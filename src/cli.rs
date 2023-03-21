@@ -76,7 +76,7 @@ pub struct Cli {
         long,
         default_value = "",
         env("TOPOLOGY"),
-        help = "In multi-node mode, pass other node hostnames"
+        help = "In cluster mode, pass other node hostnames"
     )]
     pub topology: Vec<String>,
 

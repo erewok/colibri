@@ -8,7 +8,7 @@ use crate::cli;
 /// Each rate-limited item will be stored in here.
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub (crate) struct TokenBucket {
+pub(crate) struct TokenBucket {
     // Count of tokens
     pub tokens: f64,
     // timestamp in unix milliseconds
@@ -26,7 +26,6 @@ impl Default for TokenBucket {
 
 /// Rate limiting is implemented by a single bucket for each limited object.
 impl TokenBucket {
-
     pub fn tokens_to_u32(&self) -> u32 {
         self.tokens.trunc().clamp(0.0, u32::MAX.into()) as u32
     }
@@ -48,7 +47,10 @@ impl TokenBucket {
         // Tokens are added at the token rate
         let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms);
         // Max calls is limited to: rate_limit_settings.rate_limit_max_calls_allowed
-        self.tokens = (self.tokens + tokens_to_add).clamp(0.0, f64::from(rate_limit_settings.rate_limit_max_calls_allowed));
+        self.tokens = (self.tokens + tokens_to_add).clamp(
+            0.0,
+            f64::from(rate_limit_settings.rate_limit_max_calls_allowed),
+        );
         self.last_call = Utc::now().timestamp_millis();
         self
     }

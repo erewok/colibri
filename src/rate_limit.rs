@@ -27,7 +27,7 @@ impl RateLimiter {
             cache: HashMap::new(),
         }
     }
-    pub fn expire_keys(&mut self)  {
+    pub fn expire_keys(&mut self) {
         let after_buckets_expired: HashMap<String, token_bucket::TokenBucket> = self
             .cache
             .drain_filter(|_k, bucket| {

@@ -2,10 +2,8 @@
 ///
 use serde::{Deserialize, Serialize};
 
-
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RateLimitSettings {
@@ -38,27 +36,57 @@ impl RateLimitSettings {
 #[derive(Clone, Debug, clap::Parser)]
 pub struct Cli {
     // Server listen address
-    #[clap(long, default_value = "0.0.0.0", env("LISTEN_ADDRESS"), help = "IP Address to listen on")]
+    #[clap(
+        long,
+        default_value = "0.0.0.0",
+        env("LISTEN_ADDRESS"),
+        help = "IP Address to listen on"
+    )]
     pub listen_address: String,
 
     // Server listen port
-    #[clap(long, default_value = "8000", env("LISTEN_PORT"), help = "Port to bind Colibri server to")]
+    #[clap(
+        long,
+        default_value = "8000",
+        env("LISTEN_PORT"),
+        help = "Port to bind Colibri server to"
+    )]
     pub listen_port: u16,
 
     // Rate limit settings: max calls (over interval)
-    #[clap(long, default_value = "1000", env("RATE_LIMIT_MAX_CALLS_ALLOWED"), help = "Max calls allowed per interval")]
+    #[clap(
+        long,
+        default_value = "1000",
+        env("RATE_LIMIT_MAX_CALLS_ALLOWED"),
+        help = "Max calls allowed per interval"
+    )]
     pub rate_limit_max_calls_allowed: u32,
 
     // Rate limit settings: interval in seconds to check if rate limit exceeded
-    #[clap(long, default_value = "60", env("RATE_LIMIT_INTERVAL_SECONDS"), help = "Interval in seconds to check limit")]
+    #[clap(
+        long,
+        default_value = "60",
+        env("RATE_LIMIT_INTERVAL_SECONDS"),
+        help = "Interval in seconds to check limit"
+    )]
     pub rate_limit_interval_seconds: u32,
 
     // Cluster configuration information: topology
-    #[clap(long, default_value = "", env("TOPOLOGY"), help = "In multi-node mode, pass other node hostnames")]
+    #[clap(
+        long,
+        default_value = "",
+        env("TOPOLOGY"),
+        help = "In multi-node mode, pass other node hostnames"
+    )]
     pub topology: Vec<String>,
 
     // Cluster configuration information: this node-id
-    #[clap(long, default_value = "", env("HOSTNAME"), help = "An identifier for this node")]
+    #[clap(
+        long,
+        default_value = "",
+        env("HOSTNAME"),
+        help = "An identifier for this node"
+    )]
     pub hostname: String,
 }
 

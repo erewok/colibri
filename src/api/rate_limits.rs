@@ -1,6 +1,4 @@
-use std::{
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use axum::{
     extract::{Path, State},
@@ -33,9 +31,13 @@ pub async fn check_limit(
             }))
         }
         Err(err) => {
-            event!(Level::ERROR, message = "Failed to read from RwLock", err=format!("{:?}", err));
+            event!(
+                Level::ERROR,
+                message = "Failed to read from RwLock",
+                err = format!("{:?}", err)
+            );
             Err(StatusCode::INTERNAL_SERVER_ERROR)
-        },
+        }
     }
 }
 
@@ -59,26 +61,30 @@ pub async fn rate_limit(
             }
         }
         Err(err) => {
-            event!(Level::ERROR, message = "Failed to writer RwLock", err=format!("{:?}", err));
+            event!(
+                Level::ERROR,
+                message = "Failed to writer RwLock",
+                err = format!("{:?}", err)
+            );
             Err(StatusCode::INTERNAL_SERVER_ERROR)
-        },
+        }
     }
 }
 
 #[instrument(skip(state), level = "debug")]
-pub async fn expire_keys(
-    State(state): State<Arc<RwLock<state::AppState>>>,
-) -> StatusCode {
+pub async fn expire_keys(State(state): State<Arc<RwLock<state::AppState>>>) -> StatusCode {
     match state.write() {
         Ok(mut _state) => {
-            _state
-                .rate_limiter
-                .expire_keys(); 
+            _state.rate_limiter.expire_keys();
             StatusCode::OK
         }
         Err(err) => {
-            event!(Level::ERROR, message = "Failed to writer RwLock", err=format!("{:?}", err));
+            event!(
+                Level::ERROR,
+                message = "Failed to writer RwLock",
+                err = format!("{:?}", err)
+            );
             StatusCode::INTERNAL_SERVER_ERROR
-        },
+        }
     }
 }

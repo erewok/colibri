@@ -3,7 +3,6 @@ use tracing::instrument;
 
 use crate::cli::{APP_NAME, APP_VERSION};
 
-
 // basic handler that responds with a static string
 pub async fn root() -> &'static str {
     "Welcome to Colibri"

@@ -8,10 +8,7 @@ use std::{
 };
 
 use axum::{
-    error_handling::HandleErrorLayer,
-    http::StatusCode,
-    response::IntoResponse,
-    routing, Router,
+    error_handling::HandleErrorLayer, http::StatusCode, response::IntoResponse, routing, Router,
 };
 use tokio::time::Duration;
 use tower::{BoxError, ServiceBuilder};
@@ -19,7 +16,6 @@ use tower_http::trace::TraceLayer;
 
 use crate::cli;
 use crate::rate_limit::RateLimiter;
-
 
 pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
     let state: state::SharedState = Arc::new(RwLock::new(state::AppState {
@@ -31,8 +27,14 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
         .route("/", routing::get(base::root))
         .route("/health", routing::get(base::health))
         .route("/about", routing::get(base::about))
-        .route("/rate-limit-check/:client_id", routing::get(rate_limits::check_limit))
-        .route("/rate-limit/:client_id", routing::post(rate_limits::rate_limit))
+        .route(
+            "/rate-limit-check/:client_id",
+            routing::get(rate_limits::check_limit),
+        )
+        .route(
+            "/rate-limit/:client_id",
+            routing::post(rate_limits::rate_limit),
+        )
         .route("/expire-keys", routing::post(rate_limits::expire_keys))
         // .route("/topology", todo!())
         .layer(

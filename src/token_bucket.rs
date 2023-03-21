@@ -68,8 +68,6 @@ impl TokenBucket {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,37 +87,36 @@ mod tests {
     fn tokens_to_u32() {
         let bucket = TokenBucket {
             tokens: 4294967297.0,
-            last_call: Utc::now().timestamp_millis()
+            last_call: Utc::now().timestamp_millis(),
         };
         assert_eq!(bucket.tokens_to_u32(), u32::MAX);
 
         let bucket = TokenBucket {
             tokens: -4294967297.0,
-            last_call: Utc::now().timestamp_millis()
+            last_call: Utc::now().timestamp_millis(),
         };
         assert_eq!(bucket.tokens_to_u32(), 0);
 
         let bucket = TokenBucket {
             tokens: 3.333333333333333,
-            last_call: Utc::now().timestamp_millis()
+            last_call: Utc::now().timestamp_millis(),
         };
         assert_eq!(bucket.tokens_to_u32(), 3);
 
         let bucket = TokenBucket {
             tokens: 1203.9999999999,
-            last_call: Utc::now().timestamp_millis()
+            last_call: Utc::now().timestamp_millis(),
         };
         assert_eq!(bucket.tokens_to_u32(), 1203);
     }
 
     #[tokio::test]
     async fn add_tokens_check_math() {
-        
         let mut bucket = TokenBucket {
             tokens: 5.0,
-            last_call: Utc::now().timestamp_millis()
+            last_call: Utc::now().timestamp_millis(),
         };
-        
+
         let settings = cli::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
@@ -139,5 +136,4 @@ mod tests {
         assert!(bucket.tokens < 6.0);
         bucket.add_tokens_to_bucket(&settings);
     }
-
 }

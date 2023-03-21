@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     // Build Axum Router
     let api = api::api(args).await?.layer(TraceLayer::new_for_http());
 
-    // Start server
+    // Start Cache Expire Request Loop
     info!("Starting Cache Expiry background task");
 
     tokio::spawn(async move {

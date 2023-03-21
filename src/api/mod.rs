@@ -21,20 +21,17 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
     let state: state::SharedState = Arc::new(RwLock::new(state::AppState {
         topology: settings.topology.clone(),
         hostname: settings.hostname.clone(),
-        rate_limiter: RateLimiter::new(settings),
+        rate_limiter: RateLimiter::new(settings.rate_limit_settings()),
     }));
     let api = Router::new()
         .route("/", routing::get(base::root))
         .route("/health", routing::get(base::health))
         .route("/about", routing::get(base::about))
         .route(
-            "/rate-limit-check/:client_id",
+            "/rl-check/:client_id",
             routing::get(rate_limits::check_limit),
         )
-        .route(
-            "/rate-limit/:client_id",
-            routing::post(rate_limits::rate_limit),
-        )
+        .route("/rl/:client_id", routing::post(rate_limits::rate_limit))
         .route("/expire-keys", routing::post(rate_limits::expire_keys))
         // .route("/topology", todo!())
         .layer(

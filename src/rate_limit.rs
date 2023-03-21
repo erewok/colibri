@@ -57,10 +57,9 @@ impl RateLimiter {
         let mut bucket = match self.cache.get(&key) {
             // We are going to modify and insert this bucket back into cache
             Some(mut _bucket) => _bucket.to_owned(),
-            None => {
-                let mut _bucket = TokenBucket::default();
-                _bucket.tokens = self.settings.rate_limit_max_calls_allowed.into();
-                _bucket
+            None => TokenBucket {
+                tokens: self.settings.rate_limit_max_calls_allowed.into(),
+                ..Default::default()
             },
         };
         // Add more tokens at token bucket rate

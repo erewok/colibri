@@ -31,10 +31,7 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
             "/rl-check/:client_id",
             routing::get(rate_limits::check_limit),
         )
-        .route(
-            "/rl/:client_id",
-            routing::post(rate_limits::rate_limit),
-        )
+        .route("/rl/:client_id", routing::post(rate_limits::rate_limit))
         .route("/expire-keys", routing::post(rate_limits::expire_keys))
         // .route("/topology", todo!())
         .layer(

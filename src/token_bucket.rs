@@ -18,6 +18,7 @@ pub(crate) struct TokenBucket {
 impl Default for TokenBucket {
     fn default() -> Self {
         Self {
+            // greater than zero, probably fewer than whatever max will be for this app
             tokens: 1f64,
             last_call: Utc::now().timestamp_millis(),
         }
@@ -65,4 +66,78 @@ impl TokenBucket {
     pub fn check_if_allowed(&self) -> bool {
         self.tokens > 0f64
     }
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{self, Duration};
+
+    #[test]
+    fn check_allowed() {
+        let mut bucket = TokenBucket::default();
+        bucket.tokens = 2.0;
+        bucket.decrement();
+        assert!(bucket.check_if_allowed());
+        bucket.decrement();
+        assert_eq!(bucket.check_if_allowed(), false);
+    }
+
+    #[test]
+    fn tokens_to_u32() {
+        let bucket = TokenBucket {
+            tokens: 4294967297.0,
+            last_call: Utc::now().timestamp_millis()
+        };
+        assert_eq!(bucket.tokens_to_u32(), u32::MAX);
+
+        let bucket = TokenBucket {
+            tokens: -4294967297.0,
+            last_call: Utc::now().timestamp_millis()
+        };
+        assert_eq!(bucket.tokens_to_u32(), 0);
+
+        let bucket = TokenBucket {
+            tokens: 3.333333333333333,
+            last_call: Utc::now().timestamp_millis()
+        };
+        assert_eq!(bucket.tokens_to_u32(), 3);
+
+        let bucket = TokenBucket {
+            tokens: 1203.9999999999,
+            last_call: Utc::now().timestamp_millis()
+        };
+        assert_eq!(bucket.tokens_to_u32(), 1203);
+    }
+
+    #[tokio::test]
+    async fn add_tokens_check_math() {
+        
+        let mut bucket = TokenBucket {
+            tokens: 5.0,
+            last_call: Utc::now().timestamp_millis()
+        };
+        
+        let settings = cli::RateLimitSettings {
+            rate_limit_max_calls_allowed: 5,
+            rate_limit_interval_seconds: 1,
+        };
+
+        for _n in 0..5 {
+            assert!(bucket.tokens > 0.0);
+            assert!(bucket.tokens < 6.0);
+            bucket.add_tokens_to_bucket(&settings);
+        }
+        // exhausted tokens now
+        assert!((1.0 - bucket.tokens).is_sign_negative());
+        // sleep and expire
+        time::sleep(Duration::from_secs(2)).await;
+
+        assert!(bucket.tokens > 0.0);
+        assert!(bucket.tokens < 6.0);
+        bucket.add_tokens_to_bucket(&settings);
+    }
+
 }

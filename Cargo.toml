@@ -10,6 +10,7 @@ anyhow = "1.0.70"
 axum = "0.6.11"
 chrono = { version = "0.4.24", features = ["clock"] }
 clap = { version = "4.1.11", features = ["derive", "env"] }
+reqwest = "0.11.15"
 serde = { version = "1.0.158", features = ["derive"] }
 serde_json = "1.0.94"
 tokio = { version = "1.26.0", features = ["macros", "rt-multi-thread", "time"] }

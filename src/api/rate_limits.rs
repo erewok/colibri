@@ -65,19 +65,16 @@ pub async fn rate_limit(
     }
 }
 
-#[instrument(skip(state))]
+#[instrument(skip(state), level = "debug")]
 pub async fn expire_keys(
     State(state): State<Arc<RwLock<state::AppState>>>,
 ) -> StatusCode {
     match state.write() {
         Ok(mut _state) => {
-            if let Ok(_) = _state
+            _state
                 .rate_limiter
-                .expire_keys() {
-                    StatusCode::OK
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
+                .expire_keys(); 
+            StatusCode::OK
         }
         Err(err) => {
             event!(Level::ERROR, message = "Failed to writer RwLock", err=format!("{:?}", err));

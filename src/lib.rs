@@ -1,3 +1,4 @@
+#![feature(hash_drain_filter)]
 pub mod api;
 pub mod cli;
 pub mod rate_limit;

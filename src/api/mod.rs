@@ -13,10 +13,9 @@ use axum::{
     response::IntoResponse,
     routing, Router,
 };
-use tokio::time::{self, Duration};
+use tokio::time::Duration;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
-use tracing::{event, instrument, Level};
 
 use crate::cli;
 use crate::rate_limit::RateLimiter;

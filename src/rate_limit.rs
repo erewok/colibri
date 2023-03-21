@@ -16,7 +16,7 @@ use crate::token_bucket::TokenBucket;
 /// Each rate-limited item will be stored in here.
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct RateLimiter {
+pub struct RateLimiter {
     settings: cli::RateLimitSettings,
     cache: HashMap<String, token_bucket::TokenBucket>,
 }
@@ -27,6 +27,9 @@ impl RateLimiter {
             settings: settings.rate_limit_settings(),
             cache: HashMap::new(),
         }
+    }
+    pub fn expire_keys(&mut self) -> Result<(), String> {
+        Ok(())
     }
 
     pub fn check_calls_remaining_for_client(&self, key: &str) -> u32 {

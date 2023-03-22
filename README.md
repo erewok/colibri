@@ -43,6 +43,8 @@ content-length: 0
 date: Wed, 22 Mar 2023 15:26:45 GMT
 ```
 
+Here's a demo: ![](./rate-limiting-demo.gif)
+
 
 **Note**: Restarting any Colibri node will restart any rate-limit counts.
 

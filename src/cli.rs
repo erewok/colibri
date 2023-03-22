@@ -24,8 +24,7 @@ impl RateLimitSettings {
     pub fn token_rate_seconds(&self) -> f64 {
         let calls_allowed = f64::from(self.rate_limit_max_calls_allowed);
         let interval_seconds = f64::from(self.rate_limit_interval_seconds);
-        let rate_seconds = calls_allowed / interval_seconds;
-        rate_seconds
+        calls_allowed / interval_seconds
     }
 
     pub fn token_rate_milliseconds(&self) -> f64 {

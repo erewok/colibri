@@ -21,19 +21,20 @@ use crate::rate_limit::RateLimiter;
 pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
     // A rate_limiter holds rate-limiting data in memory
     let rate_limiter = RateLimiter::new(settings.rate_limit_settings());
+
     // This enum marks the state/workload
-    let state: state::SharedState;
-    if settings.topology.is_empty() {
-        state = Arc::new(RwLock::new(state::WorkMode::SingleNode(rate_limiter)));
+    let state: state::SharedState = if settings.topology.is_empty() {
+        Arc::new(RwLock::new(state::WorkMode::SingleNode(rate_limiter)))
     } else {
-        state = Arc::new(RwLock::new(state::WorkMode::MultiNode(
+        Arc::new(RwLock::new(state::WorkMode::MultiNode(
             state::MultiNodeState {
                 topology: settings.topology.clone(),
                 hostname: settings.hostname.clone(),
                 rate_limiter: RateLimiter::new(settings.rate_limit_settings()),
             },
-        )));
-    }
+        )))
+    };
+
     // Endpoints
     let api = Router::new()
         .route("/", routing::get(base::root))

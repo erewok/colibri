@@ -40,7 +40,7 @@ impl RateLimiter {
 
     /// Expire all keys older than a threshold to keep cache from growing endlessly
     pub fn expire_keys(&mut self) {
-        let threshold = self.settings.rate_limit_interval_seconds as i64 * 2;
+        let threshold = (self.settings.rate_limit_interval_seconds * 1000) as i64 * 2;
         let cutoff = Utc::now().timestamp_millis() - threshold;
         let after_buckets_expired: HashMap<String, token_bucket::TokenBucket> = self
             .cache
@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn limit_calls_will_block() {
+    fn limit_calls_will_limit() {
         let mut rl = new_rate_limiter();
         for _n in 0..5 {
             assert!(rl.check_calls_remaining_for_client("a1") > 0);

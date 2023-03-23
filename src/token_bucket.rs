@@ -63,8 +63,9 @@ impl TokenBucket {
     }
 
     /// Check if rate-limited.
+    /// Must have at least 1 full token
     pub fn check_if_allowed(&self) -> bool {
-        self.tokens > 0f64
+        self.tokens >= 1f64
     }
 }
 

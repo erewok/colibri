@@ -1,5 +1,3 @@
-use std::sync::{Arc, RwLock};
-
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -15,15 +13,16 @@ pub struct CheckCallsResponse {
     calls_remaining: u32,
 }
 
+/// Multi Node implementation of checking limit
 #[instrument(skip(state))]
 pub async fn check_limit(
     Path(client_id): Path<String>,
-    State(state): State<Arc<RwLock<state::AppState>>>,
+    State(state): State<state::SharedState>,
 ) -> Result<axum::Json<CheckCallsResponse>, StatusCode> {
     match state.read() {
         Ok(_state) => {
             let calls_remaining = _state
-                .rate_limiter
+                .get_rate_limiter()
                 .check_calls_remaining_for_client(client_id.as_str());
             Ok(axum::Json(CheckCallsResponse {
                 client_id,
@@ -44,12 +43,12 @@ pub async fn check_limit(
 #[instrument(skip(state))]
 pub async fn rate_limit(
     Path(client_id): Path<String>,
-    State(state): State<Arc<RwLock<state::AppState>>>,
+    State(state): State<state::SharedState>,
 ) -> Result<axum::Json<CheckCallsResponse>, StatusCode> {
     match state.write() {
         Ok(mut _state) => {
             if let Some(calls_remaining) = _state
-                .rate_limiter
+                .get_rate_limiter_mut()
                 .limit_calls_for_client(client_id.clone())
             {
                 Ok(axum::Json(CheckCallsResponse {
@@ -72,10 +71,10 @@ pub async fn rate_limit(
 }
 
 #[instrument(skip(state), level = "debug")]
-pub async fn expire_keys(State(state): State<Arc<RwLock<state::AppState>>>) -> StatusCode {
+pub async fn expire_keys(State(state): State<state::SharedState>) -> StatusCode {
     match state.write() {
         Ok(mut _state) => {
-            _state.rate_limiter.expire_keys();
+            _state.get_rate_limiter_mut().expire_keys();
             StatusCode::OK
         }
         Err(err) => {

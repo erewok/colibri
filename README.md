@@ -2,7 +2,53 @@
 
 Colibri is a simple HTTP service built in Rust that implements an in-memory data structure for rate-limiting services. Rate counts are stored _in memory_ so that Colibri can respond quickly.
 
+You can launch Colibri locally using cargo:
+
+```sh
+❯ cargo run -- --rate-limit-max-calls-allowed=2 --rate-limit-interval-seconds=10
+   Compiling colibri v0.2.0 (/Users/erewok/open_source/colibri)
+    Finished dev [unoptimized + debuginfo] target(s) in 3.61s
+     Running `target/debug/colibri --rate-limit-max-calls-allowed=4 --rate-limit-interval-seconds=10`
+2023-03-22T15:24:12.893173Z  INFO colibri: Starting Cache Expiry background task
+2023-03-22T15:24:12.893274Z  INFO colibri: Starting Colibri on 0.0.0.0:8000
+```
+
+Then, in another terminal, you can send requests and see them get rate-limited:
+
+```sh
+❯ curl -XPOST -i http://localhost:8000/rl/some-client-identifier
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 58
+date: Wed, 22 Mar 2023 15:26:17 GMT
+
+{"client_id":"some-client-identifier","calls_remaining":1}
+
+❯ curl -XPOST -i http://localhost:8000/rl/some-client-identifier
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 58
+date: Wed, 22 Mar 2023 15:26:20 GMT
+
+{"client_id":"some-client-identifier","calls_remaining":0}
+
+❯ curl -XPOST -i http://localhost:8000/rl/some-client-identifier
+HTTP/1.1 429 Too Many Requests
+content-length: 0
+date: Wed, 22 Mar 2023 15:26:45 GMT
+
+❯ curl -XPOST -i http://localhost:8000/rl/some-client-identifier
+HTTP/1.1 429 Too Many Requests
+content-length: 0
+date: Wed, 22 Mar 2023 15:26:45 GMT
+```
+
+Here's a demo: ![](./rate-limiting-demo.gif)
+
+
 **Note**: Restarting any Colibri node will restart any rate-limit counts.
+
+
 
 ## Configuration
 

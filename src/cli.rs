@@ -22,14 +22,13 @@ impl Default for RateLimitSettings {
 
 impl RateLimitSettings {
     pub fn token_rate_seconds(&self) -> f64 {
-        let rate_seconds = self
-            .rate_limit_max_calls_allowed
-            .checked_div(self.rate_limit_interval_seconds)
-            .unwrap_or(1);
-        rate_seconds as f64
+        let calls_allowed = f64::from(self.rate_limit_max_calls_allowed);
+        let interval_seconds = f64::from(self.rate_limit_interval_seconds);
+        calls_allowed / interval_seconds
     }
+
     pub fn token_rate_milliseconds(&self) -> f64 {
-        self.token_rate_seconds() / 1000f64
+        self.token_rate_seconds() / 1000.0
     }
 }
 

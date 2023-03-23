@@ -17,23 +17,35 @@ use tower_http::trace::TraceLayer;
 use crate::cli;
 use crate::rate_limit::RateLimiter;
 
+/// Build an API with a rate-limiter and a strategy
 pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
-    let state: state::SharedState = Arc::new(RwLock::new(state::AppState {
-        topology: settings.topology.clone(),
-        hostname: settings.hostname.clone(),
-        rate_limiter: RateLimiter::new(settings.rate_limit_settings()),
-    }));
+    // A rate_limiter holds rate-limiting data in memory
+    let rate_limiter = RateLimiter::new(settings.rate_limit_settings());
+
+    // This enum marks the state/workload
+    let state: state::SharedState = if settings.topology.is_empty() {
+        Arc::new(RwLock::new(state::WorkMode::SingleNode(rate_limiter)))
+    } else {
+        Arc::new(RwLock::new(state::WorkMode::MultiNode(
+            state::MultiNodeState {
+                topology: settings.topology.clone(),
+                hostname: settings.hostname.clone(),
+                rate_limiter: RateLimiter::new(settings.rate_limit_settings()),
+            },
+        )))
+    };
+
+    // Endpoints
     let api = Router::new()
         .route("/", routing::get(base::root))
         .route("/health", routing::get(base::health))
         .route("/about", routing::get(base::about))
+        .route("/rl/:client_id", routing::post(rate_limits::rate_limit))
         .route(
             "/rl-check/:client_id",
             routing::get(rate_limits::check_limit),
         )
-        .route("/rl/:client_id", routing::post(rate_limits::rate_limit))
         .route("/expire-keys", routing::post(rate_limits::expire_keys))
-        // .route("/topology", todo!())
         .layer(
             ServiceBuilder::new()
                 // Handle errors from middleware
@@ -43,6 +55,7 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
                 .layer(TraceLayer::new_for_http()),
         )
         .with_state(state);
+
     Ok(api)
 }
 

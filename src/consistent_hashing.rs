@@ -1,10 +1,11 @@
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 /// Jump consistent hashing implementation
 /// Based on:
 /// https://arxiv.org/ftp/arxiv/papers/1406/1406.2294.pdf
 ///
 ///
-use std::hash::{Hash, Hasher};
 
 pub const MAGIC_CONSTANT: u64 = 2862933555777941757;
 

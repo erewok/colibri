@@ -41,6 +41,32 @@ pub async fn check_limit(
 }
 
 #[instrument(skip(state))]
+pub async fn check_limit_cluster(
+    client_id: String,
+    state: State<state::SharedState>,
+) -> Result<axum::Json<CheckCallsResponse>, StatusCode> {
+    match state.read() {
+        Ok(_state) => {
+            let calls_remaining = _state
+                .get_rate_limiter()
+                .check_calls_remaining_for_client(client_id.as_str());
+            Ok(axum::Json(CheckCallsResponse {
+                client_id,
+                calls_remaining,
+            }))
+        }
+        Err(err) => {
+            event!(
+                Level::ERROR,
+                message = "Failed to read from RwLock",
+                err = format!("{:?}", err)
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[instrument(skip(state))]
 pub async fn rate_limit(
     Path(client_id): Path<String>,
     State(state): State<state::SharedState>,

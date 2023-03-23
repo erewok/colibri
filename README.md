@@ -2,6 +2,14 @@
 
 Colibri is a simple HTTP service built in Rust that implements an in-memory data structure for rate-limiting services. Rate counts are stored _in memory_ so that Colibri can respond quickly.
 
+**Note**: Restarting a Colibri node will restart any rate-limit counts.
+
+## Design
+
+...todo...
+
+## Demo
+
 You can launch Colibri locally using cargo:
 
 ```sh
@@ -36,19 +44,9 @@ date: Wed, 22 Mar 2023 15:26:20 GMT
 HTTP/1.1 429 Too Many Requests
 content-length: 0
 date: Wed, 22 Mar 2023 15:26:45 GMT
-
-❯ curl -XPOST -i http://localhost:8000/rl/some-client-identifier
-HTTP/1.1 429 Too Many Requests
-content-length: 0
-date: Wed, 22 Mar 2023 15:26:45 GMT
 ```
 
-Here's a demo: ![](./rate-limiting-demo.gif)
-
-
-**Note**: Restarting any Colibri node will restart any rate-limit counts.
-
-
+[Click here for a demo](./rate-limiting-demo.gif).
 
 ## Configuration
 

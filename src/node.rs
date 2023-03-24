@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{info, event, Level};
+use tracing::{event, info, Level};
 
 use crate::{cli, consistent_hashing, rate_limit};
 
@@ -274,8 +274,8 @@ impl Node for MultiNode {
                         Ok(None)
                     } else {
                         resp.json() //  won't work for 429s
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))
                     }
                 }
                 // fallback to self?

@@ -260,14 +260,19 @@ impl Node for MultiNode {
             match self.topology.get(&bucket) {
                 Some(host) => {
                     let url = format!("{}/rl/{}", host, client_id);
-                    reqwest::Client::new()
+                    let resp = reqwest::Client::new()
                         .post(url)
                         .send()
                         .await
-                        .map_err(|e| anyhow::anyhow!(e))?
-                        .json() //  won't work for 429s
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    let status = resp.status().as_u16();
+                    if status == 429 {
+                        Ok(None)
+                    } else {
+                        resp.json() //  won't work for 429s
                         .await
                         .map_err(|e| anyhow::anyhow!(e))
+                    }
                 }
                 // fallback to self?
                 None => match self.rate_limiter.write() {

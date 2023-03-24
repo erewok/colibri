@@ -52,6 +52,32 @@ date: Wed, 22 Mar 2023 15:26:45 GMT
 
 [Click here for a terminal demo](./rate-limiting-demo.gif).
 
+## Single-Node Mode
+
+You can run colibri as a single-node in the following way:
+
+```sh
+$ colibri
+2023-03-24T23:22:26.690566Z  INFO colibri: Starting Cache Expiry background task
+2023-03-24T23:22:26.690666Z  INFO colibri: Starting Colibri on 0.0.0.0:8000
+
+```
+
+
+## Multi-Node Mode
+
+You can run a few colibri nodes as part of a cluster in the following way:
+
+```sh
+$ cargo run -- --listen-port 8000 --node-id 0 --topology http://localhost:8000 --topology http://localhost:8001 --topology http://localhost:8002 --topology http://localhost:8003
+
+$ cargo run -- --listen-port 8001 --node-id 1 --topology http://localhost:8000 --topology http://localhost:8001 --topology http://localhost:8002 --topology http://localhost:8003
+
+$ cargo run -- --listen-port 8002 --node-id 2 --topology http://localhost:8000 --topology http://localhost:8001 --topology http://localhost:8002 --topology http://localhost:8003
+
+```
+
+
 ## Configuration
 
 The following configuration options are available for running Colibri:

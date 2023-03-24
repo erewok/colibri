@@ -44,7 +44,7 @@ pub async fn rate_limit(
     }
 }
 
-#[instrument(skip(state), level = "debug")]
+// #[instrument(skip(state), level = "debug")]
 pub async fn expire_keys(State(mut state): State<node::NodeWrapper>) -> StatusCode {
     state.expire_keys();
     StatusCode::OK

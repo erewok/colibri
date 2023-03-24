@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{event, Level};
+use tracing::{info, event, Level};
 
 use crate::{cli, consistent_hashing, rate_limit};
 
@@ -20,8 +20,10 @@ impl NodeWrapper {
             settings.rate_limit_settings(),
         )));
         if settings.topology.is_empty() {
+            info!("Starting in single-node mode");
             Self::Single(SingleNode { rate_limiter })
         } else {
+            info!("Starting in multi-node mode");
             Self::Multi(MultiNode {
                 node_id: settings.node_id,
                 topology: settings
@@ -189,6 +191,7 @@ impl Node for MultiNode {
                 }
             }
         } else {
+            info!("Requesting data from bucket {}", bucket);
             // Use bucket to select into the topology HashMap
             match self.topology.get(&bucket) {
                 Some(host) => {
@@ -257,6 +260,7 @@ impl Node for MultiNode {
         } else {
             // Use bucket to select into the topology HashMap
             // The problem right now is that if this is a 429, we want to send that back
+            info!("Requesting data from bucket {}", bucket);
             match self.topology.get(&bucket) {
                 Some(host) => {
                     let url = format!("{}/rl/{}", host, client_id);

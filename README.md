@@ -77,6 +77,39 @@ $ cargo run -- --listen-port 8002 --node-id 2 --topology http://localhost:8000 -
 
 ```
 
+In another terminal, if you make some requests, you can see communicating going across the cluster:
+
+```sh
+❯ curl -i -XPOST  http://localhost:8000/rl/a
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 37
+date: Fri, 24 Mar 2023 23:42:19 GMT
+
+{"client_id":"a","calls_remaining":1}
+
+❯ curl -i -XPOST  http://localhost:8000/rl/a
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 37
+date: Fri, 24 Mar 2023 23:42:21 GMT
+
+{"client_id":"a","calls_remaining":0}
+
+❯ curl -i -XPOST  http://localhost:8000/rl/a
+HTTP/1.1 429 Too Many Requests
+content-length: 0
+date: Fri, 24 Mar 2023 23:42:22 GMT
+
+```
+
+Back in the terminal of the node we're requesting, we'll see it's pulling from the other node:
+
+```sh
+2023-03-24T23:42:09.859385Z  INFO rate_limit{client_id="a"}: colibri::node: Requesting data from bucket 1
+
+```
+
 
 ## Configuration
 

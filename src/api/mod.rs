@@ -1,11 +1,7 @@
 mod base;
 mod rate_limits;
-mod state;
 
-use std::{
-    borrow::Cow,
-    sync::{Arc, RwLock},
-};
+use std::borrow::Cow;
 
 use axum::{
     error_handling::HandleErrorLayer, http::StatusCode, response::IntoResponse, routing, Router,
@@ -15,15 +11,12 @@ use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 
 use crate::cli;
-use crate::rate_limit::RateLimiter;
+use crate::node;
 
 /// Build an API with a rate-limiter and a strategy
 pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
-    // A rate_limiter holds rate-limiting data in memory
-    let rate_limiter = RateLimiter::new(settings.rate_limit_settings());
-
     // App state will automatically check limits or ask other nodes
-    let app_state = state::get_state(settings);
+    let app_state = node::NodeWrapper::new(settings);
 
     // Endpoints
     let api = Router::new()

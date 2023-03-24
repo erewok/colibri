@@ -1,55 +1,66 @@
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{event, instrument, Level};
+use tracing::{event, Level};
 
-use crate::{cli, rate_limit, consistent_hashing};
+use crate::{cli, consistent_hashing, rate_limit};
 
-
+#[derive(Clone, Debug)]
 pub enum NodeWrapper {
     Single(SingleNode),
-    Multi(MultiNode)
+    Multi(MultiNode),
 }
 
 impl NodeWrapper {
     pub fn new(settings: cli::Cli) -> Self {
         // A rate_limiter holds rate-limiting data in memory
-        let rate_limiter = rate_limit::RateLimiter::new(settings.rate_limit_settings());
+        let rate_limiter = Arc::new(RwLock::new(rate_limit::RateLimiter::new(
+            settings.rate_limit_settings(),
+        )));
         if settings.topology.is_empty() {
             Self::Single(SingleNode { rate_limiter })
         } else {
-           Self::Multi(
-                MultiNode {
-                    node_id: settings.node_id,
-                    topology: settings.topology.iter().enumerate().map(|(node_id, host)| (node_id as u32, host.to_string())).collect(),
-                    rate_limiter: rate_limit::RateLimiter::new(settings.rate_limit_settings()),
-                },
-            )
+            Self::Multi(MultiNode {
+                node_id: settings.node_id,
+                topology: settings
+                    .topology
+                    .iter()
+                    .enumerate()
+                    .map(|(node_id, host)| (node_id as u32, host.to_string()))
+                    .collect(),
+                rate_limiter,
+            })
         }
     }
 
     pub fn expire_keys(&mut self) {
         match self {
-            Self::Single(node) => node.rate_limiter.expire_keys(),
-            Self::Multi(node) => node.rate_limiter.expire_keys()
+            Self::Single(node) => node.expire_keys(),
+            Self::Multi(node) => node.expire_keys(),
         }
     }
 
-    pub async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse, anyhow::Error> {
+    pub async fn check_limit(
+        &self,
+        client_id: String,
+    ) -> Result<CheckCallsResponse, anyhow::Error> {
         match self {
             Self::Single(node) => node.check_limit(client_id).await,
             Self::Multi(node) => node.check_limit(client_id).await,
         }
     }
-    pub async fn rate_limit(&mut self, client_id: String) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
+    pub async fn rate_limit(
+        &mut self,
+        client_id: String,
+    ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
         match self {
             Self::Single(node) => node.rate_limit(client_id).await,
             Self::Multi(node) => node.rate_limit(client_id).await,
         }
     }
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckCallsResponse {
@@ -59,40 +70,81 @@ pub struct CheckCallsResponse {
 
 #[async_trait]
 pub trait Node {
-    fn get_rate_limiter_mut(&mut self) -> &mut rate_limit::RateLimiter;
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse, anyhow::Error>;
-    async fn rate_limit(&mut self, client_id: String) -> Result<Option<CheckCallsResponse>, anyhow::Error>;
+    async fn rate_limit(
+        &mut self,
+        client_id: String,
+    ) -> Result<Option<CheckCallsResponse>, anyhow::Error>;
+    fn expire_keys(&mut self);
 }
 
 #[derive(Clone, Debug)]
 pub struct SingleNode {
-    rate_limiter: rate_limit::RateLimiter
+    rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
 }
 
 #[async_trait]
 impl Node for SingleNode {
-
-    fn get_rate_limiter_mut(&mut self) -> &mut rate_limit::RateLimiter {
-        &mut self.rate_limiter
-    }
-
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse, anyhow::Error> {
-        let calls_remaining = self.rate_limiter.check_calls_remaining_for_client(client_id.as_str());
-        Ok(CheckCallsResponse {
-            client_id: client_id,
-            calls_remaining,
-        })
+        match self.rate_limiter.read() {
+            Ok(rate_limiter) => {
+                let calls_remaining =
+                    rate_limiter.check_calls_remaining_for_client(client_id.as_str());
+                Ok(CheckCallsResponse {
+                    client_id,
+                    calls_remaining,
+                })
+            }
+            Err(err) => {
+                event!(
+                    Level::ERROR,
+                    message = "Failed checking limit",
+                    err = format!("{:?}", err)
+                );
+                Err(anyhow::anyhow!("Failed to access rate_limiter"))
+            }
+        }
     }
 
-    async fn rate_limit(&mut self, client_id: String) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
-        let calls_left = self.rate_limiter.limit_calls_for_client(client_id.to_string());
-        if let Some(calls_remaining) = calls_left {
-            Ok(Some(CheckCallsResponse {
-                client_id: client_id,
-                calls_remaining,
-            }))
-        } else {
-            Ok(None)
+    async fn rate_limit(
+        &mut self,
+        client_id: String,
+    ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
+        match self.rate_limiter.write() {
+            Ok(mut rate_limiter) => {
+                let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
+                if let Some(calls_remaining) = calls_left {
+                    Ok(Some(CheckCallsResponse {
+                        client_id,
+                        calls_remaining,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(err) => {
+                event!(
+                    Level::ERROR,
+                    message = "Failed applying rate limit",
+                    err = format!("{:?}", err)
+                );
+                Err(anyhow::anyhow!("Failed to access rate_limiter"))
+            }
+        }
+    }
+
+    fn expire_keys(&mut self) {
+        match self.rate_limiter.write() {
+            Ok(mut rate_limiter) => {
+                rate_limiter.expire_keys();
+            }
+            Err(err) => {
+                event!(
+                    Level::ERROR,
+                    message = "Failed expiring keys",
+                    err = format!("{:?}", err)
+                );
+            }
         }
     }
 }
@@ -100,7 +152,7 @@ impl Node for SingleNode {
 pub enum ReplicationFactor {
     One = 1,
     Two = 2,
-    Three = 3
+    Three = 3,
 }
 
 #[derive(Clone, Debug)]
@@ -108,25 +160,34 @@ pub struct MultiNode {
     topology: HashMap<u32, String>,
     node_id: u32,
     // replication_factor: ReplicationFactor,
-    rate_limiter: rate_limit::RateLimiter
+    rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
 }
 
 #[async_trait]
 impl Node for MultiNode {
-
-    fn get_rate_limiter_mut(&mut self) -> &mut rate_limit::RateLimiter {
-        &mut self.rate_limiter
-    }
-
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse, anyhow::Error> {
         let number_of_buckets = self.topology.len().try_into()?;
-        let bucket = consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
+        let bucket =
+            consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
         if bucket == self.node_id {
-            let calls_remaining = self.rate_limiter.check_calls_remaining_for_client(client_id.as_str());
-            Ok(CheckCallsResponse {
-                client_id,
-                calls_remaining,
-            })
+            match self.rate_limiter.read() {
+                Ok(rate_limiter) => {
+                    let calls_remaining =
+                        rate_limiter.check_calls_remaining_for_client(client_id.as_str());
+                    Ok(CheckCallsResponse {
+                        client_id,
+                        calls_remaining,
+                    })
+                }
+                Err(err) => {
+                    event!(
+                        Level::ERROR,
+                        message = "Failed checking limit",
+                        err = format!("{:?}", err)
+                    );
+                    Err(anyhow::anyhow!("Failed to access rate_limiter"))
+                }
+            }
         } else {
             // Use bucket to select into the topology HashMap
             match self.topology.get(&bucket) {
@@ -140,31 +201,58 @@ impl Node for MultiNode {
                         .json()
                         .await
                         .map_err(|e| anyhow::anyhow!(e))
-                }, 
-                // fallback to self?
-                None => {
-                    let calls_remaining = self.rate_limiter.check_calls_remaining_for_client(client_id.as_str());
-                    Ok(CheckCallsResponse {
-                        client_id,
-                        calls_remaining,
-                    })
                 }
+                // fallback to self?
+                None => match self.rate_limiter.read() {
+                    Ok(rate_limiter) => {
+                        let calls_remaining =
+                            rate_limiter.check_calls_remaining_for_client(client_id.as_str());
+                        Ok(CheckCallsResponse {
+                            client_id,
+                            calls_remaining,
+                        })
+                    }
+                    Err(err) => {
+                        event!(
+                            Level::ERROR,
+                            message = "Failed checking limit",
+                            err = format!("{:?}", err)
+                        );
+                        Err(anyhow::anyhow!("Failed to access rate_limiter"))
+                    }
+                },
             }
         }
     }
 
-    async fn rate_limit(&mut self, client_id: String) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
+    async fn rate_limit(
+        &mut self,
+        client_id: String,
+    ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
         let number_of_buckets = self.topology.len().try_into()?;
-        let bucket = consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
+        let bucket =
+            consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
         if bucket == self.node_id {
-            let calls_left = self.rate_limiter.limit_calls_for_client(client_id.to_string());
-            if let Some(calls_remaining) = calls_left {
-                Ok(Some(CheckCallsResponse {
-                    client_id,
-                    calls_remaining,
-                }))
-            } else {
-                Ok(None)
+            match self.rate_limiter.write() {
+                Ok(mut rate_limiter) => {
+                    let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
+                    if let Some(calls_remaining) = calls_left {
+                        Ok(Some(CheckCallsResponse {
+                            client_id,
+                            calls_remaining,
+                        }))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                Err(err) => {
+                    event!(
+                        Level::ERROR,
+                        message = "Failed applying rate limit",
+                        err = format!("{:?}", err)
+                    );
+                    Err(anyhow::anyhow!("Failed to access rate_limiter"))
+                }
             }
         } else {
             // Use bucket to select into the topology HashMap
@@ -180,19 +268,44 @@ impl Node for MultiNode {
                         .json() //  won't work for 429s
                         .await
                         .map_err(|e| anyhow::anyhow!(e))
-                }, 
-                // fallback to self?
-                None => {
-                    let calls_left = self.rate_limiter.limit_calls_for_client(client_id.to_string());
-                    if let Some(calls_remaining) = calls_left {
-                        Ok(Some(CheckCallsResponse {
-                            client_id,
-                            calls_remaining,
-                        }))
-                    } else {
-                        Ok(None)
-                    }
                 }
+                // fallback to self?
+                None => match self.rate_limiter.write() {
+                    Ok(mut rate_limiter) => {
+                        let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
+                        if let Some(calls_remaining) = calls_left {
+                            Ok(Some(CheckCallsResponse {
+                                client_id,
+                                calls_remaining,
+                            }))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Err(err) => {
+                        event!(
+                            Level::ERROR,
+                            message = "Failed applying rate limit",
+                            err = format!("{:?}", err)
+                        );
+                        Err(anyhow::anyhow!("Failed to access rate_limiter"))
+                    }
+                },
+            }
+        }
+    }
+
+    fn expire_keys(&mut self) {
+        match self.rate_limiter.write() {
+            Ok(mut rate_limiter) => {
+                rate_limiter.expire_keys();
+            }
+            Err(err) => {
+                event!(
+                    Level::ERROR,
+                    message = "Failed expiring keys",
+                    err = format!("{:?}", err)
+                );
             }
         }
     }

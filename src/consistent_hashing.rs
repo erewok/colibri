@@ -32,7 +32,7 @@ pub fn get_neighbor_bucket(bucket_selected: u32, number_of_buckets: u32) -> (u32
     if bucket_selected == 0 {
         // bucket is first
         (number_of_buckets - 1, 1)
-    } else if bucket_selected == number_of_buckets - 1  {
+    } else if bucket_selected == number_of_buckets - 1 {
         // bucket is last
         (bucket_selected - 1, 0)
     } else {
@@ -40,7 +40,6 @@ pub fn get_neighbor_bucket(bucket_selected: u32, number_of_buckets: u32) -> (u32
         (bucket_selected - 1, bucket_selected + 1)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -61,7 +60,7 @@ mod tests {
         for bucket_count in 1..50 {
             for word_size in 2..50 {
                 let string = Alphanumeric.sample_string(&mut rand::thread_rng(), word_size);
-                
+
                 let jmp_hash = jump_consistent_hash(&string, bucket_count);
                 // We should perform some statistical analysis on the distribution of these jmp_hash values
                 assert!(jmp_hash < bucket_count);

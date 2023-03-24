@@ -22,18 +22,8 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
     // A rate_limiter holds rate-limiting data in memory
     let rate_limiter = RateLimiter::new(settings.rate_limit_settings());
 
-    // This enum marks the state/workload
-    let state: state::SharedState = if settings.topology.is_empty() {
-        Arc::new(RwLock::new(state::WorkMode::SingleNode(rate_limiter)))
-    } else {
-        Arc::new(RwLock::new(state::WorkMode::MultiNode(
-            state::MultiNodeState {
-                topology: settings.topology.clone(),
-                hostname: settings.hostname.clone(),
-                rate_limiter: RateLimiter::new(settings.rate_limit_settings()),
-            },
-        )))
-    };
+    // App state will automatically check limits or ask other nodes
+    let app_state = state::get_state(settings);
 
     // Endpoints
     let api = Router::new()
@@ -54,7 +44,7 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
                 .timeout(Duration::from_secs(10))
                 .layer(TraceLayer::new_for_http()),
         )
-        .with_state(state);
+        .with_state(app_state);
 
     Ok(api)
 }

@@ -6,11 +6,15 @@ Colibri is a simple HTTP service built in Rust that implements an in-memory data
 
 ## Design
 
-...todo...
+Colibri implements the Token Bucket algorithm for keeping track of the rate at which clients are allowed to issue requests. Currently, all Colibri data structures are held in memory without persistence so that it can quickly respond to incoming requests. Colibri can be run in single-node mode or in multi-node mode. 
+
+In single-node mode each Colibri node will keep track of rate-limits individually without using any distributed properties. This strategy can potentially work behind a load balancer that fairly distributes traffic such as a round robin load balancing strategy if you configure each Colibri node to allow a max of M/N requests where M is the global max and N is the node count.
+
+In multi-node mode Colibri functions more as a distributed hash table, assigning responsibility for distinct client IDs to individual nodes using consistent hashing. This is experimental; for instance, it's not currently designed to work around network partitions or dynamic cluster resizing.
 
 ## Demo
 
-You can launch Colibri locally using cargo:
+After cloning this repo, you can launch Colibri locally using `cargo`:
 
 ```sh
 ❯ cargo run -- --rate-limit-max-calls-allowed=2 --rate-limit-interval-seconds=10
@@ -21,7 +25,7 @@ You can launch Colibri locally using cargo:
 2023-03-22T15:24:12.893274Z  INFO colibri: Starting Colibri on 0.0.0.0:8000
 ```
 
-Then, in another terminal, you can send requests and see them get rate-limited:
+Then, in another terminal, you can send requests and see them rate-limited:
 
 ```sh
 ❯ curl -XPOST -i http://localhost:8000/rl/some-client-identifier
@@ -46,7 +50,7 @@ content-length: 0
 date: Wed, 22 Mar 2023 15:26:45 GMT
 ```
 
-[Click here for a demo](./rate-limiting-demo.gif).
+[Click here for a terminal demo](./rate-limiting-demo.gif).
 
 ## Configuration
 

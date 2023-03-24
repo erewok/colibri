@@ -53,6 +53,7 @@ impl RateLimiter {
     }
 
     /// Check rate limit and decrement if call is allowed
+    /// None -> not allowed
     pub fn limit_calls_for_client(&mut self, key: String) -> Option<u32> {
         let mut bucket = match self.cache.get(&key) {
             // We are going to modify and insert this bucket back into cache

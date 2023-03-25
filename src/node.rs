@@ -88,51 +88,14 @@ pub struct SingleNode {
 #[async_trait]
 impl Node for SingleNode {
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse, anyhow::Error> {
-        match self.rate_limiter.read() {
-            Ok(rate_limiter) => {
-                let calls_remaining =
-                    rate_limiter.check_calls_remaining_for_client(client_id.as_str());
-                Ok(CheckCallsResponse {
-                    client_id,
-                    calls_remaining,
-                })
-            }
-            Err(err) => {
-                event!(
-                    Level::ERROR,
-                    message = "Failed checking limit",
-                    err = format!("{:?}", err)
-                );
-                Err(anyhow::anyhow!("Failed to access rate_limiter"))
-            }
-        }
+        local_check_limit(client_id, self.rate_limiter.clone())
     }
 
     async fn rate_limit(
         &mut self,
         client_id: String,
     ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
-        match self.rate_limiter.write() {
-            Ok(mut rate_limiter) => {
-                let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
-                if let Some(calls_remaining) = calls_left {
-                    Ok(Some(CheckCallsResponse {
-                        client_id,
-                        calls_remaining,
-                    }))
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(err) => {
-                event!(
-                    Level::ERROR,
-                    message = "Failed applying rate limit",
-                    err = format!("{:?}", err)
-                );
-                Err(anyhow::anyhow!("Failed to access rate_limiter"))
-            }
-        }
+        local_rate_limit(client_id, self.rate_limiter.clone())
     }
 
     fn expire_keys(&mut self) {
@@ -172,24 +135,7 @@ impl Node for MultiNode {
         let bucket =
             consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
         if bucket == self.node_id {
-            match self.rate_limiter.read() {
-                Ok(rate_limiter) => {
-                    let calls_remaining =
-                        rate_limiter.check_calls_remaining_for_client(client_id.as_str());
-                    Ok(CheckCallsResponse {
-                        client_id,
-                        calls_remaining,
-                    })
-                }
-                Err(err) => {
-                    event!(
-                        Level::ERROR,
-                        message = "Failed checking limit",
-                        err = format!("{:?}", err)
-                    );
-                    Err(anyhow::anyhow!("Failed to access rate_limiter"))
-                }
-            }
+            local_check_limit(client_id, self.rate_limiter.clone())
         } else {
             info!("Requesting data from bucket {}", bucket);
             // Use bucket to select into the topology HashMap
@@ -206,24 +152,7 @@ impl Node for MultiNode {
                         .map_err(|e| anyhow::anyhow!(e))
                 }
                 // fallback to self?
-                None => match self.rate_limiter.read() {
-                    Ok(rate_limiter) => {
-                        let calls_remaining =
-                            rate_limiter.check_calls_remaining_for_client(client_id.as_str());
-                        Ok(CheckCallsResponse {
-                            client_id,
-                            calls_remaining,
-                        })
-                    }
-                    Err(err) => {
-                        event!(
-                            Level::ERROR,
-                            message = "Failed checking limit",
-                            err = format!("{:?}", err)
-                        );
-                        Err(anyhow::anyhow!("Failed to access rate_limiter"))
-                    }
-                },
+                None => local_check_limit(client_id, self.rate_limiter.clone()),
             }
         }
     }
@@ -236,27 +165,7 @@ impl Node for MultiNode {
         let bucket =
             consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
         if bucket == self.node_id {
-            match self.rate_limiter.write() {
-                Ok(mut rate_limiter) => {
-                    let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
-                    if let Some(calls_remaining) = calls_left {
-                        Ok(Some(CheckCallsResponse {
-                            client_id,
-                            calls_remaining,
-                        }))
-                    } else {
-                        Ok(None)
-                    }
-                }
-                Err(err) => {
-                    event!(
-                        Level::ERROR,
-                        message = "Failed applying rate limit",
-                        err = format!("{:?}", err)
-                    );
-                    Err(anyhow::anyhow!("Failed to access rate_limiter"))
-                }
-            }
+            local_rate_limit(client_id, self.rate_limiter.clone())
         } else {
             // Use bucket to select into the topology HashMap
             // The problem right now is that if this is a 429, we want to send that back
@@ -279,27 +188,7 @@ impl Node for MultiNode {
                     }
                 }
                 // fallback to self?
-                None => match self.rate_limiter.write() {
-                    Ok(mut rate_limiter) => {
-                        let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
-                        if let Some(calls_remaining) = calls_left {
-                            Ok(Some(CheckCallsResponse {
-                                client_id,
-                                calls_remaining,
-                            }))
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    Err(err) => {
-                        event!(
-                            Level::ERROR,
-                            message = "Failed applying rate limit",
-                            err = format!("{:?}", err)
-                        );
-                        Err(anyhow::anyhow!("Failed to access rate_limiter"))
-                    }
-                },
+                None => local_rate_limit(client_id, self.rate_limiter.clone()),
             }
         }
     }
@@ -316,6 +205,56 @@ impl Node for MultiNode {
                     err = format!("{:?}", err)
                 );
             }
+        }
+    }
+}
+
+fn local_check_limit(
+    client_id: String,
+    rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
+) -> Result<CheckCallsResponse, anyhow::Error> {
+    match rate_limiter.read() {
+        Ok(rate_limiter) => {
+            let calls_remaining = rate_limiter.check_calls_remaining_for_client(client_id.as_str());
+            Ok(CheckCallsResponse {
+                client_id,
+                calls_remaining,
+            })
+        }
+        Err(err) => {
+            event!(
+                Level::ERROR,
+                message = "Failed checking limit",
+                err = format!("{:?}", err)
+            );
+            Err(anyhow::anyhow!("Failed to access rate_limiter"))
+        }
+    }
+}
+
+fn local_rate_limit(
+    client_id: String,
+    rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
+) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
+    match rate_limiter.write() {
+        Ok(mut rate_limiter) => {
+            let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
+            if let Some(calls_remaining) = calls_left {
+                Ok(Some(CheckCallsResponse {
+                    client_id,
+                    calls_remaining,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(err) => {
+            event!(
+                Level::ERROR,
+                message = "Failed applying rate limit",
+                err = format!("{:?}", err)
+            );
+            Err(anyhow::anyhow!("Failed to access rate_limiter"))
         }
     }
 }

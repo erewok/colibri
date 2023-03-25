@@ -34,9 +34,9 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
                 // Handle errors from middleware
                 .layer(HandleErrorLayer::new(handle_error))
                 .load_shed()
-                .timeout(Duration::from_secs(10))
-                .layer(TraceLayer::new_for_http()),
+                .timeout(Duration::from_secs(10)),
         )
+        .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 
     Ok(api)

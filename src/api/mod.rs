@@ -1,11 +1,7 @@
 mod base;
 mod rate_limits;
-mod state;
 
-use std::{
-    borrow::Cow,
-    sync::{Arc, RwLock},
-};
+use std::borrow::Cow;
 
 use axum::{
     error_handling::HandleErrorLayer, http::StatusCode, response::IntoResponse, routing, Router,
@@ -15,25 +11,12 @@ use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 
 use crate::cli;
-use crate::rate_limit::RateLimiter;
+use crate::node;
 
 /// Build an API with a rate-limiter and a strategy
 pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
-    // A rate_limiter holds rate-limiting data in memory
-    let rate_limiter = RateLimiter::new(settings.rate_limit_settings());
-
-    // This enum marks the state/workload
-    let state: state::SharedState = if settings.topology.is_empty() {
-        Arc::new(RwLock::new(state::WorkMode::SingleNode(rate_limiter)))
-    } else {
-        Arc::new(RwLock::new(state::WorkMode::MultiNode(
-            state::MultiNodeState {
-                topology: settings.topology.clone(),
-                hostname: settings.hostname.clone(),
-                rate_limiter: RateLimiter::new(settings.rate_limit_settings()),
-            },
-        )))
-    };
+    // App state will automatically check limits or ask other nodes
+    let app_state = node::NodeWrapper::new(settings);
 
     // Endpoints
     let api = Router::new()
@@ -51,10 +34,10 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
                 // Handle errors from middleware
                 .layer(HandleErrorLayer::new(handle_error))
                 .load_shed()
-                .timeout(Duration::from_secs(10))
-                .layer(TraceLayer::new_for_http()),
+                .timeout(Duration::from_secs(10)),
         )
-        .with_state(state);
+        .layer(TraceLayer::new_for_http())
+        .with_state(app_state);
 
     Ok(api)
 }

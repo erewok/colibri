@@ -1,6 +1,6 @@
 # Things to Do
 
-- [ ] Implement TTL for client-ids so it doesn't grow forever
-- [ ] Add test suite
 - [ ] Work on distributed rate-limiting implementation
-- [ ] Add Github action
+- [ ] Improve logging
+- [ ] Add test suite
+- [ ] Configuration in multinode with command-line args or env vars needs work

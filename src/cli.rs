@@ -75,7 +75,7 @@ pub struct Cli {
         long,
         default_value = "",
         env("TOPOLOGY"),
-        help = "In cluster mode, pass other node hostnames"
+        help = "In cluster mode, pass other node addresses: order matters!"
     )]
     pub topology: Vec<String>,
 
@@ -87,6 +87,15 @@ pub struct Cli {
         help = "An identifier for this node"
     )]
     pub hostname: String,
+
+    // Cluster configuration information: this node-id
+    #[clap(
+        long,
+        default_value = "0",
+        env("HOSTNAME"),
+        help = "An identifier for this node"
+    )]
+    pub node_id: u32,
 }
 
 impl Cli {

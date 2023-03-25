@@ -6,11 +6,11 @@ Colibri is a simple HTTP service built in Rust that implements an in-memory data
 
 ## Design
 
-Colibri implements the Token Bucket algorithm for keeping track of the rate at which clients are allowed to issue requests. Currently, all Colibri data structures are held in memory without persistence so that it can quickly respond to incoming requests. Colibri can be run in single-node mode or in multi-node mode. 
+Colibri implements the [Token Bucket algorithm](https://en.wikipedia.org/wiki/Token_bucket) for rate-limiting clients. Currently, all Colibri data structures are held in memory without persistence so that it can quickly respond to incoming requests. 
 
-In single-node mode each Colibri node will keep track of rate-limits individually without using any distributed properties. This strategy can potentially work behind a load balancer that fairly distributes traffic such as a round robin load balancing strategy if you configure each Colibri node to allow a max of M/N requests where M is the global max and N is the node count.
+Colibri can be run in single-node mode or in multi-node mode. In single-node mode each Colibri node will keep track of rate-limits individually without using any distributed properties. This strategy could potentially work behind a round-robin load balancer that fairly distributes traffic but it gets quickly confusing with interleaved client requests.
 
-In multi-node mode Colibri functions more as a distributed hash table, assigning responsibility for distinct client IDs to individual nodes using consistent hashing. This is experimental; for instance, it's not currently designed to work around network partitions or dynamic cluster resizing.
+In multi-node mode Colibri functions as a distributed hash table, assigning responsibility for distinct client IDs to individual nodes using consistent hashing. This is experimental; for instance, it's not currently designed to work around network partitions or dynamic cluster resizing.
 
 ## Demo
 
@@ -128,9 +128,11 @@ Options:
       --rate-limit-interval-seconds <RATE_LIMIT_INTERVAL_SECONDS>
           Interval in seconds to check limit [env: RATE_LIMIT_INTERVAL_SECONDS=] [default: 60]
       --topology <TOPOLOGY>
-          In multi-node mode, pass other node hostnames [env: TOPOLOGY=] [default: ]
+          In cluster mode, pass other node addresses: order matters! [env: TOPOLOGY=] [default: ]
       --hostname <HOSTNAME>
           An identifier for this node [env: HOSTNAME=] [default: ]
+      --node-id <NODE_ID>
+          An identifier for this node [env: HOSTNAME=] [default: 0]
   -h, --help
           Print help
 

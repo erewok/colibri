@@ -23,9 +23,9 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
         .route("/", routing::get(base::root))
         .route("/health", routing::get(base::health))
         .route("/about", routing::get(base::about))
-        .route("/rl/:client_id", routing::post(rate_limits::rate_limit))
+        .route("/rl/{client_id}", routing::post(rate_limits::rate_limit))
         .route(
-            "/rl-check/:client_id",
+            "/rl-check/{client_id}",
             routing::get(rate_limits::check_limit),
         )
         .route("/expire-keys", routing::post(rate_limits::expire_keys))

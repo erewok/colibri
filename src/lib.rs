@@ -1,4 +1,3 @@
-#![feature(hash_drain_filter)]
 pub mod api;
 pub mod cli;
 pub mod consistent_hashing;

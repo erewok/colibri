@@ -49,14 +49,15 @@ async fn main() -> anyhow::Result<()> {
         .parse::<IpAddr>()
         .expect("Invalid ip address");
     let socket_address = SocketAddr::from((listen_address, app_port));
+    // Socket server listen address setup
+    let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();
 
     // Build Axum Router
     let api = api::api(args).await?.layer(TraceLayer::new_for_http());
 
-    // Start Cache Expire Request Loop
-    info!("Starting Cache Expiry background task");
-
     tokio::spawn(async move {
+        // Start Cache Expire Request Loop
+        info!("Starting Cache Expiry background task");
         let mut interval = time::interval(Duration::from_millis(KEY_EXPIRY_INTERVAL));
         loop {
             interval.tick().await;
@@ -66,9 +67,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start server
     info!("Starting Colibri on {}", socket_address);
-    axum::Server::bind(&socket_address)
-        .serve(api.into_make_service())
-        .await?;
+    axum::serve(listener, api).await?;
 
     Ok(())
 }

@@ -44,7 +44,7 @@ impl RateLimiter {
         let cutoff = Utc::now().timestamp_millis() - threshold;
         let after_buckets_expired: HashMap<String, token_bucket::TokenBucket> = self
             .cache
-            .drain_filter(|_k, bucket| {
+            .extract_if(|_k, bucket| {
                 // check that last call was within cutoff
                 bucket.last_call > cutoff
             })

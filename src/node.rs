@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{event, info, Level};
 
+use crate::error::Result;
 use crate::{cli, consistent_hashing, rate_limit};
 
 #[derive(Clone, Debug)]
@@ -14,26 +15,38 @@ pub enum NodeWrapper {
 }
 
 impl NodeWrapper {
-    pub fn new(settings: cli::Cli) -> Self {
+    pub fn new(settings: cli::Cli) -> Result<Self> {
         // A rate_limiter holds rate-limiting data in memory
         let rate_limiter = Arc::new(RwLock::new(rate_limit::RateLimiter::new(
             settings.rate_limit_settings(),
         )));
-        if settings.topology.is_empty() {
-            info!("Starting in single-node mode");
-            Self::Single(SingleNode { rate_limiter })
+
+        // Filter out empty strings from topology
+        let valid_topology: Vec<String> = settings
+            .topology
+            .iter()
+            .filter(|host| !host.trim().is_empty())
+            .map(|host| host.to_string())
+            .collect();
+
+        if valid_topology.is_empty() {
+            info!("Starting in single-node mode (no other nodes specified)");
+            Ok(Self::Single(SingleNode { rate_limiter }))
         } else {
-            info!("Starting in multi-node mode");
-            Self::Multi(MultiNode {
-                node_id: settings.node_id,
-                topology: settings
-                    .topology
+            info!(
+                "Starting in multi-node mode with {} other nodes: {:?}",
+                valid_topology.len(),
+                valid_topology
+            );
+            Ok(Self::Multi(MultiNode {
+                node_id: settings.node_id()?,
+                topology: valid_topology
                     .iter()
                     .enumerate()
                     .map(|(node_id, host)| (node_id as u32, host.to_string()))
                     .collect(),
                 rate_limiter,
-            })
+            }))
         }
     }
 
@@ -44,19 +57,13 @@ impl NodeWrapper {
         }
     }
 
-    pub async fn check_limit(
-        &self,
-        client_id: String,
-    ) -> Result<CheckCallsResponse, anyhow::Error> {
+    pub async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
         match self {
             Self::Single(node) => node.check_limit(client_id).await,
             Self::Multi(node) => node.check_limit(client_id).await,
         }
     }
-    pub async fn rate_limit(
-        &self,
-        client_id: String,
-    ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
+    pub async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
         match self {
             Self::Single(node) => node.rate_limit(client_id).await,
             Self::Multi(node) => node.rate_limit(client_id).await,
@@ -72,11 +79,8 @@ pub struct CheckCallsResponse {
 
 #[async_trait]
 pub trait Node {
-    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse, anyhow::Error>;
-    async fn rate_limit(
-        &self,
-        client_id: String,
-    ) -> Result<Option<CheckCallsResponse>, anyhow::Error>;
+    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse>;
+    async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>>;
     fn expire_keys(&self);
 }
 
@@ -87,14 +91,11 @@ pub struct SingleNode {
 
 #[async_trait]
 impl Node for SingleNode {
-    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse, anyhow::Error> {
+    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
         local_check_limit(client_id, self.rate_limiter.clone())
     }
 
-    async fn rate_limit(
-        &self,
-        client_id: String,
-    ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
+    async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
         local_rate_limit(client_id, self.rate_limiter.clone())
     }
 
@@ -130,7 +131,7 @@ pub struct MultiNode {
 
 #[async_trait]
 impl Node for MultiNode {
-    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse, anyhow::Error> {
+    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
         let number_of_buckets = self.topology.len().try_into()?;
         let bucket =
             consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
@@ -143,13 +144,12 @@ impl Node for MultiNode {
                 Some(host) => {
                     let url = format!("{}/rl-check/{}", host, client_id);
                     reqwest::Client::new()
-                        .post(url)
+                        .get(url)
                         .send()
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))?
+                        .await?
                         .json()
                         .await
-                        .map_err(|e| anyhow::anyhow!(e))
+                        .map_err(Into::into)
                 }
                 // fallback to self?
                 None => local_check_limit(client_id, self.rate_limiter.clone()),
@@ -157,10 +157,7 @@ impl Node for MultiNode {
         }
     }
 
-    async fn rate_limit(
-        &self,
-        client_id: String,
-    ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
+    async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
         let number_of_buckets = self.topology.len().try_into()?;
         let bucket =
             consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
@@ -175,16 +172,15 @@ impl Node for MultiNode {
                     let url = format!("{}/rl/{}", host, client_id);
                     let resp = reqwest::Client::new()
                         .post(url)
+                        .header("content-type", "application/json")
+                        .body("{}")
                         .send()
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                        .await?;
                     let status = resp.status().as_u16();
                     if status == 429 {
                         Ok(None)
                     } else {
-                        resp.json() //  won't work for 429s
-                            .await
-                            .map_err(|e| anyhow::anyhow!(e))
+                        resp.json().await.map_err(Into::into)
                     }
                 }
                 // fallback to self?
@@ -212,7 +208,7 @@ impl Node for MultiNode {
 fn local_check_limit(
     client_id: String,
     rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
-) -> Result<CheckCallsResponse, anyhow::Error> {
+) -> Result<CheckCallsResponse> {
     match rate_limiter.read() {
         Ok(rate_limiter) => {
             let calls_remaining = rate_limiter.check_calls_remaining_for_client(client_id.as_str());
@@ -227,7 +223,7 @@ fn local_check_limit(
                 message = "Failed checking limit",
                 err = format!("{:?}", err)
             );
-            Err(anyhow::anyhow!("Failed to access rate_limiter"))
+            Err(crate::concurrency_error!("Failed to access rate_limiter"))
         }
     }
 }
@@ -235,7 +231,7 @@ fn local_check_limit(
 fn local_rate_limit(
     client_id: String,
     rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
-) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
+) -> Result<Option<CheckCallsResponse>> {
     match rate_limiter.write() {
         Ok(mut rate_limiter) => {
             let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
@@ -254,7 +250,7 @@ fn local_rate_limit(
                 message = "Failed applying rate limit",
                 err = format!("{:?}", err)
             );
-            Err(anyhow::anyhow!("Failed to access rate_limiter"))
+            Err(crate::concurrency_error!("Failed to access rate_limiter"))
         }
     }
 }

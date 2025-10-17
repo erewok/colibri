@@ -7,11 +7,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use colibri::api;
 use colibri::cli;
+use colibri::error::Result;
 
 const KEY_EXPIRY_INTERVAL: u64 = 500;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -36,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let state_for_expiry = app_state.clone();
 
     tokio::spawn(async move {
-        // Start Cache Expire Request Loop - direct method call instead of HTTP
+        // Start Cache Expire Request Loop
         info!("Starting Cache Expiry background task");
         let mut interval = time::interval(Duration::from_millis(KEY_EXPIRY_INTERVAL));
         loop {

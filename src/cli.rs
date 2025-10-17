@@ -73,29 +73,10 @@ pub struct Cli {
     // Cluster configuration information: topology
     #[clap(
         long,
-        default_value = "",
         env("TOPOLOGY"),
-        help = "In cluster mode, pass other node addresses: order matters!"
+        help = "Other node addresses in the cluster (e.g., http://node1:8000,http://node2:8000). If empty, runs in single-node mode."
     )]
     pub topology: Vec<String>,
-
-    // Cluster configuration information: this node-id
-    #[clap(
-        long,
-        default_value = "",
-        env("HOSTNAME"),
-        help = "An identifier for this node"
-    )]
-    pub hostname: String,
-
-    // Cluster configuration information: this node-id
-    #[clap(
-        long,
-        default_value = "0",
-        env("NODE_ID"),
-        help = "An identifier for this node"
-    )]
-    pub node_id: u32,
 }
 
 impl Cli {
@@ -104,5 +85,9 @@ impl Cli {
             rate_limit_max_calls_allowed: self.rate_limit_max_calls_allowed,
             rate_limit_interval_seconds: self.rate_limit_interval_seconds,
         }
+    }
+
+    pub fn node_id(&self) -> Result<u32, String> {
+        crate::gossip::node_id::generate_node_id_from_system(self.listen_port)
     }
 }

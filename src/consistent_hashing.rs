@@ -1,14 +1,11 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+pub const MAGIC_CONSTANT: u64 = 2862933555777941757;
 /// Jump consistent hashing implementation
 /// Based on:
 /// https://arxiv.org/ftp/arxiv/papers/1406/1406.2294.pdf
 ///
-///
-
-pub const MAGIC_CONSTANT: u64 = 2862933555777941757;
-
 /// This implementation based on the paper.
 pub fn jump_consistent_hash(key: &str, number_of_buckets: u32) -> u32 {
     let mut hasher: DefaultHasher = Default::default();

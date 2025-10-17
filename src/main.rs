@@ -2,31 +2,13 @@ use std::net::{IpAddr, SocketAddr};
 
 use clap::Parser;
 use tokio::time::{self, Duration};
-use tower_http::trace::TraceLayer;
-use tracing::{event, info, Level};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use colibri::api;
 use colibri::cli;
 
 const KEY_EXPIRY_INTERVAL: u64 = 500;
-
-async fn fire_expire(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let _resp = client
-        .post(format!("http://localhost:{}/expire-keys", port))
-        .send()
-        .await
-        .map_err(|err| {
-            event!(
-                Level::ERROR,
-                message = "Failed to hit expire-keys endpoint",
-                err = format!("{:?}", err)
-            );
-            err
-        })?;
-    Ok(())
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,27 +23,25 @@ async fn main() -> anyhow::Result<()> {
     // Parse args and env vars
     let args = cli::Cli::parse();
 
-    // Pull app port for cleanup requests and serving app
-    let app_port = args.listen_port;
     // Socket server listen address setup
     let listen_address: IpAddr = args
         .listen_address
         .parse::<IpAddr>()
         .expect("Invalid ip address");
-    let socket_address = SocketAddr::from((listen_address, app_port));
-    // Socket server listen address setup
+    let socket_address = SocketAddr::from((listen_address, args.listen_port));
     let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();
 
-    // Build Axum Router
-    let api = api::api(args).await?.layer(TraceLayer::new_for_http());
+    // Build Axum Router and get shared state
+    let (api, app_state) = api::api(args).await?;
+    let state_for_expiry = app_state.clone();
 
     tokio::spawn(async move {
-        // Start Cache Expire Request Loop
+        // Start Cache Expire Request Loop - direct method call instead of HTTP
         info!("Starting Cache Expiry background task");
         let mut interval = time::interval(Duration::from_millis(KEY_EXPIRY_INTERVAL));
         loop {
             interval.tick().await;
-            fire_expire(app_port).await.unwrap();
+            state_for_expiry.expire_keys();
         }
     });
 

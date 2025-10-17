@@ -14,7 +14,7 @@ use crate::cli;
 use crate::node;
 
 /// Build an API with a rate-limiter and a strategy
-pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
+pub async fn api(settings: cli::Cli) -> anyhow::Result<(Router, node::NodeWrapper)> {
     // App state will automatically check limits or ask other nodes
     let app_state = node::NodeWrapper::new(settings);
 
@@ -37,9 +37,9 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
                 .timeout(Duration::from_secs(10)),
         )
         .layer(TraceLayer::new_for_http())
-        .with_state(app_state);
+        .with_state(app_state.clone());
 
-    Ok(api)
+    Ok((api, app_state))
 }
 
 async fn handle_error(error: BoxError) -> impl IntoResponse {

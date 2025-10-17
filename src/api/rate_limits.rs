@@ -28,7 +28,7 @@ pub async fn check_limit(
 #[instrument(skip(state), level = "info")]
 pub async fn rate_limit(
     Path(client_id): Path<String>,
-    State(mut state): State<node::NodeWrapper>,
+    State(state): State<node::NodeWrapper>,
 ) -> Result<axum::Json<node::CheckCallsResponse>, StatusCode> {
     let result = state.rate_limit(client_id).await.map_err(|err| {
         event!(
@@ -45,7 +45,7 @@ pub async fn rate_limit(
 }
 
 #[instrument(skip(state), level = "debug")]
-pub async fn expire_keys(State(mut state): State<node::NodeWrapper>) -> StatusCode {
+pub async fn expire_keys(State(state): State<node::NodeWrapper>) -> StatusCode {
     state.expire_keys();
     StatusCode::OK
 }

@@ -92,7 +92,7 @@ pub struct Cli {
     #[clap(
         long,
         default_value = "0",
-        env("HOSTNAME"),
+        env("NODE_ID"),
         help = "An identifier for this node"
     )]
     pub node_id: u32,

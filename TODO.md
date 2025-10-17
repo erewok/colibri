@@ -1,6 +1,4 @@
-# Things to Do
+# Colibri Rate Limiter - Implementation Plan & TODOs
 
-- [ ] Work on distributed rate-limiting implementation
-- [ ] Improve logging
-- [ ] Add test suite
-- [ ] Configuration in multinode with command-line args or env vars needs work
+- [ ] Add tests
+- [ ] Add gossip-based system for propagating cluster state

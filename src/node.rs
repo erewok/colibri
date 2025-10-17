@@ -37,7 +37,7 @@ impl NodeWrapper {
         }
     }
 
-    pub fn expire_keys(&mut self) {
+    pub fn expire_keys(&self) {
         match self {
             Self::Single(node) => node.expire_keys(),
             Self::Multi(node) => node.expire_keys(),
@@ -54,7 +54,7 @@ impl NodeWrapper {
         }
     }
     pub async fn rate_limit(
-        &mut self,
+        &self,
         client_id: String,
     ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
         match self {
@@ -74,10 +74,10 @@ pub struct CheckCallsResponse {
 pub trait Node {
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse, anyhow::Error>;
     async fn rate_limit(
-        &mut self,
+        &self,
         client_id: String,
     ) -> Result<Option<CheckCallsResponse>, anyhow::Error>;
-    fn expire_keys(&mut self);
+    fn expire_keys(&self);
 }
 
 #[derive(Clone, Debug)]
@@ -92,13 +92,13 @@ impl Node for SingleNode {
     }
 
     async fn rate_limit(
-        &mut self,
+        &self,
         client_id: String,
     ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
         local_rate_limit(client_id, self.rate_limiter.clone())
     }
 
-    fn expire_keys(&mut self) {
+    fn expire_keys(&self) {
         match self.rate_limiter.write() {
             Ok(mut rate_limiter) => {
                 rate_limiter.expire_keys();
@@ -158,7 +158,7 @@ impl Node for MultiNode {
     }
 
     async fn rate_limit(
-        &mut self,
+        &self,
         client_id: String,
     ) -> Result<Option<CheckCallsResponse>, anyhow::Error> {
         let number_of_buckets = self.topology.len().try_into()?;
@@ -193,7 +193,7 @@ impl Node for MultiNode {
         }
     }
 
-    fn expire_keys(&mut self) {
+    fn expire_keys(&self) {
         match self.rate_limiter.write() {
             Ok(mut rate_limiter) => {
                 rate_limiter.expire_keys();

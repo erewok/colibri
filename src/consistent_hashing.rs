@@ -29,7 +29,17 @@ pub fn jump_consistent_hash(key: &str, number_of_buckets: u32) -> u32 {
 
 /// Return bucket number to left and right of the selected one
 pub fn get_neighbor_bucket(bucket_selected: u32, number_of_buckets: u32) -> (u32, u32) {
-    if bucket_selected == 0 {
+    if number_of_buckets == 1 {
+        // Special case: only one bucket
+        (0, 0)
+    } else if number_of_buckets == 2 {
+        // Special case: two buckets - neighbor is the other one
+        if bucket_selected == 0 {
+            (1, 1)
+        } else {
+            (0, 0)
+        }
+    } else if bucket_selected == 0 {
         // bucket is first
         (number_of_buckets - 1, 1)
     } else if bucket_selected == number_of_buckets - 1 {
@@ -79,5 +89,118 @@ mod tests {
         assert_eq!(result_last, (21, 0));
         let result_middle = get_neighbor_bucket(17, 23);
         assert_eq!(result_middle, (16, 18));
+    }
+
+    #[test]
+    fn test_consistent_hashing_deterministic() {
+        let key = "test_key";
+        let bucket_count = 10;
+
+        // Same input should always produce same output
+        let result1 = jump_consistent_hash(key, bucket_count);
+        let result2 = jump_consistent_hash(key, bucket_count);
+        let result3 = jump_consistent_hash(key, bucket_count);
+
+        assert_eq!(result1, result2);
+        assert_eq!(result2, result3);
+        assert!(result1 < bucket_count);
+    }
+
+    #[test]
+    fn test_consistent_hashing_bounds() {
+        let test_cases = vec![
+            ("key1", 1),
+            ("key2", 5),
+            ("key3", 10),
+            ("key4", 50),
+            ("key5", 100),
+            ("very_long_key_with_lots_of_characters", 73),
+            ("", 25), // Empty string
+        ];
+
+        for (key, bucket_count) in test_cases {
+            let result = jump_consistent_hash(key, bucket_count);
+            assert!(
+                result < bucket_count,
+                "Hash result {} should be less than bucket count {} for key '{}'",
+                result,
+                bucket_count,
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_consistent_hashing_distribution() {
+        use std::collections::HashMap;
+
+        let bucket_count = 10;
+        let mut bucket_counts = HashMap::new();
+
+        // Test distribution across 1000 keys
+        for i in 0..1000 {
+            let key = format!("key_{}", i);
+            let bucket = jump_consistent_hash(&key, bucket_count);
+            *bucket_counts.entry(bucket).or_insert(0) += 1;
+        }
+
+        // Each bucket should get roughly equal distribution (within 50%)
+        let expected_per_bucket = 1000 / bucket_count as usize;
+        let tolerance = expected_per_bucket * 50 / 100; // 50% tolerance
+
+        // Verify all buckets are used
+        assert_eq!(bucket_counts.len(), bucket_count as usize);
+
+        for (bucket, count) in bucket_counts.iter() {
+            assert!(
+                *count >= expected_per_bucket - tolerance
+                    && *count <= expected_per_bucket + tolerance,
+                "Bucket {} has {} items, expected {} ± {} ({}% tolerance)",
+                bucket,
+                count,
+                expected_per_bucket,
+                tolerance,
+                (tolerance * 100) / expected_per_bucket
+            );
+        }
+    }
+
+    #[test]
+    fn test_neighbor_bucket_edge_cases() {
+        // Test first bucket (edge case)
+        assert_eq!(get_neighbor_bucket(0, 10), (9, 1));
+
+        // Test last bucket (edge case)
+        assert_eq!(get_neighbor_bucket(9, 10), (8, 0));
+
+        // Test middle bucket
+        assert_eq!(get_neighbor_bucket(5, 10), (4, 6));
+
+        // Test with different bucket counts
+        assert_eq!(get_neighbor_bucket(2, 5), (1, 3));
+        assert_eq!(get_neighbor_bucket(0, 5), (4, 1));
+        assert_eq!(get_neighbor_bucket(4, 5), (3, 0));
+
+        // Edge case: single bucket
+        assert_eq!(get_neighbor_bucket(0, 1), (0, 0));
+
+        // Edge case: two buckets
+        assert_eq!(get_neighbor_bucket(0, 2), (1, 1));
+        assert_eq!(get_neighbor_bucket(1, 2), (0, 0));
+    }
+
+    #[test]
+    fn test_consistent_hashing_reproducibility() {
+        // Test that the same key produces the same hash across multiple calls
+        let key = "reproducibility_test";
+        let bucket_count = 42;
+
+        let first_result = jump_consistent_hash(key, bucket_count);
+
+        // Call multiple times to ensure consistency
+        for _ in 0..100 {
+            let result = jump_consistent_hash(key, bucket_count);
+            assert_eq!(result, first_result, "Hash result changed across calls");
+        }
     }
 }

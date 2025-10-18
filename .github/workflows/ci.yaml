@@ -42,22 +42,9 @@ jobs:
       - name: Run tests
         run: |
           cd ${{ github.workspace }}
-          just ci-test
+          just test
   build:
     runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_INCREMENTAL: 0
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v5
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: nightly
-          override: true
-          components: rustfmt, clippy
-
       - run: cargo build --release --all-features

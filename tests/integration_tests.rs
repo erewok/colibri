@@ -1,5 +1,5 @@
-use colibri::cli::RateLimitSettings;
 use colibri::rate_limit::RateLimiter;
+use colibri::settings::RateLimitSettings;
 
 #[test]
 fn test_rate_limiter_integration() {

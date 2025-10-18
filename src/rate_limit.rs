@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use bincode::{Decode, Encode};
 use chrono::Utc;
 
-use crate::cli;
+use crate::settings;
 use crate::token_bucket;
 use crate::token_bucket::TokenBucket;
 
@@ -18,12 +18,12 @@ use crate::token_bucket::TokenBucket;
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
 #[derive(Clone, Debug, Decode, Encode)]
 pub struct RateLimiter {
-    settings: cli::RateLimitSettings,
+    settings: settings::RateLimitSettings,
     cache: HashMap<String, token_bucket::TokenBucket>,
 }
 
 impl RateLimiter {
-    pub fn new(rate_limit_settings: cli::RateLimitSettings) -> Self {
+    pub fn new(rate_limit_settings: settings::RateLimitSettings) -> Self {
         Self {
             settings: rate_limit_settings,
             cache: HashMap::new(),
@@ -85,8 +85,8 @@ mod tests {
     use super::*;
     use tokio::time::{self, Duration};
 
-    fn get_settings() -> cli::RateLimitSettings {
-        cli::RateLimitSettings {
+    fn get_settings() -> settings::RateLimitSettings {
+        settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
         }
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_rate_limiter_with_zero_tokens() {
-        let zero_settings = cli::RateLimitSettings {
+        let zero_settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 0,
             rate_limit_interval_seconds: 1,
         };
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn test_rate_limiter_settings_impact() {
         // Test with high limits
-        let high_limit = cli::RateLimitSettings {
+        let high_limit = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
         };

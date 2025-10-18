@@ -24,16 +24,17 @@
 //! # Ok(())
 //! # }
 //! ```
-
-use crate::error::{GossipError, Result};
-use crate::gossip::messages::{ClusterMembership, GossipPacket};
-use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+
+use super::messages::{ClusterMembership, GossipPacket, NodeStatus};
+use crate::error::{GossipError, Result};
 
 /// Dynamic UDP multicast transport for gossip communication
 ///
@@ -93,12 +94,7 @@ impl DynamicMulticastTransport {
         peers.clear();
 
         for (node_id, node_info) in &membership.nodes {
-            if *node_id != local_node_id
-                && matches!(
-                    node_info.status,
-                    crate::gossip::messages::NodeStatus::Active
-                )
-            {
+            if *node_id != local_node_id && matches!(node_info.status, NodeStatus::Active) {
                 peers.insert(node_info.address);
             }
         }
@@ -344,7 +340,7 @@ pub struct TransportStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gossip::messages::{
+    use crate::node::gossip::messages::{
         ClusterMembership, GossipMessage, NodeCapabilities, NodeInfo, NodeStatus,
     };
     use std::net::{IpAddr, Ipv4Addr};

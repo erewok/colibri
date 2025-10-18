@@ -53,16 +53,19 @@
 //! # }
 //! ```
 //! ```
-
-use crate::gossip::messages::{ClusterMembership, GossipMessage, GossipPacket};
-use crate::gossip::transport::DynamicMulticastTransport;
-use crate::gossip::versioned_bucket::VersionedTokenBucket;
-use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 use tokio::sync::RwLock;
 use tokio::time::interval;
+
+use super::{
+    messages::{ClusterMembership, GossipMessage, GossipPacket},
+    transport::DynamicMulticastTransport,
+    versioned_bucket::VersionedTokenBucket,
+};
 
 /// Represents an urgent update that needs immediate propagation
 #[derive(Debug, Clone)]
@@ -471,7 +474,7 @@ impl GossipScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gossip::messages::{NodeCapabilities, NodeInfo, NodeStatus};
+    use crate::node::gossip::messages::{NodeCapabilities, NodeInfo, NodeStatus};
     use crate::token_bucket::TokenBucket;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;

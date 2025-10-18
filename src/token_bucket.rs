@@ -1,9 +1,9 @@
-/// This module includes the "Token Bucket" rate-limiting algorithm.
-/// For inspiration see: https://en.wikipedia.org/wiki/Token_bucket
+//! This module includes the "Token Bucket" rate-limiting algorithm.
+//! For inspiration see: https://en.wikipedia.org/wiki/Token_bucket
 use bincode::{Decode, Encode};
 use chrono::Utc;
 
-use crate::cli;
+use crate::settings;
 
 /// Each rate-limited item will be stored in here.
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
@@ -35,7 +35,7 @@ impl TokenBucket {
     /// Tokens are added at the rate of token_rate * time_since_last_request
     pub fn add_tokens_to_bucket(
         &mut self,
-        rate_limit_settings: &cli::RateLimitSettings,
+        rate_limit_settings: &settings::RateLimitSettings,
     ) -> &mut Self {
         // epoch time in milliseconds here from `chrono` is an i64
         let diff_ms: i64 = Utc::now().timestamp_millis() - self.last_call;
@@ -146,7 +146,7 @@ mod tests {
             last_call: Utc::now().timestamp_millis(),
         };
 
-        let settings = cli::RateLimitSettings {
+        let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
         };
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_token_bucket_overflow_protection() {
-        let settings = cli::RateLimitSettings {
+        let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
         };
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_token_bucket_minimum_time_diff() {
-        let settings = cli::RateLimitSettings {
+        let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
         };
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_token_rate_calculation() {
-        let settings = cli::RateLimitSettings {
+        let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
         };
@@ -259,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_refill_over_time() {
-        let settings = cli::RateLimitSettings {
+        let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
         };

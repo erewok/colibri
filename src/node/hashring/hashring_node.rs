@@ -1,13 +1,17 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{event, info, Level};
 
 use crate::error::Result;
-use crate::hashring::consistent_hashing;
-use crate::node::{CheckCallsResponse, Node};
+use crate::node::{
+    generate_node_id_from_url,
+    hashring::consistent_hashing,
+    single_node::{local_check_limit, local_rate_limit},
+    CheckCallsResponse, Node,
+};
 use crate::rate_limit;
-use crate::single_node::{local_check_limit, local_rate_limit};
-use async_trait::async_trait;
+use crate::settings;
 
 pub enum ReplicationFactor {
     One = 1,
@@ -17,10 +21,30 @@ pub enum ReplicationFactor {
 
 #[derive(Clone, Debug)]
 pub struct HashringNode {
-    pub topology: HashMap<u32, String>,
+    pub topology: HashMap<u32, url::Url>,
     pub node_id: u32,
     // replication_factor: ReplicationFactor,
     pub rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
+}
+
+impl HashringNode {
+    pub fn new(
+        settings: settings::Settings,
+        rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
+    ) -> Result<Self> {
+        let node_id = settings.node_id();
+        let topology: HashMap<u32, url::Url> = settings
+            .topology
+            .into_iter()
+            .map(|url| (generate_node_id_from_url(&url), url))
+            .collect();
+        Ok(Self {
+            topology,
+            node_id,
+            // replication_factor: ReplicationFactor,
+            rate_limiter,
+        })
+    }
 }
 
 #[async_trait]

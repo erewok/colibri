@@ -1,6 +1,7 @@
-use crate::gossip::vector_clock::VectorClock;
-use crate::token_bucket::TokenBucket;
 use bincode::{Decode, Encode};
+
+use super::vector_clock::VectorClock;
+use crate::token_bucket::TokenBucket;
 
 /// A TokenBucket wrapped with vector clock for distributed conflict resolution
 #[derive(Clone, Debug, Decode, Encode)]

@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();
 
     // Build Axum Router and get shared state
-    let (api, app_state) = api::api(args).await?;
+    let (api, app_state) = api::api(args.into_settings()).await?;
     let state_for_expiry = app_state.clone();
 
     tokio::spawn(async move {

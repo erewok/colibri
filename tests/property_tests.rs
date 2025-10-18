@@ -1,6 +1,7 @@
-use colibri::cli::RateLimitSettings;
-use colibri::rate_limit::RateLimiter;
 use proptest::prelude::*;
+
+use colibri::rate_limit::RateLimiter;
+use colibri::settings::RateLimitSettings;
 
 proptest! {
     #[test]

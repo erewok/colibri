@@ -6,10 +6,11 @@
 //! - INTERNAL cluster communication (UDP gossip): Uses bincode for compact binary format
 //! - EXTERNAL API communication (HTTP): Uses serde_json for human-readable format
 //!
-
-use crate::gossip::versioned_bucket::VersionedTokenBucket;
-use bincode::{Decode, Encode};
 use std::collections::HashMap;
+
+use bincode::{Decode, Encode};
+
+use super::versioned_bucket::VersionedTokenBucket;
 
 /// All possible gossip message types for cluster communication
 #[derive(Debug, Clone, Decode, Encode)]

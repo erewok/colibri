@@ -6,13 +6,14 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use tracing::{event, info, Level};
 
-use crate::error::{ColibriError, GossipError, Result};
-use crate::gossip::{
-    generate_node_id_from_system, ClusterMembership, DynamicMulticastTransport, GossipMessage,
+use super::{
+    scheduler::GossipStats, ClusterMembership, DynamicMulticastTransport, GossipMessage,
     GossipPacket, GossipScheduler, VersionedTokenBucket,
 };
+use crate::error::{ColibriError, GossipError, Result};
 use crate::node::{CheckCallsResponse, Node};
 use crate::rate_limit::RateLimiter;
+use crate::settings;
 use crate::token_bucket::TokenBucket;
 
 /// A gossip-based node that maintains all client state locally
@@ -21,7 +22,7 @@ use crate::token_bucket::TokenBucket;
 #[derive(Clone)]
 pub struct GossipNode {
     node_id: u32,
-    /// Local rate limiter for fallback/legacy support
+    /// Local rate limiter
     rate_limiter: Arc<RwLock<RateLimiter>>,
     /// All versioned token buckets maintained locally
     local_buckets: Arc<DashMap<String, VersionedTokenBucket>>,
@@ -48,72 +49,24 @@ impl std::fmt::Debug for GossipNode {
 
 impl GossipNode {
     pub async fn new(
-        listen_port: u16,
-        topology: Vec<String>,
+        settings: settings::Settings,
         rate_limiter: Arc<RwLock<RateLimiter>>,
     ) -> Result<Self> {
-        let node_id = generate_node_id_from_system(listen_port)?;
+        let node_id = settings.node_id();
         info!(
             "Created GossipNode with ID: {} (port: {})",
-            node_id, listen_port
+            node_id, settings.listen_port
         );
 
         // Create local buckets first (needed for message processing)
         let local_buckets = Arc::new(DashMap::new());
 
         // Parse topology to get peer addresses
-        let peer_addresses: Vec<SocketAddr> = topology
+        let peer_addresses: Vec<SocketAddr> = settings
+            .topology
             .iter()
-            .filter_map(|host_str| {
-                let host = host_str.trim();
-
-                // Remove http:// or https:// prefix if present
-                let host = if host.starts_with("http://") {
-                    host.strip_prefix("http://").unwrap_or(host)
-                } else if host.starts_with("https://") {
-                    host.strip_prefix("https://").unwrap_or(host)
-                } else {
-                    host
-                };
-
-                // Try to parse as socket address first
-                if let Ok(addr) = host.parse::<SocketAddr>() {
-                    Some(addr)
-                } else {
-                    // Try to parse as host:port
-                    if let Some((hostname, port_str)) = host.split_once(':') {
-                        if let Ok(port) = port_str.parse::<u16>() {
-                            // Handle localhost
-                            let ip_str = if hostname == "localhost" {
-                                "127.0.0.1"
-                            } else {
-                                hostname
-                            };
-
-                            if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                                return Some(SocketAddr::new(ip, port));
-                            }
-                        }
-                    }
-                    // Default to port 7946 if no port specified
-                    let ip_str = if host == "localhost" {
-                        "127.0.0.1"
-                    } else {
-                        host
-                    };
-
-                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                        Some(SocketAddr::new(ip, 7946))
-                    } else {
-                        event!(
-                            Level::WARN,
-                            "Failed to parse topology address: {}",
-                            host_str
-                        );
-                        None
-                    }
-                }
-            })
+            .filter_map(|host| host.socket_addrs(|| Some(settings::STANDARD_PORT_UDP)).ok())
+            .flatten()
             .collect();
 
         // Create gossip components if we have peers
@@ -125,7 +78,11 @@ impl GossipNode {
             );
 
             // Create transport - use port 0 for tests to avoid conflicts
-            let gossip_port = if cfg!(test) { 0 } else { 7946 };
+            let gossip_port = if cfg!(test) {
+                0
+            } else {
+                settings::STANDARD_PORT_UDP
+            };
             let multicast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 1, 1)), 7946);
             let transport = Arc::new(
                 DynamicMulticastTransport::new(gossip_port, multicast_addr, peer_addresses.clone())
@@ -248,7 +205,7 @@ impl GossipNode {
     }
 
     /// Get gossip statistics (for monitoring/debugging)
-    pub async fn get_gossip_stats(&self) -> Option<crate::gossip::scheduler::GossipStats> {
+    pub async fn get_gossip_stats(&self) -> Option<GossipStats> {
         if let Some(ref scheduler) = self.gossip_scheduler {
             Some(scheduler.get_stats().await)
         } else {
@@ -478,39 +435,60 @@ impl Node for GossipNode {
 
 #[cfg(test)]
 mod tests {
+    use url::Url;
+
     use super::*;
     use std::sync::{Arc, RwLock};
 
+    pub fn gen_settings() -> settings::Settings {
+        settings::Settings {
+            listen_address: "0.0.0.0".to_string(),
+            listen_port: settings::STANDARD_PORT_HTTP,
+            listen_port_udp: settings::STANDARD_PORT_UDP,
+            topology: vec![],
+            rate_limit_max_calls_allowed: 1000,
+            rate_limit_interval_seconds: 60,
+            run_mode: settings::RunMode::Single,
+        }
+    }
+
     #[tokio::test]
-    async fn test_pure_gossip_node_single_mode() {
+    async fn test_gossip_node_single_mode() {
         let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            crate::cli::RateLimitSettings {
+            settings::RateLimitSettings {
                 rate_limit_max_calls_allowed: 1000,
                 rate_limit_interval_seconds: 60,
             },
         )));
 
-        // Create node with no topology (single mode)
-        let node = GossipNode::new(8080, vec![], rate_limiter).await.unwrap();
+        // Create node with no topology (single mode even though Gossip specified)
+        let mut conf = gen_settings();
+        conf.topology = vec![];
+        conf.run_mode = settings::RunMode::Gossip;
 
+        let node = GossipNode::new(conf, rate_limiter).await.unwrap();
         assert!(!node.has_gossip());
         assert!(node.gossip_scheduler.is_none());
         assert!(node.transport.is_none());
     }
 
     #[tokio::test]
-    async fn test_pure_gossip_node_gossip_mode() {
+    async fn test_gossip_node_gossip_mode() {
         let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            crate::cli::RateLimitSettings {
+            settings::RateLimitSettings {
                 rate_limit_max_calls_allowed: 1000,
                 rate_limit_interval_seconds: 60,
             },
         )));
 
         // Create node with topology (gossip mode) - use unique port
-        let topology = vec!["127.0.0.1:7949".to_string()];
-        let node = GossipNode::new(8081, topology, rate_limiter).await.unwrap();
+        let topology: Vec<url::Url> = vec![Url::parse("127.0.0.1:7949").unwrap()];
+        // Create node with topology (gossip mode)
+        let mut conf = gen_settings();
+        conf.topology = topology;
+        conf.run_mode = settings::RunMode::Gossip;
 
+        let node = GossipNode::new(conf, rate_limiter).await.unwrap();
         assert!(node.has_gossip());
         assert!(node.gossip_scheduler.is_some());
         assert!(node.transport.is_some());
@@ -523,15 +501,19 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limit_triggers_gossip() {
         let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            crate::cli::RateLimitSettings {
+            settings::RateLimitSettings {
                 rate_limit_max_calls_allowed: 10,
                 rate_limit_interval_seconds: 60,
             },
         )));
 
         // Create node with topology to enable gossip - use unique port
-        let topology = vec!["127.0.0.1:7950".to_string()];
-        let node = GossipNode::new(8082, topology, rate_limiter).await.unwrap();
+        let mut conf = gen_settings();
+        let topology: Vec<url::Url> = vec![Url::parse("127.0.0.1:7950").unwrap()];
+        conf.topology = topology;
+        conf.run_mode = settings::RunMode::Gossip;
+
+        let node = GossipNode::new(conf, rate_limiter).await.unwrap();
 
         // Perform rate limiting operation
         let result = node.rate_limit("test_client".to_string()).await.unwrap();
@@ -549,13 +531,18 @@ mod tests {
     #[tokio::test]
     async fn test_merge_gossip_state() {
         let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            crate::cli::RateLimitSettings {
+            settings::RateLimitSettings {
                 rate_limit_max_calls_allowed: 1000,
                 rate_limit_interval_seconds: 60,
             },
         )));
+        let mut conf = gen_settings();
+        conf.listen_port = 8084;
+        let topology: Vec<url::Url> = vec![Url::parse("127.0.0.1:7950").unwrap()];
+        conf.topology = topology;
+        conf.run_mode = settings::RunMode::Gossip;
 
-        let node = GossipNode::new(8083, vec![], rate_limiter).await.unwrap();
+        let node = GossipNode::new(conf, rate_limiter).await.unwrap();
 
         // Create some fake gossip state
         let mut entries = std::collections::HashMap::new();
@@ -588,7 +575,7 @@ mod tests {
             sender_node_id: 456,
             membership_version: 1,
         };
-        let packet = crate::gossip::GossipPacket::new(message);
+        let packet = crate::node::gossip::GossipPacket::new(message);
 
         // Process the message
         let result =
@@ -617,7 +604,7 @@ mod tests {
             sender_node_id: local_node_id, // Same as local_node_id
             membership_version: 1,
         };
-        let packet = crate::gossip::GossipPacket::new(message);
+        let packet = crate::node::gossip::GossipPacket::new(message);
 
         // Process the message
         let result =
@@ -631,21 +618,28 @@ mod tests {
     #[tokio::test]
     async fn test_topology_parsing_with_http_urls() {
         let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            crate::cli::RateLimitSettings {
+            settings::RateLimitSettings {
                 rate_limit_max_calls_allowed: 1000,
                 rate_limit_interval_seconds: 60,
             },
         )));
 
         // Test with HTTP URLs (like the justfile uses)
-        let topology = vec![
-            "http://localhost:8002".to_string(),
-            "https://localhost:8003".to_string(),
-            "127.0.0.1:8004".to_string(), // Without HTTP prefix
-            "localhost:8005".to_string(), // localhost without HTTP
-        ];
+        let topology = [
+            "http://localhost:8002",
+            "https://localhost:8003",
+            "127.0.0.1:8004", // Without HTTP prefix
+            "localhost:8005", // localhost without HTTP
+        ]
+        .iter_mut()
+        .map(|s| Url::parse(s).unwrap())
+        .collect::<Vec<Url>>();
+        let mut conf = gen_settings();
+        conf.topology = topology;
+        conf.run_mode = settings::RunMode::Gossip;
+        conf.listen_port_udp = 8081;
 
-        let node = GossipNode::new(8001, topology, rate_limiter).await.unwrap();
+        let node = GossipNode::new(conf, rate_limiter).await.unwrap();
 
         // Verify gossip is enabled (meaning topology was parsed successfully)
         assert!(node.has_gossip());
@@ -659,7 +653,7 @@ mod tests {
     #[tokio::test]
     async fn test_different_ports_generate_different_node_ids() {
         let rate_limiter1 = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            crate::cli::RateLimitSettings {
+            settings::RateLimitSettings {
                 rate_limit_max_calls_allowed: 1000,
                 rate_limit_interval_seconds: 60,
             },
@@ -667,14 +661,21 @@ mod tests {
         let rate_limiter2 = rate_limiter1.clone();
 
         // Create nodes with different ports - same topology to avoid differences there
-        let topology = vec!["http://localhost:9000".to_string()];
+        let topology = vec![Url::parse("http://localhost:9000").unwrap()];
 
-        let node1 = GossipNode::new(8001, topology.clone(), rate_limiter1)
-            .await
-            .unwrap();
-        let node2 = GossipNode::new(8002, topology, rate_limiter2)
-            .await
-            .unwrap();
+        let mut conf = gen_settings();
+        conf.topology = topology.clone();
+        conf.run_mode = settings::RunMode::Gossip;
+        conf.listen_port_udp = 8001;
+
+        let node1 = GossipNode::new(conf, rate_limiter1).await.unwrap();
+
+        let mut conf = gen_settings();
+        conf.topology = topology;
+        conf.run_mode = settings::RunMode::Gossip;
+        conf.listen_port_udp = 8002;
+
+        let node2 = GossipNode::new(conf, rate_limiter2).await.unwrap();
 
         // Verify nodes have different IDs
         assert_ne!(node1.node_id, node2.node_id);

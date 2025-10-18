@@ -4,11 +4,17 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+pub mod gossip;
+pub mod hashring;
+pub mod node_id;
+pub mod single_node;
+
 use crate::error::Result;
-use crate::gossip::GossipNode;
-use crate::hashring::HashringNode;
-use crate::single_node::SingleNode;
-use crate::{cli, rate_limit};
+use crate::{rate_limit, settings};
+pub use gossip::GossipNode;
+pub use hashring::HashringNode;
+pub use node_id::{generate_node_id, generate_node_id_from_url, validate_node_id};
+pub use single_node::SingleNode;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckCallsResponse {
@@ -31,55 +37,39 @@ pub enum NodeWrapper {
 }
 
 impl NodeWrapper {
-    pub async fn new(settings: cli::Cli) -> Result<Self> {
+    pub async fn new(settings: settings::Settings) -> Result<Self> {
         // A rate_limiter holds rate-limiting data in memory
         let rate_limiter = Arc::new(RwLock::new(rate_limit::RateLimiter::new(
             settings.rate_limit_settings(),
         )));
 
-        // Filter out empty strings from topology
-        let valid_topology: Vec<String> = settings
-            .topology
-            .iter()
-            .filter(|host| !host.trim().is_empty())
-            .map(|host| host.to_string())
-            .collect();
-
-        if valid_topology.is_empty() {
+        if settings.topology.is_empty() {
             info!("Starting in single-node mode (no other nodes specified)");
             Ok(Self::Single(SingleNode { rate_limiter }))
         } else {
-            match settings.multi_mode {
-                cli::MultiMode::Gossip => {
+            match settings.run_mode {
+                settings::RunMode::Single => {
+                    info!("Starting in single-node mode (ignoring specified topology)");
+                    Ok(Self::Single(SingleNode { rate_limiter }))
+                }
+                settings::RunMode::Gossip => {
                     info!(
-                        "Starting in pure gossip mode with {} other nodes: {:?}",
-                        valid_topology.len(),
-                        valid_topology
+                        "Starting in gossip mode with {} other nodes: {:?}",
+                        settings.topology.len(),
+                        settings.topology
                     );
                     // Use GossipNode instead of broken MultiNode
-                    let gossip_node =
-                        GossipNode::new(settings.listen_port, valid_topology, rate_limiter).await?;
+                    let gossip_node = GossipNode::new(settings, rate_limiter).await?;
                     Ok(Self::Gossip(gossip_node))
                 }
-                cli::MultiMode::Hashring => {
+                settings::RunMode::Hashring => {
                     info!(
                         "Starting in hashring mode with {} other nodes: {:?}",
-                        valid_topology.len(),
-                        valid_topology
+                        settings.topology.len(),
+                        settings.topology
                     );
-                    // Build hashring topology
-                    let mut topology_map: std::collections::HashMap<u32, String> =
-                        std::collections::HashMap::new();
-                    for (index, host) in valid_topology.iter().enumerate() {
-                        topology_map.insert(index as u32, host.clone());
-                    }
-                    // Assume this node's ID is the last in the list
-                    let node_id = (valid_topology.len() - 1) as u32;
-                    let hashring_node = HashringNode {
-                        topology: topology_map,
-                        node_id,
-                        rate_limiter,
-                    };
+                    // Build hashring node
+                    let hashring_node = HashringNode::new(settings, rate_limiter)?;
                     Ok(Self::Hashring(hashring_node))
                 }
             }

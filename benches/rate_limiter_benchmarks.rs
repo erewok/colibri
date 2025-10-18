@@ -1,5 +1,5 @@
-use colibri::cli::RateLimitSettings;
 use colibri::rate_limit::RateLimiter;
+use colibri::settings::RateLimitSettings;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 

@@ -1,10 +1,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use url::Url;
 
-/// Generate a deterministic u32 node ID from hostname and port
-///
-/// This creates a stable node ID that will be the same across restarts
-/// as long as the hostname and port remain the same.
+use crate::settings;
+
+/// Generate node ID as u32 from hostname and port
 pub fn generate_node_id(hostname: &str, port: u16) -> u32 {
     let mut hasher = DefaultHasher::new();
     hostname.hash(&mut hasher);
@@ -12,20 +12,13 @@ pub fn generate_node_id(hostname: &str, port: u16) -> u32 {
     hasher.finish() as u32
 }
 
-/// Generate node ID from system hostname and given port
-///
-/// Uses the system hostname which provides better collision resistance
-/// than IP addresses in containerized environments.
-pub fn generate_node_id_from_system(port: u16) -> Result<u32, String> {
-    let hostname = hostname::get()
-        .map_err(|_| "Failed to get hostname".to_string())?
-        .to_string_lossy()
-        .to_string();
-
-    validate_node_id(generate_node_id(&hostname, port))
+/// Generate node ID as u32 from hostname and standard port in a URL
+pub fn generate_node_id_from_url(url: &Url) -> u32 {
+    let hostname = url.host_str().unwrap_or("localhost");
+    let port = url.port().unwrap_or(settings::STANDARD_PORT_HTTP);
+    generate_node_id(hostname, port)
 }
 
-/// Validate that a node ID is not zero (reserved for special cases)
 pub fn validate_node_id(node_id: u32) -> Result<u32, String> {
     if node_id == 0 {
         return Err("Node ID cannot be zero (reserved value)".to_string());

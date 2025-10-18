@@ -1,14 +1,41 @@
 /// CLI and configuration for this application
 ///
-use serde::{Deserialize, Serialize};
+use bincode::{Decode, Encode};
 
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Decode, Encode)]
 pub struct RateLimitSettings {
     pub rate_limit_max_calls_allowed: u32,
     pub rate_limit_interval_seconds: u32,
+}
+
+#[derive(Clone, Debug)]
+pub enum MultiMode {
+    Gossip,
+    Hashring,
+}
+
+impl std::fmt::Display for MultiMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MultiMode::Gossip => write!(f, "gossip"),
+            MultiMode::Hashring => write!(f, "hashring"),
+        }
+    }
+}
+
+impl std::str::FromStr for MultiMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "gossip" => Ok(MultiMode::Gossip),
+            "hashring" => Ok(MultiMode::Hashring),
+            _ => Err(format!("Invalid multi-mode: {}", s)),
+        }
+    }
 }
 
 impl Default for RateLimitSettings {
@@ -70,32 +97,22 @@ pub struct Cli {
     )]
     pub rate_limit_interval_seconds: u32,
 
+    // Mode of multi-node operation
+    #[clap(
+        long,
+        default_value = "gossip",
+        env("MULTI_MODE"),
+        help = "Multi-node mode: 'gossip' or 'hashring'"
+    )]
+    pub multi_mode: MultiMode,
+
     // Cluster configuration information: topology
     #[clap(
         long,
-        default_value = "",
         env("TOPOLOGY"),
-        help = "In cluster mode, pass other node addresses: order matters!"
+        help = "Other node addresses in the cluster (e.g., http://node1:8000,http://node2:8000). If empty, runs in single-node mode."
     )]
     pub topology: Vec<String>,
-
-    // Cluster configuration information: this node-id
-    #[clap(
-        long,
-        default_value = "",
-        env("HOSTNAME"),
-        help = "An identifier for this node"
-    )]
-    pub hostname: String,
-
-    // Cluster configuration information: this node-id
-    #[clap(
-        long,
-        default_value = "0",
-        env("HOSTNAME"),
-        help = "An identifier for this node"
-    )]
-    pub node_id: u32,
 }
 
 impl Cli {
@@ -104,5 +121,9 @@ impl Cli {
             rate_limit_max_calls_allowed: self.rate_limit_max_calls_allowed,
             rate_limit_interval_seconds: self.rate_limit_interval_seconds,
         }
+    }
+
+    pub fn node_id(&self) -> Result<u32, String> {
+        crate::gossip::node_id::generate_node_id_from_system(self.listen_port)
     }
 }

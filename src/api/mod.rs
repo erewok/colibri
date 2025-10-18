@@ -11,21 +11,22 @@ use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 
 use crate::cli;
+use crate::error::Result;
 use crate::node;
 
 /// Build an API with a rate-limiter and a strategy
-pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
+pub async fn api(settings: cli::Cli) -> Result<(Router, node::NodeWrapper)> {
     // App state will automatically check limits or ask other nodes
-    let app_state = node::NodeWrapper::new(settings);
+    let app_state = node::NodeWrapper::new(settings).await?;
 
     // Endpoints
     let api = Router::new()
         .route("/", routing::get(base::root))
         .route("/health", routing::get(base::health))
         .route("/about", routing::get(base::about))
-        .route("/rl/:client_id", routing::post(rate_limits::rate_limit))
+        .route("/rl/{client_id}", routing::post(rate_limits::rate_limit))
         .route(
-            "/rl-check/:client_id",
+            "/rl-check/{client_id}",
             routing::get(rate_limits::check_limit),
         )
         .route("/expire-keys", routing::post(rate_limits::expire_keys))
@@ -37,9 +38,9 @@ pub async fn api(settings: cli::Cli) -> anyhow::Result<Router> {
                 .timeout(Duration::from_secs(10)),
         )
         .layer(TraceLayer::new_for_http())
-        .with_state(app_state);
+        .with_state(app_state.clone());
 
-    Ok(api)
+    Ok((api, app_state))
 }
 
 async fn handle_error(error: BoxError) -> impl IntoResponse {

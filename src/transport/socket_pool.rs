@@ -8,8 +8,9 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+// use parking_lot::RwLock;
 use tokio::net::UdpSocket;
+use tokio::sync::RwLock;
 
 use crate::error::{ColibriError, GossipError, Result};
 
@@ -64,7 +65,7 @@ impl UdpSocketPool {
 
     /// Send data to a specific peer
     pub async fn send_to(&self, target: SocketAddr, data: &[u8]) -> Result<()> {
-        let peers = self.peers.read();
+        let peers = self.peers.read().await;
         let peer_pool = peers.get(&target).ok_or_else(|| {
             ColibriError::Gossip(GossipError::Transport(format!(
                 "Peer not found: {}",
@@ -86,7 +87,7 @@ impl UdpSocketPool {
 
     /// Send data to a random peer
     pub async fn send_to_random(&self, data: &[u8]) -> Result<SocketAddr> {
-        let peers = self.peers.read();
+        let peers = self.peers.read().await;
         let peer_addrs: Vec<SocketAddr> = peers.keys().cloned().collect();
 
         if peer_addrs.is_empty() {
@@ -107,7 +108,7 @@ impl UdpSocketPool {
         data: &[u8],
         count: usize,
     ) -> Result<Vec<SocketAddr>> {
-        let peers = self.peers.read();
+        let peers = self.peers.read().await;
         let peer_addrs: Vec<SocketAddr> = peers.keys().cloned().collect();
 
         if peer_addrs.is_empty() {
@@ -146,7 +147,7 @@ impl UdpSocketPool {
 
     /// Add a new peer to the pool
     pub async fn add_peer(&self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
-        let mut peers = self.peers.write();
+        let mut peers = self.peers.write().await;
 
         if peers.contains_key(&peer_addr) {
             return Ok(()); // Peer already exists
@@ -165,7 +166,7 @@ impl UdpSocketPool {
 
     /// Remove a peer from the pool
     pub async fn remove_peer(&self, peer_addr: SocketAddr) -> Result<()> {
-        let mut peers = self.peers.write();
+        let mut peers = self.peers.write().await;
 
         if let Some(peer_pool) = peers.remove(&peer_addr) {
             let socket_count = peer_pool.sockets.len();
@@ -179,8 +180,8 @@ impl UdpSocketPool {
     }
 
     /// Get list of current peers
-    pub fn get_peers(&self) -> Vec<SocketAddr> {
-        self.peers.read().keys().cloned().collect()
+    pub async fn get_peers(&self) -> Vec<SocketAddr> {
+        self.peers.read().await.keys().cloned().collect()
     }
 
     /// Get socket pool statistics
@@ -251,7 +252,7 @@ mod tests {
         assert_eq!(stats.peer_count.load(Ordering::Relaxed), 2);
         assert_eq!(stats.total_sockets.load(Ordering::Relaxed), 6);
 
-        let pool_peers = pool.get_peers();
+        let pool_peers = pool.get_peers().await;
         assert_eq!(pool_peers.len(), 2);
         assert!(pool_peers.contains(&one));
         assert!(pool_peers.contains(&two));
@@ -279,7 +280,7 @@ mod tests {
         assert_eq!(stats.peer_count.load(Ordering::Relaxed), 1);
         assert_eq!(stats.total_sockets.load(Ordering::Relaxed), 2);
 
-        let remaining_peers = pool.get_peers();
+        let remaining_peers = pool.get_peers().await;
         assert_eq!(remaining_peers.len(), 1);
         assert!(remaining_peers.contains(&peer2));
     }

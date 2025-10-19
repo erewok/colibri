@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = UdpTransport::new(8000, cluster_urls, 3).await?;
 
     println!("Transport created on {}", transport.local_addr());
-    println!("Peers: {:?}", transport.get_peers());
+    println!("Peers: {:?}", transport.get_peers().await);
 
     // Example 1: Consistent Hashing Pattern
     // Send to specific peer and wait for response
@@ -108,7 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get direct access to socket pool for advanced operations
     let socket_pool = transport.socket_pool();
     println!("✓ Got direct socket pool access");
-    println!("  Socket pool has {} peers", socket_pool.get_peers().len());
+    println!(
+        "  Socket pool has {} peers",
+        socket_pool.get_peers().await.len()
+    );
 
     // Get direct access to receiver for advanced message processing
     let receiver = transport.receiver();

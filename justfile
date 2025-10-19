@@ -46,6 +46,7 @@ run-cluster:
     export srv1_udp=8001
     export srv2_udp=8002
     export srv3_udp=8003
+    export RUST_LOG=debug
 
     # Start node 1 (knows about nodes 2 and 3)
     cargo run -- \

@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
@@ -5,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use tracing::{event, info, Level};
+use tracing::{debug, event, info, Level};
 
 use super::{GossipMessage, GossipPacket, GossipScheduler};
 use crate::error::{ColibriError, GossipError, Result};
@@ -128,27 +129,48 @@ impl GossipNode {
 
     /// Get or create a versioned token bucket for a client
     fn get_or_create_bucket(&self, client_id: &str) -> VersionedTokenBucket {
-        self.local_buckets
+        let bucket = self
+            .local_buckets
             .entry(client_id.to_string())
             .or_insert_with(|| {
+                debug!("Creating new token bucket for client '{}'", client_id);
                 let bucket = TokenBucket::new(self.default_rate_limit, self.default_window);
                 VersionedTokenBucket::new(bucket, self.node_id)
             })
-            .clone()
+            .clone();
+
+        debug!(
+            "Retrieved bucket for client '{}': tokens={}, version={}",
+            client_id,
+            bucket.bucket.tokens,
+            bucket.vector_clock.get_timestamp(self.node_id)
+        );
+        bucket
     }
 
     /// Update a bucket locally and trigger gossip propagation if available
     fn update_bucket(&self, client_id: String, mut bucket: VersionedTokenBucket) {
+        let old_version = bucket.vector_clock.get_timestamp(self.node_id);
+
         // Increment our vector clock
-        bucket.vector_clock.increment(self.node_id);
+        let new_version = bucket.vector_clock.increment(self.node_id);
         bucket.last_updated_by = self.node_id;
+
+        debug!(
+            "Updated bucket for client '{}': tokens={}, version {} -> {}",
+            client_id, bucket.bucket.tokens, old_version, new_version
+        );
 
         // Store the updated bucket
         self.local_buckets.insert(client_id.clone(), bucket.clone());
 
         // Trigger gossip if available
-        if let Some(ref _scheduler) = self.gossip_scheduler {
-            // TODO: IMPLEMENT
+        if let Some(ref scheduler) = self.gossip_scheduler {
+            scheduler.record_change(client_id.clone(), bucket);
+            debug!(
+                "Recorded change in gossip scheduler for client '{}'",
+                client_id
+            );
         }
     }
 
@@ -157,25 +179,45 @@ impl GossipNode {
         &self,
         entries: std::collections::HashMap<String, VersionedTokenBucket>,
     ) {
+        debug!("Processing {} gossip entries for merge", entries.len());
+
         for (client_id, incoming_bucket) in entries {
             if let Some(mut current_entry) = self.local_buckets.get_mut(&client_id) {
+                let current_version = current_entry
+                    .vector_clock
+                    .get_timestamp(incoming_bucket.last_updated_by);
+                let incoming_version = incoming_bucket
+                    .vector_clock
+                    .get_timestamp(incoming_bucket.last_updated_by);
+
                 // Try to merge with existing bucket
-                if current_entry.merge(incoming_bucket, self.node_id) {
-                    event!(
-                        Level::DEBUG,
-                        "Merged gossip update for client: {}",
-                        client_id
+                if current_entry.merge(incoming_bucket.clone(), self.node_id) {
+                    debug!(
+                        "Merged gossip update for client '{}': {} -> {} tokens, version {} -> {}",
+                        client_id,
+                        current_entry.bucket.tokens,
+                        incoming_bucket.bucket.tokens,
+                        current_version,
+                        incoming_version
+                    );
+                } else {
+                    debug!(
+                        "Rejected gossip update for client '{}': incoming version {} <= current version {}",
+                        client_id, incoming_version, current_version
                     );
                 }
             } else {
                 // No existing entry, accept incoming state
+                debug!(
+                    "Accepted new gossip state for client '{}': tokens={}, version={}",
+                    client_id,
+                    incoming_bucket.bucket.tokens,
+                    incoming_bucket
+                        .vector_clock
+                        .get_timestamp(incoming_bucket.last_updated_by)
+                );
                 self.local_buckets
                     .insert(client_id.clone(), incoming_bucket);
-                event!(
-                    Level::DEBUG,
-                    "Accepted new gossip state for client: {}",
-                    client_id
-                );
             }
         }
     }
@@ -223,6 +265,41 @@ impl GossipNode {
             Err(ColibriError::Gossip(GossipError::Transport(
                 "Gossip not enabled - no transport available".to_string(),
             )))
+        }
+    }
+
+    /// Log current statistics about the gossip node state for debugging
+    pub fn log_stats(&self) {
+        let bucket_count = self.local_buckets.len();
+        debug!("Gossip node stats: {} active client buckets", bucket_count);
+
+        if bucket_count > 0 && bucket_count <= 10 {
+            // If we have a reasonable number of buckets, log details
+            for entry in self.local_buckets.iter() {
+                let (client_id, bucket) = (entry.key(), entry.value());
+                debug!(
+                    "  Client '{}': {} tokens, version={}, last_updated_by={}",
+                    client_id,
+                    bucket.bucket.tokens,
+                    bucket.vector_clock.get_timestamp(bucket.last_updated_by),
+                    bucket.last_updated_by
+                );
+            }
+        } else if bucket_count > 10 {
+            // If we have many buckets, just log a summary
+            let total_tokens: f64 = self
+                .local_buckets
+                .iter()
+                .map(|entry| entry.value().bucket.tokens)
+                .sum();
+            debug!("  Total tokens across all clients: {}", total_tokens);
+        }
+
+        if self.gossip_scheduler.is_some() {
+            // Note: We could add scheduler stats here if needed
+            debug!("  Gossip scheduler is active");
+        } else {
+            debug!("  No gossip scheduler configured");
         }
     }
 
@@ -442,9 +519,16 @@ impl Node for GossipNode {
     /// Check remaining calls for a client using local state
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
         let bucket = self.get_or_create_bucket(&client_id);
+        let calls_remaining = bucket.bucket.tokens_to_u32();
+
+        debug!(
+            "Check limit for client '{}': {} tokens remaining",
+            client_id, calls_remaining
+        );
+
         Ok(CheckCallsResponse {
             client_id,
-            calls_remaining: bucket.bucket.tokens_to_u32(),
+            calls_remaining,
         })
     }
 
@@ -454,10 +538,17 @@ impl Node for GossipNode {
 
         // Try to consume one token
         if bucket.bucket.try_consume(1) {
+            let calls_remaining = bucket.bucket.tokens_to_u32();
+
+            debug!(
+                "Rate limit SUCCESS for client '{}': {} tokens remaining",
+                client_id, calls_remaining
+            );
+
             // Success - update our state and trigger gossip
             let response = CheckCallsResponse {
                 client_id: client_id.clone(),
-                calls_remaining: bucket.bucket.tokens_to_u32(),
+                calls_remaining,
             };
 
             // Update bucket with new state
@@ -465,6 +556,10 @@ impl Node for GossipNode {
 
             Ok(Some(response))
         } else {
+            debug!(
+                "Rate limit EXCEEDED for client '{}': no tokens remaining",
+                client_id
+            );
             // Rate limit exceeded
             Ok(None)
         }
@@ -796,8 +891,8 @@ mod tests {
 
         // Test the socket pool has the expected peer
         if let Some(pool) = socket_pool {
-            let peers = pool.get_peers();
-            println!("Socket pool has {} peers: {:?}", peers.len(), peers);
+            let peers = pool.get_peers().await;
+            debug!("Socket pool has {} peers: {:?}", peers.len(), peers);
             // The peer count might be different due to URL parsing - just verify it's not empty
             assert!(
                 !peers.is_empty(),
@@ -810,9 +905,9 @@ mod tests {
             let local_addr = recv.local_addr();
             // In tests, port 0 is used which gets assigned a random port
             assert!(local_addr.port() > 0, "Receiver should have a valid port");
-            println!("Receiver listening on: {}", local_addr);
+            debug!("Receiver listening on: {}", local_addr);
         }
 
-        println!("✓ All transport integration methods working correctly");
+        info!("✓ All transport integration methods working correctly");
     }
 }

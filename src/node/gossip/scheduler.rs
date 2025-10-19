@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use rand::prelude::IndexedRandom;
 use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 
 use super::messages::{GossipMessage, GossipPacket};
 use crate::transport::{UdpReceiver, UdpSocketPool, UdpTransport};
@@ -105,25 +106,37 @@ impl GossipScheduler {
     /// Update cluster peers for gossip
     pub async fn update_cluster_peers(&self, new_peers: HashSet<SocketAddr>) {
         let mut peers = self.cluster_peers.write().await;
+        let peer_count = new_peers.len();
         *peers = new_peers;
-        println!("Updated cluster peers to {} members", peers.len());
+        info!("Updated cluster peers to {} members", peer_count);
+        debug!("Cluster peers: {:?}", *peers);
     }
 
     /// Record a state change for delta-state gossip
     pub fn record_change(&self, client_id: String, bucket: VersionedTokenBucket) {
         let change_record = ChangeRecord {
-            bucket,
+            bucket: bucket.clone(),
             last_changed: Instant::now(),
             gossip_attempts: 0,
             last_gossiped: None,
         };
 
-        self.recent_changes.insert(client_id, change_record);
+        self.recent_changes.insert(client_id.clone(), change_record);
+        debug!(
+            "Recorded state change for client '{}' with tokens={} version={}",
+            client_id,
+            bucket.bucket.tokens,
+            bucket.vector_clock.get_timestamp(self.node_id)
+        );
     }
 
     /// Update version vector for anti-entropy
     pub fn update_version_vector(&self, node_id: u32, version: u64) {
         self.version_vector.insert(node_id, version);
+        debug!(
+            "Updated version vector: node {} -> version {}",
+            node_id, version
+        );
     }
 
     /// Start the gossip scheduler with delta-state support
@@ -137,11 +150,11 @@ impl GossipScheduler {
         // TODO: Re-enable async tasks once Send issues are resolved
         // For now, just log that the scheduler is starting
 
-        println!(
+        info!(
             "Production gossip scheduler starting with {}ms delta-state interval",
             self.gossip_interval.as_millis()
         );
-        println!("Note: Async gossip loops temporarily disabled pending Send trait fixes");
+        warn!("Note: Async gossip loops temporarily disabled pending Send trait fixes");
 
         // Legacy processors can be enabled for basic functionality
         // self.start_legacy_processors().await;
@@ -163,7 +176,7 @@ impl GossipScheduler {
         let _stats = self.stats.clone();
 
         // TODO: Re-implement without Send trait issues
-        println!("Delta-state gossip loop would start here");
+        debug!("Delta-state gossip loop would start here");
 
         /*
         tokio::spawn(async move {
@@ -216,7 +229,7 @@ impl GossipScheduler {
                         // Send to selected peers
                         for &peer_addr in &selected_peers {
                             if let Err(e) = transport.send_to_peer(peer_addr, &bytes).await {
-                                eprintln!("Failed to send delta gossip to {}: {}", peer_addr, e);
+                                error!("Failed to send delta gossip to {}: {}", peer_addr, e);
                             }
                         }
 
@@ -241,7 +254,7 @@ impl GossipScheduler {
         let _version_vector = self.version_vector.clone();
         let _packet_id_counter = self.packet_id_counter.clone();
 
-        println!("Anti-entropy loop would start here");
+        debug!("Anti-entropy loop would start here");
 
         /*
         tokio::spawn(async move {
@@ -277,7 +290,7 @@ impl GossipScheduler {
 
                     if let Ok(bytes) = packet.serialize() {
                         if let Err(e) = transport.send_to_peer(peer_addr, &bytes).await {
-                            eprintln!(
+                            error!(
                                 "Failed to send anti-entropy request to {}: {}",
                                 peer_addr, e
                             );
@@ -294,7 +307,7 @@ impl GossipScheduler {
     async fn start_change_cleanup_loop(&self) {
         let _recent_changes = self.recent_changes.clone();
 
-        println!("Change cleanup loop would start here");
+        debug!("Change cleanup loop would start here");
 
         /*
         tokio::spawn(async move {

@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use url::Url;
 
 use crate::error::Result;
 /// Generic UDP transport layer for distributed systems
@@ -114,8 +113,8 @@ impl UdpTransport {
     }
 
     /// Get list of current peers
-    pub fn get_peers(&self) -> Vec<SocketAddr> {
-        self.socket_pool.get_peers()
+    pub async fn get_peers(&self) -> Vec<SocketAddr> {
+        self.socket_pool.get_peers().await
     }
 
     /// Get transport statistics
@@ -165,7 +164,7 @@ mod tests {
         let transport = UdpTransport::new(0, cluster_urls, 2).await.unwrap();
 
         assert!(transport.local_addr().port() > 0);
-        assert_eq!(transport.get_peers().len(), 2);
+        assert_eq!(transport.get_peers().await.len(), 2);
     }
 
     #[tokio::test]
@@ -188,16 +187,16 @@ mod tests {
     async fn test_peer_management() {
         let transport = UdpTransport::new(0, HashSet::new(), 1).await.unwrap();
 
-        assert_eq!(transport.get_peers().len(), 0);
+        assert_eq!(transport.get_peers().await.len(), 0);
 
         let peer_addr = "127.0.0.1:8001".parse().unwrap();
         transport.add_peer(peer_addr, 2).await.unwrap();
-
-        assert_eq!(transport.get_peers().len(), 1);
-        assert!(transport.get_peers().contains(&peer_addr));
+        let peers = transport.get_peers().await;
+        assert_eq!(peers.len(), 1);
+        assert!(peers.contains(&peer_addr));
 
         transport.remove_peer(peer_addr).await.unwrap();
-        assert_eq!(transport.get_peers().len(), 0);
+        assert_eq!(transport.get_peers().await.len(), 0);
     }
 
     #[tokio::test]

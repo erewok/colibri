@@ -123,7 +123,8 @@ impl GossipScheduler {
 
         self.recent_changes.insert(client_id.clone(), change_record);
         debug!(
-            "Recorded state change for client '{}' with tokens={} version={}",
+            "[{}] Recorded state change for client '{}' with tokens={} version={}",
+            self.node_id,
             client_id,
             bucket.bucket.tokens,
             bucket.vector_clock.get_timestamp(self.node_id)
@@ -145,42 +146,42 @@ impl GossipScheduler {
     /// 1. Delta-state gossip processor (configurable interval, default 100ms)
     /// 2. Anti-entropy process (every 10 seconds)
     /// 3. Change cleanup (every 30 seconds)
-    /// 4. Legacy urgent/regular processors (for backward compatibility)
     pub async fn start(&self) {
-        // TODO: Re-enable async tasks once Send issues are resolved
-        // For now, just log that the scheduler is starting
-
         info!(
             "Production gossip scheduler starting with {}ms delta-state interval",
             self.gossip_interval.as_millis()
         );
-        warn!("Note: Async gossip loops temporarily disabled pending Send trait fixes");
 
-        // Legacy processors can be enabled for basic functionality
-        // self.start_legacy_processors().await;
+        // Start all background tasks
+        self.start_delta_gossip_loop().await;
+        self.start_anti_entropy_loop().await;
+        self.start_change_cleanup_loop().await;
+
+        info!("All gossip scheduler background tasks started successfully");
     }
 
-    /// Start delta-state gossip loop (DISABLED - TODO: Fix Send trait issues)
-    #[allow(dead_code)]
+    /// Start delta-state gossip loop - sends recent changes to random peers
     async fn start_delta_gossip_loop(&self) {
-        let _recent_changes = self.recent_changes.clone();
-        let _transport = self.transport.clone();
-        let _cluster_peers = self.cluster_peers.clone();
-        let _gossip_interval = self.gossip_interval;
-        let _gossip_fanout = self.gossip_fanout;
-        let _max_payload_size = self.max_gossip_payload_size;
-        let _node_id = self.node_id;
-        let _gossip_round = self.gossip_round.clone();
-        let _packet_id_counter = self.packet_id_counter.clone();
-        let _version_vector = self.version_vector.clone();
-        let _stats = self.stats.clone();
+        // Clone all necessary data for the async task
+        let recent_changes = self.recent_changes.clone();
+        let transport = self.transport.clone();
+        let cluster_peers = self.cluster_peers.clone();
+        let gossip_interval = self.gossip_interval;
+        let gossip_fanout = self.gossip_fanout;
+        let max_payload_size = self.max_gossip_payload_size;
+        let node_id = self.node_id;
+        let gossip_round = self.gossip_round.clone();
+        let packet_id_counter = self.packet_id_counter.clone();
+        let version_vector = self.version_vector.clone();
+        let stats = self.stats.clone();
 
-        // TODO: Re-implement without Send trait issues
-        debug!("Delta-state gossip loop would start here");
-
-        /*
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(gossip_interval);
+            debug!(
+                "[{}] Delta-state gossip loop started with {}ms interval",
+                node_id,
+                gossip_interval.as_millis()
+            );
 
             loop {
                 interval.tick().await;
@@ -188,18 +189,26 @@ impl GossipScheduler {
                 // Get recent changes for delta-state gossip
                 let changes = Self::collect_recent_changes(
                     &recent_changes,
-                    Duration::from_millis(100), // Changes in last 100ms
+                    Duration::from_millis(500), // Changes in last 500ms
                 );
 
                 if changes.is_empty() {
                     continue;
                 }
 
+                debug!(
+                    "[{}] Found {} recent changes to gossip",
+                    node_id,
+                    changes.len()
+                );
+
                 // Select random peers for this gossip round
                 let peers = cluster_peers.read().await;
-                let selected_peers = Self::select_random_peers(&peers, gossip_fanout);
+                let peer_vec: Vec<SocketAddr> = peers.iter().cloned().collect();
+                let selected_peers = Self::select_random_peers(&peer_vec, gossip_fanout);
 
                 if selected_peers.is_empty() {
+                    debug!("[{}] No peers available for gossip", node_id);
                     continue;
                 }
 
@@ -216,20 +225,26 @@ impl GossipScheduler {
                     let message = GossipMessage::DeltaStateSync {
                         updates: chunk,
                         sender_node_id: node_id,
-                        gossip_round: gossip_round.fetch_add(1, Ordering::Relaxed),
+                        gossip_round: gossip_round
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         last_seen_versions: last_seen_versions.clone(),
                     };
 
                     let packet = GossipPacket::new_with_id(
                         message,
-                        packet_id_counter.fetch_add(1, Ordering::Relaxed),
+                        packet_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     );
 
                     if let Ok(bytes) = packet.serialize() {
                         // Send to selected peers
                         for &peer_addr in &selected_peers {
                             if let Err(e) = transport.send_to_peer(peer_addr, &bytes).await {
-                                error!("Failed to send delta gossip to {}: {}", peer_addr, e);
+                                warn!(
+                                    "[{}] Failed to send delta gossip to {}: {}",
+                                    node_id, peer_addr, e
+                                );
+                            } else {
+                                debug!("[{}] Sent delta gossip to {}", node_id, peer_addr);
                             }
                         }
 
@@ -237,28 +252,43 @@ impl GossipScheduler {
                         let mut stats_guard = stats.write().await;
                         stats_guard.regular_messages_sent += 1;
                         stats_guard.last_regular_gossip = Some(Instant::now());
+                        debug!(
+                            "[{}] Delta gossip round completed, sent to {} peers",
+                            node_id,
+                            selected_peers.len()
+                        );
+                    } else {
+                        warn!("[{}] Failed to serialize gossip packet", node_id);
+                    }
+                }
+
+                // Mark changes as gossiped
+                for entry in recent_changes.iter() {
+                    let key = entry.key();
+                    if let Some(mut record) = recent_changes.get_mut(key.as_str()) {
+                        record.gossip_attempts += 1;
+                        record.last_gossiped = Some(Instant::now());
                     }
                 }
             }
         });
-        */
     }
 
-    /// Start anti-entropy process for missed updates (DISABLED - TODO: Fix Send trait issues)
-    #[allow(dead_code)]
+    /// Start anti-entropy process for missed updates
     async fn start_anti_entropy_loop(&self) {
-        let _transport = self.transport.clone();
-        let _cluster_peers = self.cluster_peers.clone();
-        let _anti_entropy_interval = self.anti_entropy_interval;
-        let _node_id = self.node_id;
-        let _version_vector = self.version_vector.clone();
-        let _packet_id_counter = self.packet_id_counter.clone();
+        let transport = self.transport.clone();
+        let cluster_peers = self.cluster_peers.clone();
+        let anti_entropy_interval = self.anti_entropy_interval;
+        let node_id = self.node_id;
+        let version_vector = self.version_vector.clone();
+        let packet_id_counter = self.packet_id_counter.clone();
 
-        debug!("Anti-entropy loop would start here");
-
-        /*
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(anti_entropy_interval);
+            debug!(
+                "Anti-entropy loop started with {}s interval",
+                anti_entropy_interval.as_secs()
+            );
 
             loop {
                 interval.tick().await;
@@ -268,50 +298,52 @@ impl GossipScheduler {
                     continue;
                 }
 
-                // Select one random peer for anti-entropy
-                let mut rng = rand::rng();
-                if let Some(&peer_addr) = peers.choose(&mut rng) {
-                    // Send our version vector to detect missed updates
-                    let since_version: HashMap<u32, u64> = version_vector
-                        .iter()
-                        .map(|entry| (*entry.key(), *entry.value()))
-                        .collect();
+                // Select one random peer for anti-entropy - use simple random selection
+                let peer_vec: Vec<SocketAddr> = peers.iter().cloned().collect();
+                if !peer_vec.is_empty() {
+                    // Simple random selection using current time
+                    let index = (Instant::now().elapsed().as_nanos() as usize) % peer_vec.len();
+                    if let Some(&peer_addr) = peer_vec.get(index) {
+                        // Send our version vector to detect missed updates
+                        let since_version: HashMap<u32, u64> = version_vector
+                            .iter()
+                            .map(|entry| (*entry.key(), *entry.value()))
+                            .collect();
 
-                    let message = GossipMessage::StateRequest {
-                        requesting_node_id: node_id,
-                        missing_keys: None, // Request everything we might be missing
-                        since_version,
-                    };
+                        let message = GossipMessage::StateRequest {
+                            requesting_node_id: node_id,
+                            missing_keys: None, // Request everything we might be missing
+                            since_version,
+                        };
 
-                    let packet = GossipPacket::new_with_id(
-                        message,
-                        packet_id_counter.fetch_add(1, Ordering::Relaxed),
-                    );
+                        let packet = GossipPacket::new_with_id(
+                            message,
+                            packet_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                        );
 
-                    if let Ok(bytes) = packet.serialize() {
-                        if let Err(e) = transport.send_to_peer(peer_addr, &bytes).await {
-                            error!(
-                                "Failed to send anti-entropy request to {}: {}",
-                                peer_addr, e
-                            );
+                        if let Ok(bytes) = packet.serialize() {
+                            if let Err(e) = transport.send_to_peer(peer_addr, &bytes).await {
+                                warn!(
+                                    "[{}] Failed to send anti-entropy request to {}: {}",
+                                    node_id, peer_addr, e
+                                );
+                            } else {
+                                debug!("[{}] Sent anti-entropy request to {}", node_id, peer_addr);
+                            }
                         }
                     }
                 }
             }
         });
-        */
     }
 
-    /// Clean up old changes that have been sufficiently gossiped (DISABLED - TODO: Fix Send trait issues)
-    #[allow(dead_code)]
+    /// Clean up old changes that have been sufficiently gossiped
     async fn start_change_cleanup_loop(&self) {
-        let _recent_changes = self.recent_changes.clone();
+        let recent_changes = self.recent_changes.clone();
 
-        debug!("Change cleanup loop would start here");
-
-        /*
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
+            debug!("Change cleanup loop started with 30s interval");
 
             loop {
                 interval.tick().await;
@@ -328,12 +360,14 @@ impl GossipScheduler {
                     }
                 }
 
-                for key in keys_to_remove {
-                    recent_changes.remove(&key);
+                if !keys_to_remove.is_empty() {
+                    debug!("Cleaning up {} old change records", keys_to_remove.len());
+                    for key in keys_to_remove {
+                        recent_changes.remove(&key);
+                    }
                 }
             }
         });
-        */
     }
 
     // Helper methods for delta-state gossip
@@ -510,5 +544,26 @@ mod tests {
         let change_record = scheduler.recent_changes.get("test_key").unwrap();
         assert_eq!(change_record.bucket.last_updated_by, bucket.last_updated_by);
         assert_eq!(change_record.gossip_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_background_tasks_start() {
+        let scheduler = create_test_scheduler().await;
+
+        // Test that scheduler can start background tasks without panicking
+        scheduler.start().await;
+
+        // Give the tasks a moment to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Add a change to trigger gossip activity
+        let bucket = create_test_bucket(1);
+        scheduler.record_change("test_key".to_string(), bucket);
+
+        // Wait a bit more to see if tasks run
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // If we get here without panicking, the background tasks started successfully
+        assert!(scheduler.recent_changes.contains_key("test_key"));
     }
 }

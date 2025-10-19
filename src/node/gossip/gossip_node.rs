@@ -140,7 +140,8 @@ impl GossipNode {
             .clone();
 
         debug!(
-            "Retrieved bucket for client '{}': tokens={}, version={}",
+            "[{}] Retrieved bucket for client '{}': tokens={}, version={}",
+            self.node_id,
             client_id,
             bucket.bucket.tokens,
             bucket.vector_clock.get_timestamp(self.node_id)
@@ -157,8 +158,8 @@ impl GossipNode {
         bucket.last_updated_by = self.node_id;
 
         debug!(
-            "Updated bucket for client '{}': tokens={}, version {} -> {}",
-            client_id, bucket.bucket.tokens, old_version, new_version
+            "[{}] Updated bucket for client '{}': tokens={}, version {} -> {}",
+            self.node_id, client_id, bucket.bucket.tokens, old_version, new_version
         );
 
         // Store the updated bucket
@@ -168,8 +169,8 @@ impl GossipNode {
         if let Some(ref scheduler) = self.gossip_scheduler {
             scheduler.record_change(client_id.clone(), bucket);
             debug!(
-                "Recorded change in gossip scheduler for client '{}'",
-                client_id
+                "[{}] Recorded change in gossip scheduler for client '{}'",
+                self.node_id, client_id
             );
         }
     }
@@ -179,7 +180,11 @@ impl GossipNode {
         &self,
         entries: std::collections::HashMap<String, VersionedTokenBucket>,
     ) {
-        debug!("Processing {} gossip entries for merge", entries.len());
+        debug!(
+            "[{}] Processing {} gossip entries for merge",
+            self.node_id,
+            entries.len()
+        );
 
         for (client_id, incoming_bucket) in entries {
             if let Some(mut current_entry) = self.local_buckets.get_mut(&client_id) {
@@ -193,7 +198,8 @@ impl GossipNode {
                 // Try to merge with existing bucket
                 if current_entry.merge(incoming_bucket.clone(), self.node_id) {
                     debug!(
-                        "Merged gossip update for client '{}': {} -> {} tokens, version {} -> {}",
+                        "[{}] Merged gossip update for client '{}': {} -> {} tokens, version {} -> {}",
+                        self.node_id,
                         client_id,
                         current_entry.bucket.tokens,
                         incoming_bucket.bucket.tokens,
@@ -202,14 +208,15 @@ impl GossipNode {
                     );
                 } else {
                     debug!(
-                        "Rejected gossip update for client '{}': incoming version {} <= current version {}",
-                        client_id, incoming_version, current_version
+                        "[{}] Rejected gossip update for client '{}': incoming version {} <= current version {}",
+                        self.node_id, client_id, incoming_version, current_version
                     );
                 }
             } else {
                 // No existing entry, accept incoming state
                 debug!(
-                    "Accepted new gossip state for client '{}': tokens={}, version={}",
+                    "[{}] Accepted new gossip state for client '{}': tokens={}, version={}",
+                    self.node_id,
                     client_id,
                     incoming_bucket.bucket.tokens,
                     incoming_bucket
@@ -271,14 +278,18 @@ impl GossipNode {
     /// Log current statistics about the gossip node state for debugging
     pub fn log_stats(&self) {
         let bucket_count = self.local_buckets.len();
-        debug!("Gossip node stats: {} active client buckets", bucket_count);
+        debug!(
+            "[{}] Gossip node stats: {} active client buckets",
+            self.node_id, bucket_count
+        );
 
         if bucket_count > 0 && bucket_count <= 10 {
             // If we have a reasonable number of buckets, log details
             for entry in self.local_buckets.iter() {
                 let (client_id, bucket) = (entry.key(), entry.value());
                 debug!(
-                    "  Client '{}': {} tokens, version={}, last_updated_by={}",
+                    "[{}] Client '{}': {} tokens, version={}, last_updated_by={}",
+                    self.node_id,
                     client_id,
                     bucket.bucket.tokens,
                     bucket.vector_clock.get_timestamp(bucket.last_updated_by),
@@ -292,14 +303,17 @@ impl GossipNode {
                 .iter()
                 .map(|entry| entry.value().bucket.tokens)
                 .sum();
-            debug!("  Total tokens across all clients: {}", total_tokens);
+            debug!(
+                "[{}]  Total tokens across all clients: {}",
+                self.node_id, total_tokens
+            );
         }
 
         if self.gossip_scheduler.is_some() {
             // Note: We could add scheduler stats here if needed
-            debug!("  Gossip scheduler is active");
+            debug!("[{}]  Gossip scheduler is active", self.node_id);
         } else {
-            debug!("  No gossip scheduler configured");
+            debug!("[{}]  No gossip scheduler configured", self.node_id);
         }
     }
 
@@ -541,8 +555,8 @@ impl Node for GossipNode {
             let calls_remaining = bucket.bucket.tokens_to_u32();
 
             debug!(
-                "Rate limit SUCCESS for client '{}': {} tokens remaining",
-                client_id, calls_remaining
+                "[{}] Rate limit SUCCESS for client '{}': {} tokens remaining",
+                self.node_id, client_id, calls_remaining
             );
 
             // Success - update our state and trigger gossip

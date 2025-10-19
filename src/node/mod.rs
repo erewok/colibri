@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ pub struct CheckCallsResponse {
 pub trait Node {
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse>;
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>>;
-    fn expire_keys(&self);
+    async fn expire_keys(&self);
 }
 
 #[derive(Clone, Debug)]
@@ -80,11 +81,11 @@ impl NodeWrapper {
         }
     }
 
-    pub fn expire_keys(&self) {
+    pub async fn expire_keys(&self) {
         match self {
-            Self::Single(node) => node.expire_keys(),
-            Self::Gossip(node) => node.expire_keys(),
-            Self::Hashring(node) => node.expire_keys(),
+            Self::Single(node) => node.expire_keys().await,
+            Self::Gossip(node) => node.expire_keys().await,
+            Self::Hashring(node) => node.expire_keys().await,
         }
     }
 

@@ -1,8 +1,9 @@
 #[cfg(test)]
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -87,14 +88,13 @@ impl GossipNode {
                     })?,
             );
 
-            // Create gossip scheduler
+            // Create gossip scheduler - transport already knows about peers
             let scheduler = Arc::new(GossipScheduler::new(
                 Duration::from_millis(settings.gossip_interval_ms),
                 settings.gossip_fanout,
                 32768, // max payload size (32KB)
                 transport.clone(),
                 node_id,
-                settings.topology, // initial_peers
             ));
 
             // Start the gossip scheduler
@@ -329,7 +329,7 @@ impl GossipNode {
                 node_id
             );
 
-            let mut message_receiver = transport.get_message_receiver();
+            let mut message_receiver = transport.get_message_receiver().await;
 
             loop {
                 // Try to receive a message with a timeout
@@ -580,20 +580,10 @@ impl Node for GossipNode {
     }
 
     /// Expire keys from local buckets
-    fn expire_keys(&self) {
+    async fn expire_keys(&self) {
         // Expire from the legacy rate limiter
-        match self.rate_limiter.write() {
-            Ok(mut rate_limiter) => {
-                rate_limiter.expire_keys();
-            }
-            Err(err) => {
-                event!(
-                    Level::ERROR,
-                    message = "Failed expiring keys from rate_limiter",
-                    err = format!("{:?}", err)
-                );
-            }
-        }
+        let mut rate_limiter = self.rate_limiter.write().await;
+        rate_limiter.expire_keys();
 
         // TODO: Implement expiry for local_buckets based on TokenBucket's last_refill time
         // For now, we'll rely on the existing rate_limiter for expiry logic
@@ -605,7 +595,8 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     pub fn gen_settings() -> settings::Settings {
         settings::Settings {

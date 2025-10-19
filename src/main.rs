@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
         let mut interval = time::interval(Duration::from_millis(KEY_EXPIRY_INTERVAL));
         loop {
             interval.tick().await;
-            state_for_expiry.expire_keys();
+            state_for_expiry.expire_keys().await;
         }
     });
 

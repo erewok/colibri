@@ -93,8 +93,8 @@ impl UdpTransport {
     }
 
     /// Get a channel receiver for incoming messages
-    pub fn get_message_receiver(&self) -> mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)> {
-        self.receiver.get_message_receiver()
+    pub async fn get_message_receiver(&self) -> mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)> {
+        self.receiver.get_message_receiver().await
     }
 
     /// Add a new peer to the socket pool

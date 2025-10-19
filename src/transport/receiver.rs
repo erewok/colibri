@@ -8,9 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
 use crate::error::{ColibriError, GossipError, Result};
@@ -81,7 +80,7 @@ impl UdpReceiver {
                         stats.messages_received.fetch_add(1, Ordering::Relaxed);
 
                         // Check if this is a response to a pending request
-                        let mut pending = pending_responses.lock();
+                        let mut pending = pending_responses.lock().await;
                         if let Some(waiters) = pending.get_mut(&addr) {
                             if let Some(waiter) = waiters.pop() {
                                 if waiters.is_empty() {
@@ -131,7 +130,7 @@ impl UdpReceiver {
                         stats.messages_received.fetch_add(1, Ordering::Relaxed);
 
                         // Check if this is a response to a pending request
-                        let mut pending = pending_responses.lock();
+                        let mut pending = pending_responses.lock().await;
                         if let Some(waiters) = pending.get_mut(&addr) {
                             if let Some(waiter) = waiters.pop() {
                                 if waiters.is_empty() {
@@ -164,7 +163,7 @@ impl UdpReceiver {
     }
 
     /// Get a channel receiver for incoming messages
-    pub fn get_message_receiver(&self) -> mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)> {
+    pub async fn get_message_receiver(&self) -> mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)> {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Start the receiving task if not already started
@@ -174,7 +173,9 @@ impl UdpReceiver {
         let tx_clone = tx.clone();
 
         // Store the sender for potential cleanup
-        *self.message_tx.lock() = Some(tx);
+        let mut chan = self.message_tx.lock().await;
+        *chan = Some(tx);
+        drop(chan);
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536]; // 64KB buffer
@@ -186,7 +187,7 @@ impl UdpReceiver {
                         stats.messages_received.fetch_add(1, Ordering::Relaxed);
 
                         // Check if this is a response to a pending request
-                        let mut pending = pending_responses.lock();
+                        let mut pending = pending_responses.lock().await;
                         if let Some(waiters) = pending.get_mut(&addr) {
                             if let Some(waiter) = waiters.pop() {
                                 if waiters.is_empty() {
@@ -228,7 +229,7 @@ impl UdpReceiver {
 
         // Register the pending response
         {
-            let mut pending = self.pending_responses.lock();
+            let mut pending = self.pending_responses.lock().await;
             pending.entry(peer).or_insert_with(Vec::new).push(tx);
         }
 
@@ -240,7 +241,7 @@ impl UdpReceiver {
             ))),
             Err(_) => {
                 // Remove the pending request on timeout
-                let mut pending = self.pending_responses.lock();
+                let mut pending = self.pending_responses.lock().await;
                 if let Some(waiters) = pending.get_mut(&peer) {
                     waiters.clear(); // Clear all waiters for this peer
                     if waiters.is_empty() {
@@ -263,8 +264,8 @@ impl UdpReceiver {
     }
 
     /// Get count of pending response waiters (for debugging)
-    pub fn pending_response_count(&self) -> usize {
-        let pending = self.pending_responses.lock();
+    pub async fn pending_response_count(&self) -> usize {
+        let pending = self.pending_responses.lock().await;
         pending.values().map(|v| v.len()).sum()
     }
 }
@@ -283,7 +284,7 @@ mod tests {
         let receiver = UdpReceiver::new(bind_addr).await.unwrap();
 
         assert!(receiver.local_addr().port() > 0);
-        assert_eq!(receiver.pending_response_count(), 0);
+        assert_eq!(receiver.pending_response_count().await, 0);
     }
 
     #[tokio::test]
@@ -327,7 +328,7 @@ mod tests {
         let receiver = UdpReceiver::new(bind_addr).await.unwrap();
         let receiver_addr = receiver.local_addr();
 
-        let mut message_rx = receiver.get_message_receiver();
+        let mut message_rx = receiver.get_message_receiver().await;
 
         // Give the receiver task a moment to start
         sleep(Duration::from_millis(10)).await;
@@ -379,7 +380,7 @@ mod tests {
             Err(e) => panic!("Failed to receive response: {:?}", e),
         }
 
-        assert_eq!(receiver.pending_response_count(), 0);
+        assert_eq!(receiver.pending_response_count().await, 0);
     }
 
     #[tokio::test]
@@ -398,7 +399,7 @@ mod tests {
             response,
             Err(ColibriError::Gossip(GossipError::Transport(_)))
         ));
-        assert_eq!(receiver.pending_response_count(), 0);
+        assert_eq!(receiver.pending_response_count().await, 0);
     }
 
     #[tokio::test]
@@ -433,7 +434,7 @@ mod tests {
 
         // Should have 2 pending responses
         sleep(Duration::from_millis(10)).await;
-        assert_eq!(receiver.pending_response_count(), 2);
+        assert_eq!(receiver.pending_response_count().await, 2);
 
         // Send responses
         sender1.send_to(b"response1", receiver_addr).await.unwrap();
@@ -444,6 +445,6 @@ mod tests {
 
         assert_eq!(result1.unwrap(), b"response1");
         assert_eq!(result2.unwrap(), b"response2");
-        assert_eq!(receiver.pending_response_count(), 0);
+        assert_eq!(receiver.pending_response_count().await, 0);
     }
 }

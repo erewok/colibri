@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nStarting message receiver...");
 
     // Get a channel receiver for incoming messages
-    let mut message_rx = transport.get_message_receiver();
+    let mut message_rx = transport.get_message_receiver().await;
 
     // Spawn a task to handle incoming messages
     tokio::spawn(async move {

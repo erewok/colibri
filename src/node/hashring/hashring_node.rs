@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
-use tracing::{event, info, Level};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::info;
 
 use crate::error::Result;
 use crate::node::{
@@ -57,7 +58,7 @@ impl Node for HashringNode {
         let bucket =
             consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
         if bucket == self.node_id {
-            local_check_limit(client_id, self.rate_limiter.clone())
+            local_check_limit(client_id, self.rate_limiter.clone()).await
         } else {
             info!("Requesting data from bucket {}", bucket);
             // Use bucket to select into the topology HashMap
@@ -73,7 +74,7 @@ impl Node for HashringNode {
                         .map_err(Into::into)
                 }
                 // fallback to self?
-                None => local_check_limit(client_id, self.rate_limiter.clone()),
+                None => local_check_limit(client_id, self.rate_limiter.clone()).await,
             }
         }
     }
@@ -83,7 +84,7 @@ impl Node for HashringNode {
         let bucket =
             consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
         if bucket == self.node_id {
-            local_rate_limit(client_id, self.rate_limiter.clone())
+            local_rate_limit(client_id, self.rate_limiter.clone()).await
         } else {
             // Use bucket to select into the topology HashMap
             // The problem right now is that if this is a 429, we want to send that back
@@ -105,23 +106,13 @@ impl Node for HashringNode {
                     }
                 }
                 // fallback to self?
-                None => local_rate_limit(client_id, self.rate_limiter.clone()),
+                None => local_rate_limit(client_id, self.rate_limiter.clone()).await,
             }
         }
     }
 
-    fn expire_keys(&self) {
-        match self.rate_limiter.write() {
-            Ok(mut rate_limiter) => {
-                rate_limiter.expire_keys();
-            }
-            Err(err) => {
-                event!(
-                    Level::ERROR,
-                    message = "Failed expiring keys",
-                    err = format!("{:?}", err)
-                );
-            }
-        }
+    async fn expire_keys(&self) {
+        let mut rate_limiter = self.rate_limiter.write().await;
+        rate_limiter.expire_keys();
     }
 }

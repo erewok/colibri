@@ -2,13 +2,11 @@
 //!
 //! Manages a pool of UDP sockets for each peer in the cluster.
 //! Provides load balancing and fault tolerance through socket rotation.
-use rand::prelude::IndexedRandom;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-// use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
@@ -87,16 +85,24 @@ impl UdpSocketPool {
 
     /// Send data to a random peer
     pub async fn send_to_random(&self, data: &[u8]) -> Result<SocketAddr> {
-        let peers = self.peers.read().await;
-        let peer_addrs: Vec<SocketAddr> = peers.keys().cloned().collect();
+        // Select peer without holding the lock
+        let target = {
+            let peers = self.peers.read().await;
+            let peer_addrs: Vec<SocketAddr> = peers.keys().cloned().collect();
 
-        if peer_addrs.is_empty() {
-            return Err(ColibriError::Gossip(GossipError::Transport(
-                "No peers available".to_string(),
-            )));
-        }
-        let mut rng = rand::rng();
-        let target = *peer_addrs.choose(&mut rng).unwrap();
+            if peer_addrs.is_empty() {
+                return Err(ColibriError::Gossip(GossipError::Transport(
+                    "No peers available".to_string(),
+                )));
+            }
+            // Use simple time-based selection to avoid Send issues with rand::rng()
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let index = (now.as_nanos() as usize) % peer_addrs.len();
+            peer_addrs[index]
+        }; // Lock is dropped here
 
         self.send_to(target, data).await?;
         Ok(target)
@@ -108,22 +114,35 @@ impl UdpSocketPool {
         data: &[u8],
         count: usize,
     ) -> Result<Vec<SocketAddr>> {
-        let peers = self.peers.read().await;
-        let peer_addrs: Vec<SocketAddr> = peers.keys().cloned().collect();
+        // First, select peers without holding the lock
+        let selected_peers = {
+            let peers = self.peers.read().await;
+            let peer_addrs: Vec<SocketAddr> = peers.keys().cloned().collect();
 
-        if peer_addrs.is_empty() {
-            return Err(ColibriError::Gossip(GossipError::Transport(
-                "No peers available".to_string(),
-            )));
-        }
+            if peer_addrs.is_empty() {
+                return Err(ColibriError::Gossip(GossipError::Transport(
+                    "No peers available".to_string(),
+                )));
+            }
 
-        let mut rng = rand::rng();
-        let selected_count = count.min(peer_addrs.len());
-        let selected_peers: Vec<SocketAddr> = peer_addrs
-            .choose_multiple(&mut rng, selected_count)
-            .cloned()
-            .collect();
+            // Use simple selection method to avoid Send issues with rand::rng()
+            let selected_count = count.min(peer_addrs.len());
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let start_index = (now.as_nanos() as usize) % peer_addrs.len();
 
+            // Select consecutive peers starting from random index
+            let mut selected = Vec::with_capacity(selected_count);
+            for i in 0..selected_count {
+                let index = (start_index + i) % peer_addrs.len();
+                selected.push(peer_addrs[index]);
+            }
+            selected
+        }; // Lock is dropped here
+
+        // Now send to each peer without holding the main lock
         let mut successful_sends = Vec::new();
 
         for target in selected_peers {

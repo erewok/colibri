@@ -1,6 +1,7 @@
 //! Example usage of the UDP Transport module
 //!
-//! This example demonstrates both consistent hashing and gossip patterns.
+//! This example demonstrates both consistent hashing and gossip patterns,
+//! including direct access to socket pools and receivers for advanced use cases.
 
 use colibri::transport::{TransportStats, UdpTransport};
 use std::collections::HashSet;
@@ -14,9 +15,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Setup cluster topology
     let mut cluster_urls = HashSet::new();
-    cluster_urls.insert("udp://127.0.0.1:8001".parse()?);
-    cluster_urls.insert("udp://127.0.0.1:8002".parse()?);
-    cluster_urls.insert("udp://127.0.0.1:8003".parse()?);
+    cluster_urls.insert("127.0.0.1:8001".parse()?);
+    cluster_urls.insert("127.0.0.1:8002".parse()?);
+    cluster_urls.insert("127.0.0.1:8003".parse()?);
 
     // Create transport for this node
     let transport = UdpTransport::new(8000, cluster_urls, 3).await?;
@@ -100,6 +101,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Final stats
     let final_stats = transport.get_stats();
     print_stats(final_stats);
+
+    // Example 6: Direct Socket Pool and Receiver Access
+    println!("\nDemonstrating direct component access...");
+
+    // Get direct access to socket pool for advanced operations
+    let socket_pool = transport.socket_pool();
+    println!("✓ Got direct socket pool access");
+    println!("  Socket pool has {} peers", socket_pool.get_peers().len());
+
+    // Get direct access to receiver for advanced message processing
+    let receiver = transport.receiver();
+    println!("✓ Got direct receiver access");
+    println!("  Receiver bound to: {}", receiver.local_addr());
+
+    // Example 7: Advanced Socket Pool Operations
+    println!("\nDemonstrating advanced socket pool operations...");
+
+    // Send to multiple random peers using socket pool directly
+    let test_message = b"Direct socket pool message";
+    match socket_pool.send_to_random_multiple(test_message, 2).await {
+        Ok(targets) => println!(
+            "✓ Socket pool sent to {} random peers: {:?}",
+            targets.len(),
+            targets
+        ),
+        Err(e) => println!("✗ Socket pool send failed: {}", e),
+    }
+
+    // Example 8: Receiver Statistics
+    println!("\nReceiver statistics:");
+    let receiver_stats = receiver.get_stats();
+    println!(
+        "  Messages received: {}",
+        receiver_stats.messages_received.into_inner()
+    );
+    println!(
+        "  Receive errors: {}",
+        receiver_stats.receive_errors.into_inner()
+    );
+    println!("  Local address: {}", receiver.local_addr());
+
+    // Example 9: Gossip-like Message Pattern
+    println!("\nDemonstrating gossip-like message patterns...");
+
+    // Create a simple gossip message payload
+    let gossip_payload = b"GOSSIP_STATE_UPDATE:client_123:tokens_remaining:42";
+
+    // Send to random subset of peers (mimicking gossip fanout)
+    let gossip_fanout = 2;
+    match socket_pool
+        .send_to_random_multiple(gossip_payload, gossip_fanout)
+        .await
+    {
+        Ok(gossip_targets) => {
+            println!(
+                "✓ Sent gossip update to {} peers: {:?}",
+                gossip_targets.len(),
+                gossip_targets
+            );
+            println!("  Payload: {:?}", String::from_utf8_lossy(gossip_payload));
+        }
+        Err(e) => println!("✗ Gossip send failed: {}", e),
+    }
+
+    // Example 10: Transport Integration Capabilities
+    println!("\nTransport integration capabilities demonstrated:");
+    println!("  ✓ Direct socket pool access for custom protocols");
+    println!("  ✓ Direct receiver access for custom message handling");
+    println!("  ✓ Random peer selection for gossip patterns");
+    println!("  ✓ Specific peer targeting for consistent hashing");
+    println!("  ✓ Statistics collection for monitoring");
+    println!("  ✓ Dynamic peer management");
+    println!("  ✓ Channel-based async message processing");
 
     // Keep running for a moment to process any incoming messages
     println!("\nListening for messages for 5 seconds...");

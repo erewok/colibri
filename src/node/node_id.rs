@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use url::Url;
 
 use crate::settings;
@@ -17,6 +18,13 @@ pub fn generate_node_id_from_url(url: &Url) -> u32 {
     let hostname = url.host_str().unwrap_or("localhost");
     let port = url.port().unwrap_or(settings::STANDARD_PORT_HTTP);
     generate_node_id(hostname, port)
+}
+
+/// Generate node ID as u32 from hostname and standard port in a URL
+pub fn generate_node_id_from_socket_addr(socket_addr: &SocketAddr) -> u32 {
+    let hostname = socket_addr.ip().to_string();
+    let port = socket_addr.port();
+    generate_node_id(&hostname, port)
 }
 
 pub fn validate_node_id(node_id: u32) -> Result<u32, String> {

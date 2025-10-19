@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -12,7 +13,7 @@ use crate::node::{CheckCallsResponse, Node};
 use crate::rate_limit::RateLimiter;
 use crate::settings;
 use crate::token_bucket::TokenBucket;
-use crate::transport::UdpTransport;
+use crate::transport::{UdpReceiver, UdpSocketPool, UdpTransport};
 use crate::versioned_bucket::VersionedTokenBucket;
 
 /// A gossip-based node that maintains all client state locally
@@ -53,26 +54,18 @@ impl GossipNode {
         let node_id = settings.node_id();
         info!(
             "Created GossipNode with ID: {} (port: {})",
-            node_id, settings.listen_port
+            node_id, settings.listen_port_udp
         );
 
         // Create local buckets first (needed for message processing)
         let local_buckets = Arc::new(DashMap::new());
 
-        // Parse topology to get peer addresses
-        let peer_addresses: Vec<SocketAddr> = settings
-            .topology
-            .iter()
-            .filter_map(|host| host.socket_addrs(|| Some(settings::STANDARD_PORT_UDP)).ok())
-            .flatten()
-            .collect();
-
         // Create gossip components if we have peers
-        let (gossip_scheduler, transport) = if !peer_addresses.is_empty() {
+        let (gossip_scheduler, transport) = if !settings.topology.is_empty() {
             info!(
                 "Initializing gossip transport with {} peers: {:?}",
-                peer_addresses.len(),
-                peer_addresses
+                settings.topology.len(),
+                settings.topology
             );
 
             // Create transport - use port 0 for tests to avoid conflicts
@@ -82,14 +75,8 @@ impl GossipNode {
                 settings.listen_port_udp
             };
             // Convert peer addresses to URLs for UdpTransport
-            use std::collections::HashSet;
-            let cluster_urls: HashSet<url::Url> = peer_addresses
-                .iter()
-                .filter_map(|addr| format!("udp://{}", addr).parse().ok())
-                .collect();
-
             let transport = Arc::new(
-                UdpTransport::new(gossip_port, cluster_urls, 3)
+                UdpTransport::new(gossip_port, settings.topology.clone(), 3)
                     .await
                     .map_err(|e| {
                         ColibriError::Gossip(GossipError::Transport(format!(
@@ -101,13 +88,12 @@ impl GossipNode {
 
             // Create gossip scheduler
             let scheduler = Arc::new(GossipScheduler::new(
-                Duration::from_millis(25), // regular interval
-                4,                         // fanout
-                32768,                     // max payload size (32KB)
-                2,                         // urgent fanout
+                Duration::from_millis(settings.gossip_interval_ms),
+                settings.gossip_fanout,
+                32768, // max payload size (32KB)
                 transport.clone(),
                 node_id,
-                peer_addresses.clone(), // initial_peers
+                settings.topology, // initial_peers
             ));
 
             // Start the gossip scheduler
@@ -161,7 +147,7 @@ impl GossipNode {
         self.local_buckets.insert(client_id.clone(), bucket.clone());
 
         // Trigger gossip if available
-        if let Some(ref scheduler) = self.gossip_scheduler {
+        if let Some(ref _scheduler) = self.gossip_scheduler {
             // TODO: IMPLEMENT
         }
     }
@@ -197,6 +183,47 @@ impl GossipNode {
     /// Check if this node has gossip enabled
     pub fn has_gossip(&self) -> bool {
         self.gossip_scheduler.is_some() && self.transport.is_some()
+    }
+
+    /// Get direct access to the UDP socket pool for custom gossip operations
+    pub fn get_socket_pool(&self) -> Option<Arc<UdpSocketPool>> {
+        self.transport.as_ref().map(|t| t.socket_pool().clone())
+    }
+
+    /// Get direct access to the UDP receiver for custom message processing
+    pub fn get_receiver(&self) -> Option<Arc<UdpReceiver>> {
+        self.transport.as_ref().map(|t| t.receiver().clone())
+    }
+
+    /// Get direct access to the transport (if available)
+    pub fn get_transport(&self) -> Option<Arc<UdpTransport>> {
+        self.transport.clone()
+    }
+
+    /// Send a gossip message to random peers using the underlying socket pool
+    pub async fn send_to_random_peers(
+        &self,
+        message: &GossipMessage,
+        fanout: usize,
+    ) -> Result<Vec<SocketAddr>> {
+        if let Some(ref scheduler) = self.gossip_scheduler {
+            scheduler.gossip_to_random_peers(message, fanout).await
+        } else {
+            Err(ColibriError::Gossip(GossipError::Transport(
+                "Gossip not enabled - no transport available".to_string(),
+            )))
+        }
+    }
+
+    /// Send a gossip message to a specific peer using the underlying socket pool
+    pub async fn send_to_peer(&self, message: &GossipMessage, target: SocketAddr) -> Result<()> {
+        if let Some(ref scheduler) = self.gossip_scheduler {
+            scheduler.gossip_to_peer(message, target).await
+        } else {
+            Err(ColibriError::Gossip(GossipError::Transport(
+                "Gossip not enabled - no transport available".to_string(),
+            )))
+        }
     }
 
     /// Start the background task that processes incoming gossip messages
@@ -476,10 +503,13 @@ mod tests {
             listen_address: "0.0.0.0".to_string(),
             listen_port: settings::STANDARD_PORT_HTTP,
             listen_port_udp: settings::STANDARD_PORT_UDP,
-            topology: vec![],
             rate_limit_max_calls_allowed: 1000,
             rate_limit_interval_seconds: 60,
             run_mode: settings::RunMode::Single,
+            gossip_interval_ms: 25,
+            gossip_fanout: 4,
+            topology: HashSet::new(),
+            failure_timeout_secs: 30,
         }
     }
 
@@ -494,7 +524,7 @@ mod tests {
 
         // Create node with no topology (single mode even though Gossip specified)
         let mut conf = gen_settings();
-        conf.topology = vec![];
+        conf.topology = HashSet::new();
         conf.run_mode = settings::RunMode::Gossip;
 
         let node = GossipNode::new(conf, rate_limiter).await.unwrap();
@@ -513,7 +543,10 @@ mod tests {
         )));
 
         // Create node with topology (gossip mode) - use unique port
-        let topology: Vec<url::Url> = vec![Url::parse("127.0.0.1:7949").unwrap()];
+        let topology: HashSet<SocketAddr> = vec![Url::parse("http://127.0.0.1:7949").unwrap()]
+            .into_iter()
+            .map(|url| url.socket_addrs(|| None).unwrap()[0])
+            .collect();
         // Create node with topology (gossip mode)
         let mut conf = gen_settings();
         conf.topology = topology;
@@ -538,7 +571,10 @@ mod tests {
 
         // Create node with topology to enable gossip - use unique port
         let mut conf = gen_settings();
-        let topology: Vec<url::Url> = vec![Url::parse("127.0.0.1:7950").unwrap()];
+        let topology: HashSet<SocketAddr> = vec![Url::parse("http://127.0.0.1:7950").unwrap()]
+            .into_iter()
+            .map(|url| url.socket_addrs(|| None).unwrap()[0])
+            .collect();
         conf.topology = topology;
         conf.run_mode = settings::RunMode::Gossip;
 
@@ -564,7 +600,10 @@ mod tests {
         )));
         let mut conf = gen_settings();
         conf.listen_port = 8084;
-        let topology: Vec<url::Url> = vec![Url::parse("127.0.0.1:7950").unwrap()];
+        let topology: HashSet<SocketAddr> = vec![Url::parse("http://127.0.0.1:7951").unwrap()]
+            .into_iter()
+            .map(|url| url.socket_addrs(|| None).unwrap()[0])
+            .collect();
         conf.topology = topology;
         conf.run_mode = settings::RunMode::Gossip;
 
@@ -654,12 +693,12 @@ mod tests {
         let topology = [
             "http://localhost:8002",
             "https://localhost:8003",
-            "127.0.0.1:8004", // Without HTTP prefix
-            "localhost:8005", // localhost without HTTP
+            "http://127.0.0.1:8004", // With HTTP prefix
+            "http://localhost:8005", // localhost with HTTP
         ]
-        .iter_mut()
-        .map(|s| Url::parse(s).unwrap())
-        .collect::<Vec<Url>>();
+        .iter()
+        .map(|s| s.parse::<SocketAddr>().unwrap())
+        .collect::<HashSet<SocketAddr>>();
         let mut conf = gen_settings();
         conf.topology = topology;
         conf.run_mode = settings::RunMode::Gossip;
@@ -687,19 +726,24 @@ mod tests {
         let rate_limiter2 = rate_limiter1.clone();
 
         // Create nodes with different ports - same topology to avoid differences there
-        let topology = vec![Url::parse("http://localhost:9000").unwrap()];
+        let topology1: HashSet<SocketAddr> =
+            HashSet::from(["http://127.0.0.1:9000".parse().unwrap()]); // Different topology
+        let topology2: HashSet<SocketAddr> =
+            HashSet::from(["http://127.0.0.1:9001".parse().unwrap()]); // Different topology
 
         let mut conf = gen_settings();
-        conf.topology = topology.clone();
+        conf.topology = topology1;
         conf.run_mode = settings::RunMode::Gossip;
-        conf.listen_port_udp = 8001;
+        conf.listen_port = 8001; // Different HTTP port for node ID generation
+        conf.listen_port_udp = 8401; // Different UDP port
 
         let node1 = GossipNode::new(conf, rate_limiter1).await.unwrap();
 
         let mut conf = gen_settings();
-        conf.topology = topology;
+        conf.topology = topology2;
         conf.run_mode = settings::RunMode::Gossip;
-        conf.listen_port_udp = 8002;
+        conf.listen_port = 8002; // Different HTTP port for node ID generation
+        conf.listen_port_udp = 8402; // Different UDP port
 
         let node2 = GossipNode::new(conf, rate_limiter2).await.unwrap();
 
@@ -708,7 +752,67 @@ mod tests {
         assert_ne!(node1.node_id, 0);
         assert_ne!(node2.node_id, 0);
 
-        info!("Node 1 (port 8001) has ID: {}", node1.node_id);
-        info!("Node 2 (port 8002) has ID: {}", node2.node_id);
+        info!(
+            "Node 1 (HTTP port 8001, UDP port 8401) has ID: {}",
+            node1.node_id
+        );
+        info!(
+            "Node 2 (HTTP port 8002, UDP port 8402) has ID: {}",
+            node2.node_id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transport_integration_methods() {
+        let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
+            settings::RateLimitSettings {
+                rate_limit_max_calls_allowed: 1000,
+                rate_limit_interval_seconds: 60,
+            },
+        )));
+
+        // Create node with gossip enabled
+        let topology: HashSet<SocketAddr> =
+            HashSet::from(["http://localhost:9005".parse().unwrap()]);
+        let mut conf = gen_settings();
+        conf.topology = topology;
+        conf.run_mode = settings::RunMode::Gossip;
+        conf.listen_port = 8005;
+        conf.listen_port_udp = 8405;
+
+        let node = GossipNode::new(conf, rate_limiter).await.unwrap();
+
+        // Test direct component access methods
+        assert!(node.has_gossip());
+
+        let socket_pool = node.get_socket_pool();
+        assert!(socket_pool.is_some());
+
+        let receiver = node.get_receiver();
+        assert!(receiver.is_some());
+
+        let transport = node.get_transport();
+        assert!(transport.is_some());
+
+        // Test the socket pool has the expected peer
+        if let Some(pool) = socket_pool {
+            let peers = pool.get_peers();
+            println!("Socket pool has {} peers: {:?}", peers.len(), peers);
+            // The peer count might be different due to URL parsing - just verify it's not empty
+            assert!(
+                !peers.is_empty(),
+                "Socket pool should have at least one peer"
+            );
+        }
+
+        // Test that we can access the receiver
+        if let Some(recv) = receiver {
+            let local_addr = recv.local_addr();
+            // In tests, port 0 is used which gets assigned a random port
+            assert!(local_addr.port() > 0, "Receiver should have a valid port");
+            println!("Receiver listening on: {}", local_addr);
+        }
+
+        println!("✓ All transport integration methods working correctly");
     }
 }

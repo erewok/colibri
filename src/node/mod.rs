@@ -14,7 +14,10 @@ use crate::error::Result;
 use crate::{rate_limit, settings};
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;
-pub use node_id::{generate_node_id, generate_node_id_from_url, validate_node_id};
+pub use node_id::{
+    generate_node_id, generate_node_id_from_socket_addr, generate_node_id_from_url,
+    validate_node_id,
+};
 pub use single_node::SingleNode;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

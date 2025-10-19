@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tracing::{event, info, Level};
 
 use crate::error::Result;
 use crate::node::{
-    generate_node_id_from_url,
+    generate_node_id_from_socket_addr,
     hashring::consistent_hashing,
     single_node::{local_check_limit, local_rate_limit},
     CheckCallsResponse, Node,
@@ -21,7 +22,7 @@ pub enum ReplicationFactor {
 
 #[derive(Clone, Debug)]
 pub struct HashringNode {
-    pub topology: HashMap<u32, url::Url>,
+    pub topology: HashMap<u32, SocketAddr>,
     pub node_id: u32,
     // replication_factor: ReplicationFactor,
     pub rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
@@ -33,10 +34,12 @@ impl HashringNode {
         rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
     ) -> Result<Self> {
         let node_id = settings.node_id();
-        let topology: HashMap<u32, url::Url> = settings
+        let topology: HashMap<u32, SocketAddr> = settings
             .topology
             .into_iter()
-            .map(|url| (generate_node_id_from_url(&url), url))
+            .map(|socket_addr: std::net::SocketAddr| {
+                (generate_node_id_from_socket_addr(&socket_addr), socket_addr)
+            })
             .collect();
         Ok(Self {
             topology,

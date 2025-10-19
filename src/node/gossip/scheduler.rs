@@ -1,49 +1,7 @@
 //! Gossip Scheduler for Intelligent Message Distribution
 //!
 //! Provides layered gossip timing with membership awareness and payload optimization.
-//!
-//! Example usage:
-//! ```rust,no_run
-//! use colibri::gossip::{GossipScheduler, DynamicMulticastTransport, ClusterMembership};
-//! use colibri::gossip::versioned_bucket::VersionedTokenBucket;
-//! use std::time::Duration;
-//! use std::sync::Arc;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Create transport, membership, and other dependencies
-//! let transport = Arc::new(DynamicMulticastTransport::new(
-//!     7946,
-//!     "224.0.1.1:7946".parse()?,
-//!     vec!["192.168.1.10:7946".parse()?],
-//! ).await?);
-//! let membership = ClusterMembership::new(1, "127.0.0.1:8001".parse()?);
-//! let node_id = 1;
-//!
-//! let scheduler = GossipScheduler::new(
-//!     Duration::from_millis(25), // regular interval
-//!     4,                        // fanout
-//!     32768,                    // max payload size
-//!     2,                        // urgent fanout
-//!     transport,
-//!     node_id,
-//!     membership,
-//! );
-//!
-//! // Example bucket and client ID
-//! let client_id = "example_client".to_string();
-//! let token_bucket = colibri::token_bucket::TokenBucket::default();
-//! let bucket = VersionedTokenBucket::new(token_bucket, 1);
-//!
-//! // Add urgent update for critical state
-//! scheduler.add_urgent_update(client_id.clone(), bucket.clone());
-//!
-//! // Add regular update for normal sync
-//! scheduler.add_regular_update(client_id, bucket);
-//! # Ok(())
-//! # }
-//! ```
-//! ```
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -54,7 +12,7 @@ use rand::prelude::IndexedRandom;
 use tokio::sync::RwLock;
 
 use super::messages::{GossipMessage, GossipPacket};
-use crate::transport::UdpTransport;
+use crate::transport::{UdpReceiver, UdpSocketPool, UdpTransport};
 use crate::versioned_bucket::VersionedTokenBucket;
 
 /// Change record for tracking when keys were modified for delta-state gossip
@@ -66,7 +24,7 @@ pub struct ChangeRecord {
     pub last_gossiped: Option<Instant>,
 }
 
-/// Production gossip scheduler with delta-state propagation
+/// Gossip scheduler with delta-state propagation
 ///
 /// Only sends recently changed keys, not full state. Implements patterns from
 /// production systems like Cassandra and Consul.
@@ -75,13 +33,12 @@ pub struct GossipScheduler {
     gossip_interval: Duration,
     gossip_fanout: usize,
     max_gossip_payload_size: usize,
-    urgent_gossip_fanout: usize,
     anti_entropy_interval: Duration,
 
     // Transport and cluster state
     transport: Arc<UdpTransport>,
     node_id: u32,
-    cluster_peers: Arc<RwLock<Vec<SocketAddr>>>,
+    cluster_peers: Arc<RwLock<HashSet<SocketAddr>>>,
 
     // Change tracking for delta-state gossip
     recent_changes: Arc<DashMap<String, ChangeRecord>>,
@@ -125,16 +82,14 @@ impl GossipScheduler {
         gossip_interval: Duration,
         gossip_fanout: usize,
         max_gossip_payload_size: usize,
-        urgent_gossip_fanout: usize,
         transport: Arc<UdpTransport>,
         node_id: u32,
-        initial_peers: Vec<SocketAddr>,
+        initial_peers: HashSet<SocketAddr>,
     ) -> Self {
         Self {
             gossip_interval,
             gossip_fanout,
             max_gossip_payload_size,
-            urgent_gossip_fanout,
             anti_entropy_interval: Duration::from_secs(10),
             transport,
             node_id,
@@ -148,7 +103,7 @@ impl GossipScheduler {
     }
 
     /// Update cluster peers for gossip
-    pub async fn update_cluster_peers(&self, new_peers: Vec<SocketAddr>) {
+    pub async fn update_cluster_peers(&self, new_peers: HashSet<SocketAddr>) {
         let mut peers = self.cluster_peers.write().await;
         *peers = new_peers;
         println!("Updated cluster peers to {} members", peers.len());
@@ -171,7 +126,7 @@ impl GossipScheduler {
         self.version_vector.insert(node_id, version);
     }
 
-    /// Start the production gossip scheduler with delta-state support
+    /// Start the gossip scheduler with delta-state support
     ///
     /// This spawns multiple async tasks:
     /// 1. Delta-state gossip processor (configurable interval, default 100ms)
@@ -440,6 +395,58 @@ impl GossipScheduler {
         };
         self.recent_changes.insert(key, record);
     }
+
+    /// Get direct access to the UDP socket pool for custom gossip operations
+    pub fn get_socket_pool(&self) -> Arc<UdpSocketPool> {
+        self.transport.socket_pool().clone()
+    }
+
+    /// Get direct access to the UDP receiver for custom message processing
+    pub fn get_receiver(&self) -> Arc<UdpReceiver> {
+        self.transport.receiver().clone()
+    }
+
+    /// Send gossip message to random peers using socket pool directly
+    pub async fn gossip_to_random_peers(
+        &self,
+        message: &GossipMessage,
+        fanout: usize,
+    ) -> crate::error::Result<Vec<std::net::SocketAddr>> {
+        let packet = GossipPacket::new_with_id(
+            message.clone(),
+            self.packet_id_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+
+        if let Ok(bytes) = packet.serialize() {
+            self.transport.send_to_random_peers(&bytes, fanout).await
+        } else {
+            Err(crate::error::ColibriError::Gossip(
+                crate::error::GossipError::Message("Failed to serialize gossip packet".to_string()),
+            ))
+        }
+    }
+
+    /// Send gossip message to specific peer using socket pool directly
+    pub async fn gossip_to_peer(
+        &self,
+        message: &GossipMessage,
+        target: std::net::SocketAddr,
+    ) -> crate::error::Result<()> {
+        let packet = GossipPacket::new_with_id(
+            message.clone(),
+            self.packet_id_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+
+        if let Ok(bytes) = packet.serialize() {
+            self.transport.send_to_peer(target, &bytes).await
+        } else {
+            Err(crate::error::ColibriError::Gossip(
+                crate::error::GossipError::Message("Failed to serialize gossip packet".to_string()),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -457,14 +464,13 @@ mod tests {
                 .expect("Failed to create transport"),
         );
 
-        let initial_peers = vec![];
+        let initial_peers = HashSet::new();
         let node_id = 1;
 
         GossipScheduler::new(
             Duration::from_millis(25), // gossip_interval
-            4,                         // gossip_fanout
+            3,                         // gossip_fanout
             32768,                     // max_gossip_payload_size
-            2,                         // urgent_gossip_fanout
             transport,
             node_id,
             initial_peers,

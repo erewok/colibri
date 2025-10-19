@@ -36,7 +36,7 @@ impl UdpTransport {
     /// * `pool_size_per_peer` - Number of sockets to create per peer
     pub async fn new(
         bind_port: u16,
-        cluster_urls: HashSet<Url>,
+        cluster_socket_addresses: HashSet<SocketAddr>,
         pool_size_per_peer: usize,
     ) -> Result<Self> {
         let bind_addr = SocketAddr::from(([0, 0, 0, 0], bind_port));
@@ -45,20 +45,8 @@ impl UdpTransport {
         let receiver = UdpReceiver::new(bind_addr).await?;
         let local_addr = receiver.local_addr();
 
-        // Convert URLs to socket addresses
-        let peer_addrs: Vec<SocketAddr> = cluster_urls
-            .iter()
-            .filter_map(|url| {
-                if let (Some(host), Some(port)) = (url.host_str(), url.port()) {
-                    format!("{}:{}", host, port).parse().ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-
         // Create socket pool
-        let socket_pool = UdpSocketPool::new(peer_addrs, pool_size_per_peer).await?;
+        let socket_pool = UdpSocketPool::new(cluster_socket_addresses, pool_size_per_peer).await?;
 
         Ok(Self {
             socket_pool: Arc::new(socket_pool),
@@ -94,14 +82,6 @@ impl UdpTransport {
 
         // Wait for response from the specific peer
         self.receiver.wait_for_response_from(target, timeout).await
-    }
-
-    /// Start receiving messages with a callback
-    pub async fn start_receiving<F>(&self, callback: F) -> Result<()>
-    where
-        F: FnMut(Vec<u8>, SocketAddr) + Send + 'static,
-    {
-        self.receiver.start_receiving(callback).await
     }
 
     /// Start receiving messages with an async callback
@@ -149,6 +129,16 @@ impl UdpTransport {
             send_pool_stats,
         }
     }
+
+    /// Get direct access to the socket pool for advanced operations
+    pub fn socket_pool(&self) -> &Arc<UdpSocketPool> {
+        &self.socket_pool
+    }
+
+    /// Get direct access to the receiver for advanced operations
+    pub fn receiver(&self) -> &Arc<UdpReceiver> {
+        &self.receiver
+    }
 }
 
 /// Transport statistics
@@ -169,8 +159,8 @@ mod tests {
     #[tokio::test]
     async fn test_transport_creation() {
         let mut cluster_urls = HashSet::new();
-        cluster_urls.insert("udp://127.0.0.1:8001".parse().unwrap());
-        cluster_urls.insert("udp://127.0.0.1:8002".parse().unwrap());
+        cluster_urls.insert("127.0.0.1:8001".parse().unwrap());
+        cluster_urls.insert("127.0.0.1:8002".parse().unwrap());
 
         let transport = UdpTransport::new(0, cluster_urls, 2).await.unwrap();
 

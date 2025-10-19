@@ -1,6 +1,7 @@
 //! Colibri application settings
 use bincode::{Decode, Encode};
-use url::Url;
+use std::collections::HashSet;
+use std::net::SocketAddr;
 
 use crate::node::node_id::generate_node_id;
 
@@ -91,8 +92,14 @@ pub struct Settings {
     // Mode of multi-node operation
     pub run_mode: RunMode,
 
+    // Gossip Configuration
+    pub gossip_interval_ms: u64, // Regular gossip interval (default: 25)
+    pub gossip_fanout: usize,    // Number of peers per gossip round (default: 4)
+
     // Cluster configuration information: topology
-    pub topology: Vec<Url>,
+    pub topology: HashSet<SocketAddr>,
+    // Cluster Configuration
+    pub failure_timeout_secs: u64, // Node failure detection timeout (default: 30)
 }
 
 impl Settings {

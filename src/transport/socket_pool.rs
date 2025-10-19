@@ -3,13 +3,12 @@
 //! Manages a pool of UDP sockets for each peer in the cluster.
 //! Provides load balancing and fault tolerance through socket rotation.
 use rand::prelude::IndexedRandom;
-
-use parking_lot::RwLock;
-
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 
 use crate::error::{ColibriError, GossipError, Result};
@@ -37,7 +36,10 @@ struct PeerSocketPool {
 
 impl UdpSocketPool {
     /// Create a new socket pool
-    pub async fn new(peer_addrs: Vec<SocketAddr>, pool_size_per_peer: usize) -> Result<Self> {
+    pub async fn new(
+        peer_addrs: HashSet<std::net::SocketAddr>,
+        pool_size_per_peer: usize,
+    ) -> Result<Self> {
         let mut peers = HashMap::new();
         let mut total_sockets = 0;
 
@@ -239,10 +241,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_socket_pool_creation() {
-        let peers = vec![
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002),
-        ];
+        let one = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
+        let two = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
+        let peers: HashSet<SocketAddr> = HashSet::from([one.clone(), two.clone()]);
 
         let pool = UdpSocketPool::new(peers.clone(), 3).await.unwrap();
 
@@ -252,13 +253,13 @@ mod tests {
 
         let pool_peers = pool.get_peers();
         assert_eq!(pool_peers.len(), 2);
-        assert!(pool_peers.contains(&peers[0]));
-        assert!(pool_peers.contains(&peers[1]));
+        assert!(pool_peers.contains(&one));
+        assert!(pool_peers.contains(&two));
     }
 
     #[tokio::test]
     async fn test_peer_management() {
-        let pool = UdpSocketPool::new(vec![], 2).await.unwrap();
+        let pool = UdpSocketPool::new(HashSet::new(), 2).await.unwrap();
 
         let peer1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
         let peer2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
@@ -285,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_random_no_peers() {
-        let pool = UdpSocketPool::new(vec![], 1).await.unwrap();
+        let pool = UdpSocketPool::new(HashSet::new(), 1).await.unwrap();
 
         let result = pool.send_to_random(b"test").await;
         assert!(matches!(
@@ -296,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_nonexistent_peer() {
-        let pool = UdpSocketPool::new(vec![], 1).await.unwrap();
+        let pool = UdpSocketPool::new(HashSet::new(), 1).await.unwrap();
 
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
         let result = pool.send_to(peer, b"test").await;
@@ -324,11 +325,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_random_multiple() {
-        let peers = vec![
+        let peers: HashSet<SocketAddr> = HashSet::from([
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8003),
-        ];
+        ]);
 
         let pool = UdpSocketPool::new(peers, 1).await.unwrap();
 

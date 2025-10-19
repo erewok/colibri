@@ -1,6 +1,6 @@
 //! CLI for this application
 //!
-use url::Url;
+use std::net::SocketAddr;
 
 use crate::settings;
 
@@ -76,9 +76,34 @@ pub struct Cli {
     #[clap(
         long,
         env("COLIBRI_TOPOLOGY"),
-        help = "UDP addresses if Gossip, otherwise HTTP (e.g., http://node1:8000,http://node2:8000). If empty, runs in single-node mode."
+        help = "Socket Address for TCP (hashring) or UDP (gossip) (e.g., 1.2.3.4:8000,127.0.0.1:8001). If empty, runs in single-node mode."
     )]
-    pub topology: Vec<Url>,
+    pub topology: Vec<SocketAddr>,
+    // failure_timeout_secs: u64, // Node failure detection timeout (default: 30)
+    #[clap(
+        long,
+        default_value = "30",
+        env("COLIBRI_FAILURE_TIMEOUT_SECS"),
+        help = "Node failure detection timeout in seconds"
+    )]
+    pub failure_timeout_secs: u64,
+
+    // Gossip settings
+    #[clap(
+        long,
+        default_value = "25",
+        env("COLIBRI_GOSSIP_INTERVAL_MS"),
+        help = "Gossip interval in milliseconds"
+    )]
+    pub gossip_interval_ms: u64,
+
+    #[clap(
+        long,
+        default_value = "4",
+        env("COLIBRI_GOSSIP_FANOUT"),
+        help = "Number of peers to gossip to per round"
+    )]
+    pub gossip_fanout: usize,
 }
 
 impl Cli {
@@ -90,7 +115,10 @@ impl Cli {
             rate_limit_max_calls_allowed: self.rate_limit_max_calls_allowed,
             rate_limit_interval_seconds: self.rate_limit_interval_seconds,
             run_mode: self.run_mode,
-            topology: self.topology,
+            topology: self.topology.into_iter().collect(),
+            failure_timeout_secs: self.failure_timeout_secs,
+            gossip_interval_ms: self.gossip_interval_ms,
+            gossip_fanout: self.gossip_fanout,
         }
     }
 }

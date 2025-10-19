@@ -21,6 +21,7 @@ build *args:
 # Run code quality checks
 check:
     #!/bin/bash -eux
+    cargo check
     cargo clippy -- -D warnings
     cargo fmt --all -- --check
 
@@ -45,20 +46,23 @@ run-cluster:
 
     # Start node 1 (knows about nodes 2 and 3)
     cargo run -- --listen-port 8001 \
-        --topology "http://localhost:8002" \
-        --topology "http://localhost:8003" &
+        --listen-port-udp 8401 \
+        --topology "http://localhost:8402" \
+        --topology "http://localhost:8403" &
     NODE1_PID=$!
 
     # Start node 2 (knows about nodes 1 and 3)
     cargo run -- --listen-port 8002 \
-        --topology "http://localhost:8001" \
-        --topology "http://localhost:8003" &
+        --listen-port-udp 8402 \
+        --topology "http://localhost:8401" \
+        --topology "http://localhost:8403" &
     NODE2_PID=$!
 
     # Start node 3 (knows about nodes 1 and 2)
     cargo run -- --listen-port 8003 \
-        --topology "http://localhost:8001" \
-        --topology "http://localhost:8002" &
+        --listen-port-udp 8403 \
+        --topology "http://localhost:8401" \
+        --topology "http://localhost:8402" &
     NODE3_PID=$!
 
     echo "All nodes started. PIDs: $NODE1_PID, $NODE2_PID, $NODE3_PID"
@@ -69,26 +73,29 @@ run-cluster:
     wait
 
 # Run a specific node in multi-node mode
-run-node port other_nodes:
-    cargo run -- --listen-port {{port}} --topology {{other_nodes}}
+run-node port udp_port other_nodes:
+    cargo run -- --listen-port {{port}} --listen-port-udp {{udp_port}} --topology {{other_nodes}}
 
 # Run node 1 of a 3-node cluster
 run-node1:
     cargo run -- --listen-port 8001 \
-        --topology "http://localhost:8002" \
-        --topology "http://localhost:8003"
+        --listen-port-udp 8401 \
+        --topology "http://localhost:8402" \
+        --topology "http://localhost:8403"
 
 # Run node 2 of a 3-node cluster
 run-node2:
     cargo run -- --listen-port 8002 \
-        --topology "http://localhost:8001" \
-        --topology "http://localhost:8003"
+        --listen-port-udp 8402 \
+        --topology "http://localhost:8401" \
+        --topology "http://localhost:8403"
 
 # Run node 3 of a 3-node cluster
 run-node3:
     cargo run -- --listen-port 8003 \
-        --topology "http://localhost:8001" \
-        --topology "http://localhost:8002"
+        --listen-port-udp 8403 \
+        --topology "http://localhost:8401" \
+        --topology "http://localhost:8402"
 
 # Test multi-node cluster (assumes cluster is running)
 test-cluster:
@@ -119,3 +126,6 @@ test *args:
 # Run benchmarks (full execution)
 bench:
     cargo bench
+
+transport_demo:
+    cargo run --example transport_demo

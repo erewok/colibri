@@ -7,8 +7,12 @@ use crate::node::node_id::generate_node_id;
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const STANDARD_PORT_HTTP: u16 = 8411;
+pub const STANDARD_PORT_HTTP: u16 = 8410;
+pub const DEFAULT_PORT_HTTP: &str = "8410";
+pub const STANDARD_PORT_TCP: u16 = 8411;
+pub const DEFAULT_PORT_TCP: &str = "8411";
 pub const STANDARD_PORT_UDP: u16 = 8412;
+pub const DEFAULT_PORT_UDP: &str = "8412";
 
 #[derive(Clone, Debug, Decode, Encode)]
 pub struct RateLimitSettings {

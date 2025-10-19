@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -6,19 +6,17 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use tracing::{event, info, Level};
 
-use super::{
-    scheduler::GossipStats, ClusterMembership, DynamicMulticastTransport, GossipMessage,
-    GossipPacket, GossipScheduler, VersionedTokenBucket,
-};
+use super::{GossipMessage, GossipPacket, GossipScheduler};
 use crate::error::{ColibriError, GossipError, Result};
 use crate::node::{CheckCallsResponse, Node};
 use crate::rate_limit::RateLimiter;
 use crate::settings;
 use crate::token_bucket::TokenBucket;
+use crate::transport::UdpTransport;
+use crate::versioned_bucket::VersionedTokenBucket;
 
 /// A gossip-based node that maintains all client state locally
-/// and syncs with other nodes via gossip protocol. No consistent hashing,
-/// no HTTP forwarding - every node can answer every request.
+/// and syncs with other nodes via gossip protocol.
 #[derive(Clone)]
 pub struct GossipNode {
     node_id: u32,
@@ -29,7 +27,7 @@ pub struct GossipNode {
     /// Gossip scheduler for state propagation
     gossip_scheduler: Option<Arc<GossipScheduler>>,
     /// Transport layer for network communication
-    transport: Option<Arc<DynamicMulticastTransport>>,
+    transport: Option<Arc<UdpTransport>>,
     /// Configuration
     default_rate_limit: u32,
     default_window: Duration,
@@ -81,11 +79,17 @@ impl GossipNode {
             let gossip_port = if cfg!(test) {
                 0
             } else {
-                settings::STANDARD_PORT_UDP
+                settings.listen_port_udp
             };
-            let multicast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 1, 1)), 7946);
+            // Convert peer addresses to URLs for UdpTransport
+            use std::collections::HashSet;
+            let cluster_urls: HashSet<url::Url> = peer_addresses
+                .iter()
+                .filter_map(|addr| format!("udp://{}", addr).parse().ok())
+                .collect();
+
             let transport = Arc::new(
-                DynamicMulticastTransport::new(gossip_port, multicast_addr, peer_addresses.clone())
+                UdpTransport::new(gossip_port, cluster_urls, 3)
                     .await
                     .map_err(|e| {
                         ColibriError::Gossip(GossipError::Transport(format!(
@@ -95,10 +99,6 @@ impl GossipNode {
                     })?,
             );
 
-            // Create initial membership
-            let local_addr = transport.get_local_address();
-            let membership = ClusterMembership::new(node_id, local_addr);
-
             // Create gossip scheduler
             let scheduler = Arc::new(GossipScheduler::new(
                 Duration::from_millis(25), // regular interval
@@ -107,7 +107,7 @@ impl GossipNode {
                 2,                         // urgent fanout
                 transport.clone(),
                 node_id,
-                membership,
+                peer_addresses.clone(), // initial_peers
             ));
 
             // Start the gossip scheduler
@@ -162,17 +162,7 @@ impl GossipNode {
 
         // Trigger gossip if available
         if let Some(ref scheduler) = self.gossip_scheduler {
-            // Use urgent gossip for low token counts (critical state)
-            if bucket.bucket.tokens_to_u32() < 10 {
-                scheduler.add_urgent_update(client_id, bucket);
-                event!(
-                    Level::DEBUG,
-                    "Added urgent gossip update for low token count"
-                );
-            } else {
-                scheduler.add_regular_update(client_id, bucket);
-                event!(Level::DEBUG, "Added regular gossip update");
-            }
+            // TODO: IMPLEMENT
         }
     }
 
@@ -204,15 +194,6 @@ impl GossipNode {
         }
     }
 
-    /// Get gossip statistics (for monitoring/debugging)
-    pub async fn get_gossip_stats(&self) -> Option<GossipStats> {
-        if let Some(ref scheduler) = self.gossip_scheduler {
-            Some(scheduler.get_stats().await)
-        } else {
-            None
-        }
-    }
-
     /// Check if this node has gossip enabled
     pub fn has_gossip(&self) -> bool {
         self.gossip_scheduler.is_some() && self.transport.is_some()
@@ -220,7 +201,7 @@ impl GossipNode {
 
     /// Start the background task that processes incoming gossip messages
     async fn start_message_processing_loop(
-        transport: Arc<DynamicMulticastTransport>,
+        transport: Arc<UdpTransport>,
         node_id: u32,
         local_buckets: Arc<DashMap<String, VersionedTokenBucket>>,
     ) {
@@ -230,31 +211,43 @@ impl GossipNode {
                 node_id
             );
 
+            let mut message_receiver = transport.get_message_receiver();
+
             loop {
                 // Try to receive a message with a timeout
-                match transport
-                    .receive_with_timeout(Duration::from_millis(100))
+                match tokio::time::timeout(Duration::from_millis(100), message_receiver.recv())
                     .await
                 {
-                    Ok(Some((packet, sender_addr))) => {
+                    Ok(Some((data, sender_addr))) => {
                         event!(Level::DEBUG, "Received gossip packet from {}", sender_addr);
 
-                        // Process the message
-                        if let Err(e) =
-                            GossipNode::process_incoming_message(packet, node_id, &local_buckets)
+                        // Deserialize the packet
+                        match GossipPacket::deserialize(&data) {
+                            Ok(packet) => {
+                                // Process the message
+                                if let Err(e) = GossipNode::process_incoming_message(
+                                    packet,
+                                    node_id,
+                                    &local_buckets,
+                                )
                                 .await
-                        {
-                            event!(Level::WARN, "Failed to process gossip message: {}", e);
+                                {
+                                    event!(Level::WARN, "Failed to process gossip message: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                event!(Level::WARN, "Failed to deserialize gossip packet: {}", e);
+                            }
                         }
                     }
                     Ok(None) => {
+                        // Channel closed - break the loop
+                        event!(Level::WARN, "Message receiver channel closed");
+                        break;
+                    }
+                    Err(_) => {
                         // Timeout - continue loop
                         continue;
-                    }
-                    Err(e) => {
-                        event!(Level::ERROR, "Error receiving gossip message: {}", e);
-                        // Brief pause before retrying to avoid spinning
-                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }
@@ -327,51 +320,89 @@ impl GossipNode {
                 event!(Level::DEBUG, "Received StateRequest - not yet implemented");
                 // TODO: Implement state request handling
             }
-            GossipMessage::MembershipUpdate { .. } => {
+            GossipMessage::DeltaStateSync {
+                updates,
+                sender_node_id,
+                gossip_round: _,
+                last_seen_versions: _,
+            } => {
+                // Don't process our own messages
+                if sender_node_id == local_node_id {
+                    event!(Level::DEBUG, "Ignoring our own delta gossip message");
+                    return Ok(());
+                }
+
                 event!(
                     Level::DEBUG,
-                    "Received MembershipUpdate - not yet implemented"
+                    "Processing DeltaStateSync from node {} with {} updates",
+                    sender_node_id,
+                    updates.len()
                 );
-                // TODO: Implement membership update handling
+
+                // Merge each incoming update
+                for (client_id, incoming_bucket) in updates {
+                    if let Some(mut current_entry) = local_buckets.get_mut(&client_id) {
+                        // Try to merge with existing bucket
+                        if current_entry.merge(incoming_bucket, local_node_id) {
+                            event!(
+                                Level::DEBUG,
+                                "Merged delta update for client: {} from node {}",
+                                client_id,
+                                sender_node_id
+                            );
+                        }
+                    } else {
+                        // No existing entry, accept incoming state
+                        local_buckets.insert(client_id.clone(), incoming_bucket);
+                        event!(
+                            Level::DEBUG,
+                            "Accepted new delta state for client: {} from node {}",
+                            client_id,
+                            sender_node_id
+                        );
+                    }
+                }
             }
-            GossipMessage::NodeJoinRequest { .. } => {
+            GossipMessage::StateResponse {
+                responding_node_id,
+                requested_data,
+                current_versions: _,
+            } => {
+                // Don't process our own messages
+                if responding_node_id == local_node_id {
+                    return Ok(());
+                }
+
                 event!(
                     Level::DEBUG,
-                    "Received NodeJoinRequest - not yet implemented"
+                    "Processing StateResponse from node {} with {} updates",
+                    responding_node_id,
+                    requested_data.len()
                 );
-                // TODO: Implement node join handling
+
+                // Merge each incoming update
+                for (client_id, incoming_bucket) in requested_data {
+                    if let Some(mut current_entry) = local_buckets.get_mut(&client_id) {
+                        current_entry.merge(incoming_bucket, local_node_id);
+                    } else {
+                        local_buckets.insert(client_id, incoming_bucket);
+                    }
+                }
             }
-            GossipMessage::NodeJoinResponse { .. } => {
-                event!(
-                    Level::DEBUG,
-                    "Received NodeJoinResponse - not yet implemented"
-                );
-                // TODO: Implement join response handling
-            }
-            GossipMessage::NodeLeaveNotification { .. } => {
-                event!(
-                    Level::DEBUG,
-                    "Received NodeLeaveNotification - not yet implemented"
-                );
-                // TODO: Implement node leave handling
-            }
-            GossipMessage::NodeFailureDetected { .. } => {
-                event!(
-                    Level::DEBUG,
-                    "Received NodeFailureDetected - not yet implemented"
-                );
-                // TODO: Implement failure detection handling
-            }
-            GossipMessage::Heartbeat { .. } => {
-                event!(Level::DEBUG, "Received Heartbeat - not yet implemented");
-                // TODO: Implement heartbeat handling
-            }
-            GossipMessage::MembershipSync { .. } => {
-                event!(
-                    Level::DEBUG,
-                    "Received MembershipSync - not yet implemented"
-                );
-                // TODO: Implement membership sync handling
+            GossipMessage::Heartbeat {
+                node_id,
+                timestamp: _,
+                version_vector: _,
+                is_alive: _,
+            } => {
+                // Don't process our own heartbeat
+                if node_id == local_node_id {
+                    return Ok(());
+                }
+
+                event!(Level::DEBUG, "Received heartbeat from node {}", node_id);
+
+                // TODO: Update peer liveness information
             }
         }
 
@@ -494,8 +525,6 @@ mod tests {
         assert!(node.transport.is_some());
 
         // Test that we can get gossip stats
-        let stats = node.get_gossip_stats().await;
-        assert!(stats.is_some());
     }
 
     #[tokio::test]
@@ -523,9 +552,6 @@ mod tests {
         assert!(node.local_buckets.contains_key("test_client"));
 
         // Check that gossip stats show activity
-        if let Some(stats) = node.get_gossip_stats().await {
-            assert!(stats.total_updates_processed > 0);
-        }
     }
 
     #[tokio::test]

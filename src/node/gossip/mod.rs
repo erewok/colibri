@@ -7,18 +7,10 @@
 pub mod gossip_node;
 pub mod messages;
 pub mod scheduler;
-pub mod transport;
-pub mod vector_clock;
-pub mod versioned_bucket;
 
 pub use gossip_node::GossipNode;
-pub use messages::{
-    ClusterMembership, GossipMessage, GossipPacket, NodeCapabilities, NodeInfo, NodeStatus,
-};
-pub use scheduler::{GossipScheduler, GossipStats, QueueSizes, UrgentUpdate};
-pub use transport::{DynamicMulticastTransport, TransportStats};
-pub use vector_clock::VectorClock;
-pub use versioned_bucket::VersionedTokenBucket;
+pub use messages::{GossipMessage, GossipPacket};
+pub use scheduler::{GossipScheduler, GossipStats, QueueSizes};
 
 // Additional modules will be added as we implement them:
 // pub mod membership_manager;

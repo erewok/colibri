@@ -21,16 +21,25 @@ pub struct Cli {
     // HTTP API listen port
     #[clap(
         long,
-        default_value = "8000",
+        default_value = settings::DEFAULT_PORT_HTTP,
         env("COLIBRI_HTTP_LISTEN_PORT"),
         help = "Port to bind Colibri HTTP API server to"
     )]
     pub listen_port: u16,
 
+    // TCP listen port for Gossip
+    #[clap(
+        long,
+        default_value = settings::DEFAULT_PORT_TCP,
+        env("COLIBRI_TCP_LISTEN_PORT"),
+        help = "Port to bind Colibri TCP server to"
+    )]
+    pub listen_port_tcp: u16,
+
     // UDP listen port for Gossip
     #[clap(
         long,
-        default_value = "8000",
+        default_value = settings::DEFAULT_PORT_UDP,
         env("COLIBRI_UDP_LISTEN_PORT"),
         help = "Port to bind Colibri UDP server to"
     )]
@@ -67,7 +76,7 @@ pub struct Cli {
     #[clap(
         long,
         env("COLIBRI_TOPOLOGY"),
-        help = "Other node addresses in the cluster (e.g., http://node1:8000,http://node2:8000). If empty, runs in single-node mode."
+        help = "UDP addresses if Gossip, otherwise HTTP (e.g., http://node1:8000,http://node2:8000). If empty, runs in single-node mode."
     )]
     pub topology: Vec<Url>,
 }

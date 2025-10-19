@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+pub mod cluster;
 pub mod gossip;
 pub mod hashring;
 pub mod node_id;

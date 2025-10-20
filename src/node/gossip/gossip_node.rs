@@ -1,5 +1,4 @@
-#[cfg(test)]
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +14,7 @@ use crate::node::{CheckCallsResponse, Node};
 use crate::rate_limit::RateLimiter;
 use crate::settings;
 use crate::token_bucket::TokenBucket;
-use crate::transport::{UdpReceiver, UdpTransport};
+use crate::transport::UdpTransport;
 use crate::versioned_bucket::VersionedTokenBucket;
 
 /// A gossip-based node that maintains all client state locally
@@ -173,10 +172,7 @@ impl GossipNode {
     }
 
     /// Merge incoming gossip state from other nodes (public interface)
-    pub fn merge_gossip_state(
-        &self,
-        entries: std::collections::HashMap<String, VersionedTokenBucket>,
-    ) {
+    pub fn merge_gossip_state(&self, entries: HashMap<String, VersionedTokenBucket>) {
         debug!(
             "[{}] Processing {} gossip entries for merge",
             self.node_id,
@@ -229,16 +225,6 @@ impl GossipNode {
     /// Check if this node has gossip enabled
     pub fn has_gossip(&self) -> bool {
         self.gossip_scheduler.is_some() && self.transport.is_some()
-    }
-
-    /// Get direct access to the UDP receiver for custom message processing
-    pub fn get_receiver(&self) -> Option<Arc<UdpReceiver>> {
-        self.transport.as_ref().map(|t| t.receiver().clone())
-    }
-
-    /// Get direct access to the transport (if available)
-    pub fn get_transport(&self) -> Option<Arc<UdpTransport>> {
-        self.transport.clone()
     }
 
     /// Send a gossip message to random peers using the underlying socket pool
@@ -588,11 +574,12 @@ impl Node for GossipNode {
 
 #[cfg(test)]
 mod tests {
-    use url::Url;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use tokio::sync::RwLock;
 
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
 
     pub fn gen_settings() -> settings::Settings {
         settings::Settings {
@@ -639,10 +626,8 @@ mod tests {
         )));
 
         // Create node with topology (gossip mode) - use unique port
-        let topology: HashSet<SocketAddr> = vec![Url::parse("http://127.0.0.1:7949").unwrap()]
-            .into_iter()
-            .map(|url| url.socket_addrs(|| None).unwrap()[0])
-            .collect();
+        let topology: HashSet<SocketAddr> =
+            HashSet::from(["http://127.0.0.1:7949".parse().unwrap()]);
         // Create node with topology (gossip mode)
         let mut conf = gen_settings();
         conf.topology = topology;
@@ -667,10 +652,8 @@ mod tests {
 
         // Create node with topology to enable gossip - use unique port
         let mut conf = gen_settings();
-        let topology: HashSet<SocketAddr> = vec![Url::parse("http://127.0.0.1:7950").unwrap()]
-            .into_iter()
-            .map(|url| url.socket_addrs(|| None).unwrap()[0])
-            .collect();
+        let topology: HashSet<SocketAddr> =
+            HashSet::from(["http://127.0.0.1:7950".parse().unwrap()]);
         conf.topology = topology;
         conf.run_mode = settings::RunMode::Gossip;
 
@@ -696,10 +679,8 @@ mod tests {
         )));
         let mut conf = gen_settings();
         conf.listen_port = 8084;
-        let topology: HashSet<SocketAddr> = vec![Url::parse("http://127.0.0.1:7951").unwrap()]
-            .into_iter()
-            .map(|url| url.socket_addrs(|| None).unwrap()[0])
-            .collect();
+        let topology: HashSet<SocketAddr> =
+            HashSet::from(["http://127.0.0.1:7951".parse().unwrap()]);
         conf.topology = topology;
         conf.run_mode = settings::RunMode::Gossip;
 
@@ -875,24 +856,7 @@ mod tests {
         conf.run_mode = settings::RunMode::Gossip;
         conf.listen_port = 8005;
         conf.listen_port_udp = 8405;
-
         let node = GossipNode::new(conf, rate_limiter).await.unwrap();
-
-        // Test direct component access methods
         assert!(node.has_gossip());
-
-        let receiver = node.get_receiver();
-        assert!(receiver.is_some());
-
-        let transport = node.get_transport();
-        assert!(transport.is_some());
-
-        // Test that we can access the receiver
-        if let Some(recv) = receiver {
-            let local_addr = recv.local_addr();
-            // In tests, port 0 is used which gets assigned a random port
-            assert!(local_addr.port() > 0, "Receiver should have a valid port");
-            debug!("Receiver listening on: {}", local_addr);
-        }
     }
 }

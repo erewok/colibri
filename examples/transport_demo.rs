@@ -3,24 +3,29 @@
 //! This example demonstrates both consistent hashing and gossip patterns,
 //! including direct access to socket pools and receivers for advanced use cases.
 
-use colibri::transport::{TransportStats, UdpTransport};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
+
 use tokio::time::sleep;
+
+use colibri::node::generate_node_id_from_socket_addr;
+use colibri::transport::{TransportStats, UdpTransport};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("UDP Transport Example");
 
     // Setup cluster topology
+    let start_addr: SocketAddr = "127.0.0.1:8001".parse()?;
+    let node_id = generate_node_id_from_socket_addr(&start_addr);
     let mut cluster_urls = HashSet::new();
-    cluster_urls.insert("127.0.0.1:8001".parse()?);
+    cluster_urls.insert(start_addr);
     cluster_urls.insert("127.0.0.1:8002".parse()?);
     cluster_urls.insert("127.0.0.1:8003".parse()?);
 
     // Create transport for this node
-    let transport = UdpTransport::new(8000, cluster_urls, 3).await?;
+    let mut transport = UdpTransport::new(node_id, 8000, cluster_urls).await?;
 
     println!("Transport created on {}", transport.local_addr());
     println!("Peers: {:?}", transport.get_peers().await);
@@ -33,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .send_to_peer(target_peer, b"Hello from consistent hashing")
         .await
     {
-        Ok(()) => println!("✓ Sent message to specific peer: {}", target_peer),
+        Ok(target_peer) => println!("✓ Sent message to specific peer: {}", target_peer),
         Err(e) => println!("✗ Failed to send to specific peer: {}", e),
     }
 
@@ -91,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Added new peer: {}", new_peer);
 
     // Show updated stats
-    let stats = transport.get_stats();
+    let stats = transport.get_stats().await;
     print_stats(stats);
 
     // Remove a peer
@@ -99,38 +104,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Removed peer: {}", new_peer);
 
     // Final stats
-    let final_stats = transport.get_stats();
+    let final_stats = transport.get_stats().await;
     print_stats(final_stats);
 
     // Example 6: Direct Socket Pool and Receiver Access
     println!("\nDemonstrating direct component access...");
 
-    // Get direct access to socket pool for advanced operations
-    let socket_pool = transport.socket_pool();
-    println!("✓ Got direct socket pool access");
-    println!(
-        "  Socket pool has {} peers",
-        socket_pool.get_peers().await.len()
-    );
-
-    // Get direct access to receiver for advanced message processing
+    // Get direct access to receiver for message processing
     let receiver = transport.receiver();
     println!("✓ Got direct receiver access");
     println!("  Receiver bound to: {}", receiver.local_addr());
-
-    // Example 7: Advanced Socket Pool Operations
-    println!("\nDemonstrating advanced socket pool operations...");
-
-    // Send to multiple random peers using socket pool directly
-    let test_message = b"Direct socket pool message";
-    match socket_pool.send_to_random_multiple(test_message, 2).await {
-        Ok(targets) => println!(
-            "✓ Socket pool sent to {} random peers: {:?}",
-            targets.len(),
-            targets
-        ),
-        Err(e) => println!("✗ Socket pool send failed: {}", e),
-    }
 
     // Example 8: Receiver Statistics
     println!("\nReceiver statistics:");
@@ -153,8 +136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send to random subset of peers (mimicking gossip fanout)
     let gossip_fanout = 2;
-    match socket_pool
-        .send_to_random_multiple(gossip_payload, gossip_fanout)
+    match transport
+        .send_to_random_peers(gossip_payload, gossip_fanout)
         .await
     {
         Ok(gossip_targets) => {

@@ -33,19 +33,13 @@ pub struct ReceiverStats {
 impl UdpReceiver {
     /// Create a new UDP receiver
     pub async fn new(bind_addr: SocketAddr) -> Result<Self> {
-        let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
-            ColibriError::Gossip(GossipError::Transport(format!(
-                "Socket creation failed: {}",
-                e
-            )))
-        })?;
+        let socket = UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| ColibriError::Transport(format!("Socket creation failed: {}", e)))?;
 
-        let local_addr = socket.local_addr().map_err(|e| {
-            ColibriError::Gossip(GossipError::Transport(format!(
-                "Socket creation failed: {}",
-                e
-            )))
-        })?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| ColibriError::Transport(format!("Socket creation failed: {}", e)))?;
 
         Ok(Self {
             socket: Arc::new(socket),
@@ -236,9 +230,9 @@ impl UdpReceiver {
         // Wait for response with timeout
         match timeout(timeout_duration, rx).await {
             Ok(Ok(data)) => Ok(data),
-            Ok(Err(_)) => Err(ColibriError::Gossip(GossipError::Transport(
+            Ok(Err(_)) => Err(ColibriError::Transport(
                 "Response channel closed".to_string(),
-            ))),
+            )),
             Err(_) => {
                 // Remove the pending request on timeout
                 let mut pending = self.pending_responses.lock().await;
@@ -248,9 +242,7 @@ impl UdpReceiver {
                         pending.remove(&peer);
                     }
                 }
-                Err(ColibriError::Gossip(GossipError::Transport(
-                    "Response timeout".to_string(),
-                )))
+                Err(ColibriError::Transport("Response timeout".to_string()))
             }
         }
     }
@@ -395,10 +387,7 @@ mod tests {
             .wait_for_response_from(fake_addr, Duration::from_millis(50))
             .await;
 
-        assert!(matches!(
-            response,
-            Err(ColibriError::Gossip(GossipError::Transport(_)))
-        ));
+        assert!(matches!(response, Err(ColibriError::Transport(_))));
         assert_eq!(receiver.pending_response_count().await, 0);
     }
 

@@ -10,7 +10,7 @@ pub mod scheduler;
 
 pub use gossip_node::GossipNode;
 pub use messages::{GossipMessage, GossipPacket};
-pub use scheduler::{GossipScheduler, GossipStats, QueueSizes};
+pub use scheduler::{GossipScheduler, GossipStats};
 
 // Additional modules will be added as we implement them:
 // pub mod membership_manager;

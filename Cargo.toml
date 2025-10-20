@@ -47,6 +47,7 @@ url = "2.5.7"
 tracing = "0.1.41"
 tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+indexmap = "2.12.0"
 
 [dev-dependencies]
 criterion = "0.7"

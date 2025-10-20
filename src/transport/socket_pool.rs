@@ -2,19 +2,26 @@
 //!
 //! Manages a pool of UDP sockets for each peer in the cluster.
 //! Provides load balancing and fault tolerance through socket rotation.
-use std::collections::{HashMap, HashSet};
+use rand::Rng;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
+use tracing::error;
 
-use crate::error::{ColibriError, GossipError, Result};
+use crate::error::{ColibriError, Result};
 
 /// Pool of UDP sockets for efficient peer communication
 pub struct UdpSocketPool {
-    peers: Arc<RwLock<HashMap<SocketAddr, PeerSocketPool>>>,
+    // IndexMap for easily getting a random peer
+    peers: IndexMap<SocketAddr, Arc<RwLock<UdpSocket>>>,
+    // for debugging, identifying the node
+    node_id: u32,
+    // for statistics and monitoring
     stats: Arc<SocketPoolStats>,
 }
 
@@ -27,85 +34,62 @@ pub struct SocketPoolStats {
     pub send_errors: AtomicU64,
 }
 
-/// Socket pool for a single peer
-struct PeerSocketPool {
-    sockets: Vec<Arc<UdpSocket>>,
-    next_socket: AtomicUsize,
-}
-
 impl UdpSocketPool {
     /// Create a new socket pool
-    pub async fn new(
-        peer_addrs: HashSet<std::net::SocketAddr>,
-        pool_size_per_peer: usize,
-    ) -> Result<Self> {
-        let mut peers = HashMap::new();
-        let mut total_sockets = 0;
+    pub async fn new(node_id: u32, peer_addrs: HashSet<std::net::SocketAddr>) -> Result<Self> {
+        let mut peers = IndexMap::new();
 
         for peer_addr in peer_addrs {
-            let peer_pool = PeerSocketPool::new(pool_size_per_peer).await?;
-            total_sockets += pool_size_per_peer;
-            peers.insert(peer_addr, peer_pool);
+            let socket = UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| ColibriError::Transport(format!("Socket creation failed: {}", e)))?;
+            peers.insert(peer_addr, Arc::new(RwLock::new(socket)));
         }
 
         let stats = Arc::new(SocketPoolStats {
             peer_count: AtomicUsize::new(peers.len()),
-            total_sockets: AtomicUsize::new(total_sockets),
+            total_sockets: AtomicUsize::new(peers.len()),
             messages_sent: AtomicU64::new(0),
             send_errors: AtomicU64::new(0),
         });
 
         Ok(Self {
-            peers: Arc::new(RwLock::new(peers)),
+            node_id,
+            peers,
             stats,
         })
     }
 
     /// Send data to a specific peer
-    pub async fn send_to(&self, target: SocketAddr, data: &[u8]) -> Result<()> {
-        let peers = self.peers.read().await;
-        let peer_pool = peers.get(&target).ok_or_else(|| {
-            ColibriError::Gossip(GossipError::Transport(format!(
-                "Peer not found: {}",
-                target
-            )))
-        })?;
+    pub async fn send_to(&self, target: SocketAddr, data: &[u8]) -> Result<SocketAddr> {
+        let peer_socket = self
+            .peers
+            .get(&target)
+            .ok_or_else(|| ColibriError::Transport(format!("Peer not found: {}", target)))?;
 
-        match peer_pool.send(target, data).await {
-            Ok(()) => {
+        match peer_socket.write().await.send_to(data, target).await {
+            Ok(_write_size) => {
                 self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+                Ok(target)
             }
             Err(e) => {
                 self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                Err(e)
+                error!("[{}] Failed to send UDP data: {}", target, e);
+                Err(ColibriError::Io(e))
             }
         }
     }
 
     /// Send data to a random peer
     pub async fn send_to_random(&self, data: &[u8]) -> Result<SocketAddr> {
-        // Select peer without holding the lock
-        let target = {
-            let peers = self.peers.read().await;
-            let peer_addrs: Vec<SocketAddr> = peers.keys().cloned().collect();
-
-            if peer_addrs.is_empty() {
-                return Err(ColibriError::Gossip(GossipError::Transport(
-                    "No peers available".to_string(),
-                )));
+        let random_usize: usize = rand::rng().random_range(0..self.peers.len());
+        match self.peers.get_index(random_usize) {
+            Some((target, _)) => {
+                self.send_to(*target, data).await?;
+                Ok(*target)
             }
-            // Use simple time-based selection to avoid Send issues with rand::rng()
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            let index = (now.as_nanos() as usize) % peer_addrs.len();
-            peer_addrs[index]
-        }; // Lock is dropped here
-
-        self.send_to(target, data).await?;
-        Ok(target)
+            None => return Err(ColibriError::Transport("No peers available".to_string())),
+        }
     }
 
     /// Send data to multiple random peers
@@ -114,93 +98,59 @@ impl UdpSocketPool {
         data: &[u8],
         count: usize,
     ) -> Result<Vec<SocketAddr>> {
-        // First, select peers without holding the lock
-        let selected_peers = {
-            let peers = self.peers.read().await;
-            let peer_addrs: Vec<SocketAddr> = peers.keys().cloned().collect();
-
-            if peer_addrs.is_empty() {
-                return Err(ColibriError::Gossip(GossipError::Transport(
-                    "No peers available".to_string(),
-                )));
-            }
-
-            // Use simple selection method to avoid Send issues with rand::rng()
-            let selected_count = count.min(peer_addrs.len());
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            let start_index = (now.as_nanos() as usize) % peer_addrs.len();
-
-            // Select consecutive peers starting from random index
-            let mut selected = Vec::with_capacity(selected_count);
-            for i in 0..selected_count {
-                let index = (start_index + i) % peer_addrs.len();
-                selected.push(peer_addrs[index]);
-            }
-            selected
-        }; // Lock is dropped here
-
+        if self.peers.is_empty() {
+            return Err(ColibriError::Transport(
+                "No peers available for sending".to_string(),
+            ));
+        }
         // Now send to each peer without holding the main lock
         let mut successful_sends = Vec::new();
-
-        for target in selected_peers {
-            match self.send_to(target, data).await {
-                Ok(()) => successful_sends.push(target),
-                Err(_) => {
-                    // Log error but continue with other peers
-                    eprintln!("Failed to send to peer: {}", target);
+        let mut rng = rand::rng();
+        for _ in 0..count {
+            let random_usize: usize = rng.random_range(0..self.peers.len());
+            if let Some((target, _)) = self.peers.get_index(random_usize) {
+                match self.send_to(*target, data).await {
+                    Ok(_) => successful_sends.push(*target),
+                    Err(_) => {
+                        // Log error but continue with other peers
+                        error!("[{}] Failed to send to peer: {}", self.node_id, target);
+                    }
                 }
             }
         }
 
         if successful_sends.is_empty() {
-            Err(ColibriError::Gossip(GossipError::Transport(
-                "All sends failed".to_string(),
-            )))
+            Err(ColibriError::Transport("All sends failed".to_string()))
         } else {
             Ok(successful_sends)
         }
     }
 
     /// Add a new peer to the pool
-    pub async fn add_peer(&self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
-        let mut peers = self.peers.write().await;
+    pub async fn add_peer(&mut self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| ColibriError::Transport(format!("Socket creation failed: {}", e)))?;
+        self.peers.insert(peer_addr, Arc::new(RwLock::new(socket)));
 
-        if peers.contains_key(&peer_addr) {
-            return Ok(()); // Peer already exists
-        }
-
-        let peer_pool = PeerSocketPool::new(pool_size).await?;
-        peers.insert(peer_addr, peer_pool);
-
-        self.stats.peer_count.store(peers.len(), Ordering::Relaxed);
+        self.stats
+            .peer_count
+            .store(self.peers.len(), Ordering::Relaxed);
         self.stats
             .total_sockets
             .fetch_add(pool_size, Ordering::Relaxed);
-
         Ok(())
     }
 
     /// Remove a peer from the pool
-    pub async fn remove_peer(&self, peer_addr: SocketAddr) -> Result<()> {
-        let mut peers = self.peers.write().await;
-
-        if let Some(peer_pool) = peers.remove(&peer_addr) {
-            let socket_count = peer_pool.sockets.len();
-            self.stats.peer_count.store(peers.len(), Ordering::Relaxed);
-            self.stats
-                .total_sockets
-                .fetch_sub(socket_count, Ordering::Relaxed);
-        }
-
+    pub async fn remove_peer(&mut self, peer_addr: SocketAddr) -> Result<()> {
+        self.peers.swap_remove(&peer_addr);
         Ok(())
     }
 
     /// Get list of current peers
     pub async fn get_peers(&self) -> Vec<SocketAddr> {
-        self.peers.read().await.keys().cloned().collect()
+        self.peers.keys().cloned().collect()
     }
 
     /// Get socket pool statistics
@@ -211,46 +161,6 @@ impl UdpSocketPool {
             messages_sent: AtomicU64::new(self.stats.messages_sent.load(Ordering::Relaxed)),
             send_errors: AtomicU64::new(self.stats.send_errors.load(Ordering::Relaxed)),
         }
-    }
-}
-
-impl PeerSocketPool {
-    /// Create a new peer socket pool
-    async fn new(pool_size: usize) -> Result<Self> {
-        let mut sockets = Vec::with_capacity(pool_size);
-
-        for _ in 0..pool_size {
-            let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
-                ColibriError::Gossip(GossipError::Transport(format!(
-                    "Socket creation failed: {}",
-                    e
-                )))
-            })?;
-            sockets.push(Arc::new(socket));
-        }
-
-        Ok(Self {
-            sockets,
-            next_socket: AtomicUsize::new(0),
-        })
-    }
-
-    /// Send data using the next available socket (round-robin)
-    async fn send(&self, target: SocketAddr, data: &[u8]) -> Result<()> {
-        if self.sockets.is_empty() {
-            return Err(ColibriError::Gossip(GossipError::Transport(
-                "No sockets available for peer".to_string(),
-            )));
-        }
-
-        let socket_index = self.next_socket.fetch_add(1, Ordering::Relaxed) % self.sockets.len();
-        let socket = &self.sockets[socket_index];
-
-        socket.send_to(data, target).await.map_err(|e| {
-            ColibriError::Gossip(GossipError::Transport(format!("Send failed: {}", e)))
-        })?;
-
-        Ok(())
     }
 }
 
@@ -265,7 +175,7 @@ mod tests {
         let two = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
         let peers: HashSet<SocketAddr> = HashSet::from([one.clone(), two.clone()]);
 
-        let pool = UdpSocketPool::new(peers.clone(), 3).await.unwrap();
+        let pool = UdpSocketPool::new(1, peers.clone()).await.unwrap();
 
         let stats = pool.get_stats();
         assert_eq!(stats.peer_count.load(Ordering::Relaxed), 2);
@@ -279,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_management() {
-        let pool = UdpSocketPool::new(HashSet::new(), 2).await.unwrap();
+        let mut pool = UdpSocketPool::new(2, HashSet::new()).await.unwrap();
 
         let peer1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
         let peer2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
@@ -306,41 +216,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_random_no_peers() {
-        let pool = UdpSocketPool::new(HashSet::new(), 1).await.unwrap();
+        let pool = UdpSocketPool::new(1, HashSet::new()).await.unwrap();
 
         let result = pool.send_to_random(b"test").await;
-        assert!(matches!(
-            result,
-            Err(ColibriError::Gossip(GossipError::Transport(_)))
-        ));
+        assert!(matches!(result, Err(ColibriError::Transport(_))));
     }
 
     #[tokio::test]
     async fn test_send_to_nonexistent_peer() {
-        let pool = UdpSocketPool::new(HashSet::new(), 1).await.unwrap();
+        let pool = UdpSocketPool::new(1, HashSet::new()).await.unwrap();
 
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
         let result = pool.send_to(peer, b"test").await;
-        assert!(matches!(
-            result,
-            Err(ColibriError::Gossip(GossipError::Transport(_)))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_peer_socket_pool_round_robin() {
-        let pool = PeerSocketPool::new(3).await.unwrap();
-
-        // The round-robin behavior is internal, but we can test that
-        // multiple sends don't fail due to socket management
-        let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
-
-        // These will fail to send since nothing is listening, but should
-        // exercise the round-robin socket selection
-        for _ in 0..10 {
-            let _ = pool.send(target, b"test").await;
-            // Each call should use a different socket in round-robin fashion
-        }
+        assert!(matches!(result, Err(ColibriError::Transport(_))));
     }
 
     #[tokio::test]
@@ -351,7 +239,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8003),
         ]);
 
-        let pool = UdpSocketPool::new(peers, 1).await.unwrap();
+        let pool = UdpSocketPool::new(2, peers).await.unwrap();
 
         // Should attempt to send to 2 random peers
         // This will likely fail since nothing is listening, but tests the selection logic
@@ -360,7 +248,7 @@ mod tests {
         // Either succeeds with 0-2 peers (if sends fail) or fails completely
         match result {
             Ok(sent_to) => assert!(sent_to.len() <= 2),
-            Err(ColibriError::Gossip(GossipError::Transport(_))) => {
+            Err(ColibriError::Transport(_)) => {
                 // Expected when no one is listening
             }
             Err(e) => panic!("Unexpected error: {:?}", e),

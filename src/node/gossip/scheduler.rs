@@ -2,6 +2,7 @@
 //!
 //! Provides layered gossip timing with membership awareness and payload optimization.
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::messages::{GossipMessage, GossipPacket};
-use crate::transport::{UdpReceiver, UdpSocketPool, UdpTransport};
+use crate::transport::{UdpReceiver, UdpTransport};
 use crate::versioned_bucket::VersionedTokenBucket;
 
 /// Change record for tracking when keys were modified for delta-state gossip
@@ -54,15 +55,7 @@ pub struct GossipStats {
     pub messages_sent: u64,
     pub total_updates_processed: u64,
     pub payload_bytes_sent: u64,
-    pub last_urgent_gossip: Option<Instant>,
-    pub last_regular_gossip: Option<Instant>,
-    pub queue_sizes: QueueSizes,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct QueueSizes {
-    pub urgent_queue_size: usize,
-    pub regular_queue_size: usize,
+    pub last_gossip: Option<Instant>,
 }
 
 impl GossipScheduler {
@@ -136,10 +129,10 @@ impl GossipScheduler {
             self.gossip_interval.as_millis()
         );
 
-        // Start all background tasks
-        self.start_delta_gossip_loop().await;
-        self.start_anti_entropy_loop().await;
-        self.start_change_cleanup_loop().await;
+        // // Start all background tasks
+        // self.start_delta_gossip_loop().await;
+        // self.start_anti_entropy_loop().await;
+        // self.start_change_cleanup_loop().await;
 
         info!("All gossip scheduler background tasks started successfully");
     }
@@ -158,91 +151,91 @@ impl GossipScheduler {
         let version_vector = self.version_vector.clone();
         let stats = self.stats.clone();
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(gossip_interval);
-            debug!(
-                "[{}] Delta-state gossip loop started with {}ms interval",
-                node_id,
-                gossip_interval.as_millis()
-            );
+        // tokio::spawn(async move {
+        //     let mut interval = tokio::time::interval(gossip_interval);
+        //     debug!(
+        //         "[{}] Delta-state gossip loop started with {}ms interval",
+        //         node_id,
+        //         gossip_interval.as_millis()
+        //     );
 
-            loop {
-                interval.tick().await;
+        //     loop {
+        //         interval.tick().await;
 
-                // Get recent changes for delta-state gossip
-                let changes = Self::collect_recent_changes(
-                    &recent_changes,
-                    Duration::from_millis(500), // Changes in last 500ms
-                );
+        //         // Get recent changes for delta-state gossip
+        //         let changes = Self::collect_recent_changes(
+        //             &recent_changes,
+        //             Duration::from_millis(500), // Changes in last 500ms
+        //         );
 
-                if changes.is_empty() {
-                    continue;
-                }
+        //         if changes.is_empty() {
+        //             continue;
+        //         }
 
-                debug!(
-                    "[{}] Found {} recent changes to gossip",
-                    node_id,
-                    changes.len()
-                );
+        //         debug!(
+        //             "[{}] Found {} recent changes to gossip",
+        //             node_id,
+        //             changes.len()
+        //         );
 
-                // Create version vector for anti-entropy
-                let last_seen_versions: HashMap<u32, u64> = version_vector
-                    .iter()
-                    .map(|entry| (*entry.key(), *entry.value()))
-                    .collect();
+        //         // Create version vector for anti-entropy
+        //         let last_seen_versions: HashMap<u32, u64> = version_vector
+        //             .iter()
+        //             .map(|entry| (*entry.key(), *entry.value()))
+        //             .collect();
 
-                // Split changes into chunks if needed
-                let change_chunks = Self::chunk_changes(changes, max_payload_size);
+        //         // Split changes into chunks if needed
+        //         let change_chunks = Self::chunk_changes(changes, max_payload_size);
 
-                for chunk in change_chunks {
-                    let message = GossipMessage::DeltaStateSync {
-                        updates: chunk,
-                        sender_node_id: node_id,
-                        gossip_round: gossip_round
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                        last_seen_versions: last_seen_versions.clone(),
-                    };
+        //         for chunk in change_chunks {
+        //             let message = GossipMessage::DeltaStateSync {
+        //                 updates: chunk,
+        //                 sender_node_id: node_id,
+        //                 gossip_round: gossip_round
+        //                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        //                 last_seen_versions: last_seen_versions.clone(),
+        //             };
 
-                    let packet = GossipPacket::new_with_id(
-                        message,
-                        packet_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                    );
+        //             let packet = GossipPacket::new_with_id(
+        //                 message,
+        //                 packet_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        //             );
 
-                    if let Ok(bytes) = packet.serialize() {
-                        // Let transport handle peer selection and sending
-                        match transport.send_to_random_peers(&bytes, gossip_fanout).await {
-                            Ok(sent_to_peers) => {
-                                debug!(
-                                    "[{}] Delta gossip sent to {} random peers: {:?}",
-                                    node_id,
-                                    sent_to_peers.len(),
-                                    sent_to_peers
-                                );
+        //             if let Ok(bytes) = packet.serialize() {
+        //                 // Let transport handle peer selection and sending
+        //                 match transport.send_to_random_peers(&bytes, gossip_fanout).await {
+        //                     Ok(sent_to_peers) => {
+        //                         debug!(
+        //                             "[{}] Delta gossip sent to {} random peers: {:?}",
+        //                             node_id,
+        //                             sent_to_peers.len(),
+        //                             sent_to_peers
+        //                         );
 
-                                // Update stats
-                                let mut stats_guard = stats.write().await;
-                                stats_guard.messages_sent += 1;
-                                stats_guard.last_regular_gossip = Some(Instant::now());
-                            }
-                            Err(e) => {
-                                warn!("[{}] Failed to send delta gossip: {}", node_id, e);
-                            }
-                        }
-                    } else {
-                        warn!("[{}] Failed to serialize gossip packet", node_id);
-                    }
-                }
+        //                         // Update stats
+        //                         let mut stats_guard = stats.write().await;
+        //                         stats_guard.messages_sent += 1;
+        //                         stats_guard.last_gossip = Some(Instant::now());
+        //                     }
+        //                     Err(e) => {
+        //                         warn!("[{}] Failed to send delta gossip: {}", node_id, e);
+        //                     }
+        //                 }
+        //             } else {
+        //                 warn!("[{}] Failed to serialize gossip packet", node_id);
+        //             }
+        //         }
 
-                // Mark changes as gossiped
-                for entry in recent_changes.iter() {
-                    let key = entry.key();
-                    if let Some(mut record) = recent_changes.get_mut(key.as_str()) {
-                        record.gossip_attempts += 1;
-                        record.last_gossiped = Some(Instant::now());
-                    }
-                }
-            }
-        });
+        //         // Mark changes as gossiped
+        //         for entry in recent_changes.iter() {
+        //             let key = entry.key();
+        //             if let Some(mut record) = recent_changes.get_mut(key.as_str()) {
+        //                 record.gossip_attempts += 1;
+        //                 record.last_gossiped = Some(Instant::now());
+        //             }
+        //         }
+        //     }
+        // });
     }
 
     /// Start anti-entropy process for missed updates via transport
@@ -392,11 +385,6 @@ impl GossipScheduler {
         self.recent_changes.insert(key, record);
     }
 
-    /// Get direct access to the UDP socket pool for custom gossip operations
-    pub fn get_socket_pool(&self) -> Arc<UdpSocketPool> {
-        self.transport.socket_pool().clone()
-    }
-
     /// Get direct access to the UDP receiver for custom message processing
     pub fn get_receiver(&self) -> Arc<UdpReceiver> {
         self.transport.receiver().clone()
@@ -407,7 +395,7 @@ impl GossipScheduler {
         &self,
         message: &GossipMessage,
         fanout: usize,
-    ) -> crate::error::Result<Vec<std::net::SocketAddr>> {
+    ) -> crate::error::Result<Vec<SocketAddr>> {
         let packet = GossipPacket::new_with_id(
             message.clone(),
             self.packet_id_counter
@@ -427,8 +415,8 @@ impl GossipScheduler {
     pub async fn gossip_to_peer(
         &self,
         message: &GossipMessage,
-        target: std::net::SocketAddr,
-    ) -> crate::error::Result<()> {
+        target: SocketAddr,
+    ) -> crate::error::Result<SocketAddr> {
         let packet = GossipPacket::new_with_id(
             message.clone(),
             self.packet_id_counter
@@ -455,7 +443,7 @@ mod tests {
     async fn create_test_scheduler() -> GossipScheduler {
         let cluster_urls = HashSet::new(); // Empty for test
         let transport = Arc::new(
-            UdpTransport::new(0, cluster_urls, 1)
+            UdpTransport::new(1, 0, cluster_urls)
                 .await
                 .expect("Failed to create transport"),
         );

@@ -10,12 +10,12 @@ use dashmap::DashMap;
 use tracing::{debug, event, info, Level};
 
 use super::{GossipMessage, GossipPacket, GossipScheduler};
-use crate::error::{ColibriError, GossipError, Result};
+use crate::error::{ColibriError, Result};
 use crate::node::{CheckCallsResponse, Node};
 use crate::rate_limit::RateLimiter;
 use crate::settings;
 use crate::token_bucket::TokenBucket;
-use crate::transport::{UdpReceiver, UdpSocketPool, UdpTransport};
+use crate::transport::{UdpReceiver, UdpTransport};
 use crate::versioned_bucket::VersionedTokenBucket;
 
 /// A gossip-based node that maintains all client state locally
@@ -78,13 +78,10 @@ impl GossipNode {
             };
             // Convert peer addresses to URLs for UdpTransport
             let transport = Arc::new(
-                UdpTransport::new(gossip_port, settings.topology.clone(), 3)
+                UdpTransport::new(node_id, gossip_port, settings.topology.clone())
                     .await
                     .map_err(|e| {
-                        ColibriError::Gossip(GossipError::Transport(format!(
-                            "Failed to create transport: {}",
-                            e
-                        )))
+                        ColibriError::Transport(format!("Failed to create transport: {}", e))
                     })?,
             );
 
@@ -234,11 +231,6 @@ impl GossipNode {
         self.gossip_scheduler.is_some() && self.transport.is_some()
     }
 
-    /// Get direct access to the UDP socket pool for custom gossip operations
-    pub fn get_socket_pool(&self) -> Option<Arc<UdpSocketPool>> {
-        self.transport.as_ref().map(|t| t.socket_pool().clone())
-    }
-
     /// Get direct access to the UDP receiver for custom message processing
     pub fn get_receiver(&self) -> Option<Arc<UdpReceiver>> {
         self.transport.as_ref().map(|t| t.receiver().clone())
@@ -258,20 +250,24 @@ impl GossipNode {
         if let Some(ref scheduler) = self.gossip_scheduler {
             scheduler.gossip_to_random_peers(message, fanout).await
         } else {
-            Err(ColibriError::Gossip(GossipError::Transport(
+            Err(ColibriError::Transport(
                 "Gossip not enabled - no transport available".to_string(),
-            )))
+            ))
         }
     }
 
     /// Send a gossip message to a specific peer using the underlying socket pool
-    pub async fn send_to_peer(&self, message: &GossipMessage, target: SocketAddr) -> Result<()> {
+    pub async fn send_to_peer(
+        &self,
+        message: &GossipMessage,
+        target: SocketAddr,
+    ) -> Result<SocketAddr> {
         if let Some(ref scheduler) = self.gossip_scheduler {
             scheduler.gossip_to_peer(message, target).await
         } else {
-            Err(ColibriError::Gossip(GossipError::Transport(
+            Err(ColibriError::Transport(
                 "Gossip not enabled - no transport available".to_string(),
-            )))
+            ))
         }
     }
 
@@ -885,25 +881,11 @@ mod tests {
         // Test direct component access methods
         assert!(node.has_gossip());
 
-        let socket_pool = node.get_socket_pool();
-        assert!(socket_pool.is_some());
-
         let receiver = node.get_receiver();
         assert!(receiver.is_some());
 
         let transport = node.get_transport();
         assert!(transport.is_some());
-
-        // Test the socket pool has the expected peer
-        if let Some(pool) = socket_pool {
-            let peers = pool.get_peers().await;
-            debug!("Socket pool has {} peers: {:?}", peers.len(), peers);
-            // The peer count might be different due to URL parsing - just verify it's not empty
-            assert!(
-                !peers.is_empty(),
-                "Socket pool should have at least one peer"
-            );
-        }
 
         // Test that we can access the receiver
         if let Some(recv) = receiver {
@@ -912,7 +894,5 @@ mod tests {
             assert!(local_addr.port() > 0, "Receiver should have a valid port");
             debug!("Receiver listening on: {}", local_addr);
         }
-
-        info!("✓ All transport integration methods working correctly");
     }
 }

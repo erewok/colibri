@@ -7,21 +7,21 @@
 pub mod receiver;
 pub mod socket_pool;
 
-pub use receiver::{ReceiverStats, UdpReceiver};
-pub use socket_pool::{SocketPoolStats, UdpSocketPool};
-
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 
 use crate::error::Result;
-/// Generic UDP transport layer for distributed systems
+pub use receiver::{ReceiverStats, UdpReceiver};
+pub use socket_pool::{SocketPoolStats, UdpSocketPool};
+
 #[derive(Clone)]
 pub struct UdpTransport {
-    socket_pool: Arc<UdpSocketPool>,
+    socket_pool: Arc<RwLock<UdpSocketPool>>,
     receiver: Arc<UdpReceiver>,
     local_addr: SocketAddr,
 }
@@ -31,12 +31,12 @@ impl UdpTransport {
     ///
     /// # Arguments
     /// * `bind_port` - Port to bind the receiver socket to
-    /// * `cluster_urls` - URLs of other cluster members
+    /// * `cluster_socket_addresses` - URLs of other cluster members
     /// * `pool_size_per_peer` - Number of sockets to create per peer
     pub async fn new(
+        node_id: u32,
         bind_port: u16,
         cluster_socket_addresses: HashSet<SocketAddr>,
-        pool_size_per_peer: usize,
     ) -> Result<Self> {
         let bind_addr = SocketAddr::from(([0, 0, 0, 0], bind_port));
 
@@ -45,28 +45,32 @@ impl UdpTransport {
         let local_addr = receiver.local_addr();
 
         // Create socket pool
-        let socket_pool = UdpSocketPool::new(cluster_socket_addresses, pool_size_per_peer).await?;
+        let socket_pool = UdpSocketPool::new(node_id, cluster_socket_addresses).await?;
 
         Ok(Self {
-            socket_pool: Arc::new(socket_pool),
+            socket_pool: Arc::new(RwLock::new(socket_pool)),
             receiver: Arc::new(receiver),
             local_addr,
         })
     }
 
     /// Send data to a specific peer (for consistent hashing)
-    pub async fn send_to_peer(&self, target: SocketAddr, data: &[u8]) -> Result<()> {
-        self.socket_pool.send_to(target, data).await
+    pub async fn send_to_peer(&self, target: SocketAddr, data: &[u8]) -> Result<SocketAddr> {
+        self.socket_pool.read().await.send_to(target, data).await
     }
 
     /// Send data to a random peer (for gossip)
     pub async fn send_to_random_peer(&self, data: &[u8]) -> Result<SocketAddr> {
-        self.socket_pool.send_to_random(data).await
+        self.socket_pool.read().await.send_to_random(data).await
     }
 
     /// Send data to multiple random peers (for gossip)
     pub async fn send_to_random_peers(&self, data: &[u8], count: usize) -> Result<Vec<SocketAddr>> {
-        self.socket_pool.send_to_random_multiple(data, count).await
+        self.socket_pool
+            .read()
+            .await
+            .send_to_random_multiple(data, count)
+            .await
     }
 
     /// Send request and wait for response (for consistent hashing)
@@ -98,13 +102,17 @@ impl UdpTransport {
     }
 
     /// Add a new peer to the socket pool
-    pub async fn add_peer(&self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
-        self.socket_pool.add_peer(peer_addr, pool_size).await
+    pub async fn add_peer(&mut self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
+        self.socket_pool
+            .write()
+            .await
+            .add_peer(peer_addr, pool_size)
+            .await
     }
 
     /// Remove a peer from the socket pool
     pub async fn remove_peer(&self, peer_addr: SocketAddr) -> Result<()> {
-        self.socket_pool.remove_peer(peer_addr).await
+        self.socket_pool.write().await.remove_peer(peer_addr).await
     }
 
     /// Get local socket address
@@ -114,12 +122,12 @@ impl UdpTransport {
 
     /// Get list of current peers
     pub async fn get_peers(&self) -> Vec<SocketAddr> {
-        self.socket_pool.get_peers().await
+        self.socket_pool.read().await.get_peers().await
     }
 
     /// Get transport statistics
-    pub fn get_stats(&self) -> TransportStats {
-        let send_pool_stats = self.socket_pool.get_stats();
+    pub async fn get_stats(&self) -> TransportStats {
+        let send_pool_stats = self.socket_pool.read().await.get_stats();
         let receiver_stats = self.receiver.get_stats();
 
         TransportStats {
@@ -127,11 +135,6 @@ impl UdpTransport {
             receiver_stats,
             send_pool_stats,
         }
-    }
-
-    /// Get direct access to the socket pool for advanced operations
-    pub fn socket_pool(&self) -> &Arc<UdpSocketPool> {
-        &self.socket_pool
     }
 
     /// Get direct access to the receiver for advanced operations
@@ -161,7 +164,7 @@ mod tests {
         cluster_urls.insert("127.0.0.1:8001".parse().unwrap());
         cluster_urls.insert("127.0.0.1:8002".parse().unwrap());
 
-        let transport = UdpTransport::new(0, cluster_urls, 2).await.unwrap();
+        let transport = UdpTransport::new(1, 0, cluster_urls).await.unwrap();
 
         assert!(transport.local_addr().port() > 0);
         assert_eq!(transport.get_peers().await.len(), 2);
@@ -172,20 +175,17 @@ mod tests {
         let mut cluster_urls = HashSet::new();
         cluster_urls.insert("udp://127.0.0.1:8001".parse().unwrap());
 
-        let transport = UdpTransport::new(0, cluster_urls, 1).await.unwrap();
+        let transport = UdpTransport::new(1, 0, cluster_urls).await.unwrap();
 
         // This will fail to send since no one is listening, but tests the mechanism
         let result = transport.send_to_random_peer(b"test").await;
         // Should succeed in selecting and attempting to send to a peer
-        assert!(
-            result.is_ok()
-                || matches!(result, Err(ColibriError::Gossip(GossipError::Transport(_))))
-        );
+        assert!(result.is_ok() || matches!(result, Err(ColibriError::Transport(_))));
     }
 
     #[tokio::test]
     async fn test_peer_management() {
-        let transport = UdpTransport::new(0, HashSet::new(), 1).await.unwrap();
+        let mut transport = UdpTransport::new(1, 0, HashSet::new()).await.unwrap();
 
         assert_eq!(transport.get_peers().await.len(), 0);
 
@@ -201,8 +201,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats() {
-        let transport = UdpTransport::new(0, HashSet::new(), 1).await.unwrap();
-        let stats = transport.get_stats();
+        let transport = UdpTransport::new(1, 0, HashSet::new()).await.unwrap();
+        let stats = transport.get_stats().await;
 
         assert_eq!(stats.send_pool_stats.peer_count.into_inner(), 0);
         assert_eq!(stats.send_pool_stats.total_sockets.into_inner(), 0);

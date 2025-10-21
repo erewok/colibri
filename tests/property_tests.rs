@@ -1,6 +1,7 @@
+use colibri::limiters::token_bucket::TokenBucket;
 use proptest::prelude::*;
 
-use colibri::rate_limit::RateLimiter;
+use colibri::limiters::rate_limit::RateLimiter;
 use colibri::settings::RateLimitSettings;
 
 proptest! {
@@ -13,9 +14,10 @@ proptest! {
         let settings = RateLimitSettings {
             rate_limit_max_calls_allowed: max_calls,
             rate_limit_interval_seconds: interval,
+            node_id: 1, // Dummy node ID
         };
 
-        let mut limiter = RateLimiter::new(settings);
+        let mut limiter: RateLimiter<TokenBucket> = RateLimiter::new(settings);
 
         let initial_remaining = limiter.check_calls_remaining_for_client(&client_id);
         prop_assert_eq!(initial_remaining, max_calls);
@@ -36,9 +38,10 @@ proptest! {
         let settings = RateLimitSettings {
             rate_limit_max_calls_allowed: max_calls,
             rate_limit_interval_seconds: 1,
+            node_id: 1, // Dummy node ID
         };
 
-        let mut limiter = RateLimiter::new(settings);
+        let mut limiter: RateLimiter<TokenBucket> = RateLimiter::new(settings);
         let client_id = "property_test_client";
 
         for _ in 0..requests {

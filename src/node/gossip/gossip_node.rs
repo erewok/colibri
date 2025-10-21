@@ -1,47 +1,39 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
+use std::time::Instant;
+use tokio::sync::{mpsc, RwLock};
 
 use async_trait::async_trait;
-use dashmap::DashMap;
-use tracing::{debug, event, info, Level};
+use tracing::{debug, info};
 
-use super::{GossipMessage, GossipPacket, GossipScheduler};
+use super::{GossipMessage, GossipPacket};
 use crate::error::{ColibriError, Result};
+use crate::limiters::{rate_limit::RateLimiter, versioned_bucket::VersionedTokenBucket};
 use crate::node::{CheckCallsResponse, Node};
-use crate::rate_limit::RateLimiter;
 use crate::settings;
-use crate::token_bucket::TokenBucket;
 use crate::transport::UdpTransport;
-use crate::versioned_bucket::VersionedTokenBucket;
 
 /// A gossip-based node that maintains all client state locally
 /// and syncs with other nodes via gossip protocol.
 #[derive(Clone)]
 pub struct GossipNode {
-    node_id: u32,
-    /// Local rate limiter
-    rate_limiter: Arc<RwLock<RateLimiter>>,
-    /// All versioned token buckets maintained locally
-    local_buckets: Arc<DashMap<String, VersionedTokenBucket>>,
-    /// Gossip scheduler for state propagation
-    gossip_scheduler: Option<Arc<GossipScheduler>>,
+    // rate-limit settings
+    rate_limit_settings: settings::RateLimitSettings,
+    /// Local rate limiter - handles all bucket operations
+    rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>>,
+    /// Channel for receiving incoming gossip messages from network
+    inbound_msg_tx: mpsc::Sender<Vec<u8>>,
     /// Transport layer for network communication
     transport: Option<Arc<UdpTransport>>,
-    /// Configuration
-    default_rate_limit: u32,
-    default_window: Duration,
+    /// Gossip configuration
+    gossip_interval_ms: u64,
+    gossip_fanout: usize,
 }
 
 impl std::fmt::Debug for GossipNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GossipNode")
-            .field("node_id", &self.node_id)
-            .field("default_rate_limit", &self.default_rate_limit)
-            .field("default_window", &self.default_window)
-            .field("has_gossip_scheduler", &self.gossip_scheduler.is_some())
+            .field("node_id", &self.rate_limit_settings.node_id)
             .field("has_transport", &self.transport.is_some())
             .finish()
     }
@@ -50,137 +42,101 @@ impl std::fmt::Debug for GossipNode {
 impl GossipNode {
     pub async fn new(
         settings: settings::Settings,
-        rate_limiter: Arc<RwLock<RateLimiter>>,
+        rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>>,
     ) -> Result<Self> {
         let node_id = settings.node_id();
         info!(
             "Created GossipNode with ID: {} (port: {})",
             node_id, settings.listen_port_udp
         );
+        let rl_settings = settings.rate_limit_settings();
 
-        // Create local buckets first (needed for message processing)
-        let local_buckets = Arc::new(DashMap::new());
-
-        // Create gossip components if we have peers
-        let (gossip_scheduler, transport) = if !settings.topology.is_empty() {
+        // Create transport - use port 0 for tests to avoid conflicts
+        let gossip_port = if cfg!(test) {
+            0
+        } else {
+            settings.listen_port_udp
+        };
+        // Build transport
+        let transport = if !settings.topology.is_empty() {
             info!(
                 "Initializing gossip transport with {} peers: {:?}",
                 settings.topology.len(),
                 settings.topology
             );
-
-            // Create transport - use port 0 for tests to avoid conflicts
-            let gossip_port = if cfg!(test) {
-                0
-            } else {
-                settings.listen_port_udp
-            };
-            // Convert peer addresses to URLs for UdpTransport
-            let transport = Arc::new(
+            Some(Arc::new(
                 UdpTransport::new(node_id, gossip_port, settings.topology.clone())
                     .await
                     .map_err(|e| {
                         ColibriError::Transport(format!("Failed to create transport: {}", e))
                     })?,
-            );
-
-            // Create gossip scheduler - transport already knows about peers
-            let scheduler = Arc::new(GossipScheduler::new(
-                Duration::from_millis(settings.gossip_interval_ms),
-                settings.gossip_fanout,
-                32768, // max payload size (32KB)
-                transport.clone(),
-                node_id,
-            ));
-
-            // Start the gossip scheduler
-            scheduler.start().await;
-            info!("Gossip scheduler started");
-
-            // Start incoming message processing loop
-            GossipNode::start_message_processing_loop(
-                transport.clone(),
-                node_id,
-                local_buckets.clone(),
-            )
-            .await;
-            info!("Gossip message processing loop started");
-
-            (Some(scheduler), Some(transport))
+            ))
         } else {
-            info!("No peers specified, running in single-node mode without gossip");
-            (None, None)
+            None
         };
 
-        Ok(Self {
-            node_id,
-            rate_limiter,
-            local_buckets,
-            gossip_scheduler,
-            transport,
-            default_rate_limit: 1000, // Default from rate limiter settings
-            default_window: Duration::from_secs(60), // Default window
-        })
-    }
+        // Create channel for incoming gossip messages from network
+        let (inbound_msg_tx, inbound_msg_rx) = mpsc::channel(1000);
 
-    /// Get or create a versioned token bucket for a client
-    fn get_or_create_bucket(&self, client_id: &str) -> VersionedTokenBucket {
-        let bucket = self
-            .local_buckets
-            .entry(client_id.to_string())
-            .or_insert_with(|| {
-                debug!("Creating new token bucket for client '{}'", client_id);
-                let bucket = TokenBucket::new(self.default_rate_limit, self.default_window);
-                VersionedTokenBucket::new(bucket, self.node_id)
-            })
-            .clone();
+        let node_id = rl_settings.node_id;
+        let node = Self {
+            rate_limit_settings: rl_settings,
+            rate_limiter: rate_limiter.clone(),
+            inbound_msg_tx: inbound_msg_tx.clone(),
+            transport: transport.clone(),
+            gossip_interval_ms: settings.gossip_interval_ms,
+            gossip_fanout: settings.gossip_fanout,
+        };
 
-        debug!(
-            "[{}] Retrieved bucket for client '{}': tokens={}, version={}",
-            self.node_id,
-            client_id,
-            bucket.bucket.tokens,
-            bucket.vector_clock.get_timestamp(self.node_id)
-        );
-        bucket
-    }
-
-    /// Update a bucket locally and trigger gossip propagation if available
-    fn update_bucket(&self, client_id: String, mut bucket: VersionedTokenBucket) {
-        let old_version = bucket.vector_clock.get_timestamp(self.node_id);
-
-        // Increment our vector clock
-        let new_version = bucket.vector_clock.increment(self.node_id);
-        bucket.last_updated_by = self.node_id;
-
-        debug!(
-            "[{}] Updated bucket for client '{}': tokens={}, version {} -> {}",
-            self.node_id, client_id, bucket.bucket.tokens, old_version, new_version
-        );
-
-        // Store the updated bucket
-        self.local_buckets.insert(client_id.clone(), bucket.clone());
-
-        // Trigger gossip if available
-        if let Some(ref scheduler) = self.gossip_scheduler {
-            scheduler.record_change(client_id.clone(), bucket);
-            debug!(
-                "[{}] Recorded change in gossip scheduler for client '{}'",
-                self.node_id, client_id
-            );
+        // Start the central IO processing loop if we have transport
+        if let Some(transport) = transport {
+            let rate_limiter_for_io = rate_limiter.clone();
+            let gossip_interval = std::time::Duration::from_millis(settings.gossip_interval_ms);
+            tokio::spawn(async move {
+                Self::start_io_loop(
+                    node_id,
+                    rate_limiter_for_io,
+                    inbound_msg_rx,
+                    transport,
+                    gossip_interval,
+                )
+                .await;
+            });
         }
+
+        Ok(node)
+    }
+    pub fn node_id(&self) -> u32 {
+        self.rate_limit_settings.node_id
     }
 
     /// Merge incoming gossip state from other nodes (public interface)
-    pub fn merge_gossip_state(&self, entries: HashMap<String, VersionedTokenBucket>) {
+    pub async fn merge_gossip_state(&self, entries: HashMap<String, VersionedTokenBucket>) {
+        Self::merge_gossip_state_static(self.node_id(), &self.rate_limiter, entries).await;
+    }
+
+    /// Static version of merge_gossip_state for use in IO loop
+    async fn merge_gossip_state_static(
+        node_id: u32,
+        rate_limiter: &Arc<RwLock<RateLimiter<VersionedTokenBucket>>>,
+        entries: HashMap<String, VersionedTokenBucket>,
+    ) {
         debug!(
             "[{}] Processing {} gossip entries for merge",
-            self.node_id,
+            node_id,
             entries.len()
         );
 
-        for (client_id, incoming_bucket) in entries {
-            if let Some(mut current_entry) = self.local_buckets.get_mut(&client_id) {
+        // Add explicit debug to track progress
+        eprintln!(
+            "[DEBUG] merge_gossip_state_static starting with {} entries",
+            entries.len()
+        );
+
+        for (client_id, incoming_bucket) in entries.into_iter() {
+            eprintln!("[DEBUG] Processing client: {}", client_id);
+            if let Some(mut current_entry) = rate_limiter.read().await.get_bucket(&client_id) {
+                eprintln!("[DEBUG] Found existing bucket for client: {}", client_id);
                 let current_version = current_entry
                     .vector_clock
                     .get_timestamp(incoming_bucket.last_updated_by);
@@ -189,235 +145,216 @@ impl GossipNode {
                     .get_timestamp(incoming_bucket.last_updated_by);
 
                 // Try to merge with existing bucket
-                if current_entry.merge(incoming_bucket.clone(), self.node_id) {
+                if current_entry.merge(incoming_bucket.clone(), node_id) {
                     debug!(
                         "[{}] Merged gossip update for client '{}': {} -> {} tokens, version {} -> {}",
-                        self.node_id,
+                        node_id,
                         client_id,
                         current_entry.bucket.tokens,
                         incoming_bucket.bucket.tokens,
                         current_version,
                         incoming_version
                     );
+                    rate_limiter
+                        .write()
+                        .await
+                        .set_bucket(&client_id, current_entry);
                 } else {
                     debug!(
                         "[{}] Rejected gossip update for client '{}': incoming version {} <= current version {}",
-                        self.node_id, client_id, incoming_version, current_version
+                        node_id, client_id, incoming_version, current_version
                     );
                 }
             } else {
+                eprintln!(
+                    "[DEBUG] No existing bucket, creating new one for client: {}",
+                    client_id
+                );
                 // No existing entry, accept incoming state
                 debug!(
                     "[{}] Accepted new gossip state for client '{}': tokens={}, version={}",
-                    self.node_id,
+                    node_id,
                     client_id,
                     incoming_bucket.bucket.tokens,
                     incoming_bucket
                         .vector_clock
                         .get_timestamp(incoming_bucket.last_updated_by)
                 );
-                self.local_buckets
-                    .insert(client_id.clone(), incoming_bucket);
+                rate_limiter
+                    .write()
+                    .await
+                    .set_bucket(&client_id, incoming_bucket);
+                eprintln!(
+                    "                eprintln!("[DEBUG] Finished setting new bucket for client: {}", client_id);
+            }
+        }
+        eprintln!("[DEBUG] merge_gossip_state_static completed");
+    }",
+                    client_id
+                );
             }
         }
     }
 
     /// Check if this node has gossip enabled
     pub fn has_gossip(&self) -> bool {
-        self.gossip_scheduler.is_some() && self.transport.is_some()
-    }
-
-    /// Send a gossip message to random peers using the underlying socket pool
-    pub async fn send_to_random_peers(
-        &self,
-        message: &GossipMessage,
-        fanout: usize,
-    ) -> Result<Vec<SocketAddr>> {
-        if let Some(ref scheduler) = self.gossip_scheduler {
-            scheduler.gossip_to_random_peers(message, fanout).await
-        } else {
-            Err(ColibriError::Transport(
-                "Gossip not enabled - no transport available".to_string(),
-            ))
-        }
-    }
-
-    /// Send a gossip message to a specific peer using the underlying socket pool
-    pub async fn send_to_peer(
-        &self,
-        message: &GossipMessage,
-        target: SocketAddr,
-    ) -> Result<SocketAddr> {
-        if let Some(ref scheduler) = self.gossip_scheduler {
-            scheduler.gossip_to_peer(message, target).await
-        } else {
-            Err(ColibriError::Transport(
-                "Gossip not enabled - no transport available".to_string(),
-            ))
-        }
+        self.transport.is_some()
     }
 
     /// Log current statistics about the gossip node state for debugging
-    pub fn log_stats(&self) {
-        let bucket_count = self.local_buckets.len();
+    pub async fn log_stats(&self) {
+        let bucket_count = self.rate_limiter.read().await.len();
         debug!(
             "[{}] Gossip node stats: {} active client buckets",
-            self.node_id, bucket_count
+            self.node_id(),
+            bucket_count
+        );
+    }
+
+    /// Get channel sender for incoming messages (used by transport layer)
+    pub fn inbound_message_sender(&self) -> mpsc::Sender<Vec<u8>> {
+        self.inbound_msg_tx.clone()
+    }
+
+    /// Central IO loop - handles all network communication and gossip timing
+    /// This eliminates async contention by processing all IO in one place
+    ///
+    /// Static method that takes only the shared state it needs, avoiding
+    /// the need to clone the entire GossipNode
+    async fn start_io_loop(
+        node_id: u32,
+        rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>>,
+        mut inbound_rx: mpsc::Receiver<Vec<u8>>,
+        transport: Arc<UdpTransport>,
+        gossip_interval: std::time::Duration,
+    ) {
+        info!(
+            "[{}] Starting central IO loop with {}ms gossip interval",
+            node_id,
+            gossip_interval.as_millis()
         );
 
-        if bucket_count > 0 && bucket_count <= 10 {
-            // If we have a reasonable number of buckets, log details
-            for entry in self.local_buckets.iter() {
-                let (client_id, bucket) = (entry.key(), entry.value());
-                debug!(
-                    "[{}] Client '{}': {} tokens, version={}, last_updated_by={}",
-                    self.node_id,
-                    client_id,
-                    bucket.bucket.tokens,
-                    bucket.vector_clock.get_timestamp(bucket.last_updated_by),
-                    bucket.last_updated_by
-                );
-            }
-        } else if bucket_count > 10 {
-            // If we have many buckets, just log a summary
-            let total_tokens: f64 = self
-                .local_buckets
-                .iter()
-                .map(|entry| entry.value().bucket.tokens)
-                .sum();
-            debug!(
-                "[{}]  Total tokens across all clients: {}",
-                self.node_id, total_tokens
-            );
-        }
+        let mut gossip_timer = tokio::time::interval(gossip_interval);
+        let mut last_gossip_buckets: HashMap<String, Instant> = HashMap::new();
+        let mut gossip_round = 0u64;
 
-        if self.gossip_scheduler.is_some() {
-            // Note: We could add scheduler stats here if needed
-            debug!("[{}]  Gossip scheduler is active", self.node_id);
-        } else {
-            debug!("[{}]  No gossip scheduler configured", self.node_id);
+        loop {
+            tokio::select! {
+                // Handle incoming messages from network
+                Some(data) = inbound_rx.recv() => {
+                    if let Err(e) = Self::handle_incoming_message(node_id, &rate_limiter, data).await {
+                        debug!("[{}] Error processing incoming message: {}", node_id, e);
+                    }
+                }
+
+                // Gossip timer - send delta updates
+                _ = gossip_timer.tick() => {
+                    if let Err(e) = Self::handle_gossip_tick(
+                        node_id,
+                        &rate_limiter,
+                        &transport,
+                        &mut last_gossip_buckets,
+                        &mut gossip_round,
+                    ).await {
+                        debug!("[{}] Error during gossip tick: {}", node_id, e);
+                    }
+                }
+
+                // Exit if inbound channel is closed
+                else => {
+                    info!("[{}] IO loop inbound channel closed, exiting", node_id);
+                    break;
+                }
+            }
         }
     }
 
-    /// Start the background task that processes incoming gossip messages
-    async fn start_message_processing_loop(
-        transport: Arc<UdpTransport>,
+    /// Handle incoming gossip message from network
+    async fn handle_incoming_message(
         node_id: u32,
-        local_buckets: Arc<DashMap<String, VersionedTokenBucket>>,
-    ) {
-        tokio::spawn(async move {
-            info!(
-                "Starting gossip message processing loop for node {}",
-                node_id
-            );
-
-            let mut message_receiver = transport.get_message_receiver().await;
-
-            loop {
-                // Try to receive a message with a timeout
-                match tokio::time::timeout(Duration::from_millis(100), message_receiver.recv())
-                    .await
-                {
-                    Ok(Some((data, sender_addr))) => {
-                        event!(Level::DEBUG, "Received gossip packet from {}", sender_addr);
-
-                        // Deserialize the packet
-                        match GossipPacket::deserialize(&data) {
-                            Ok(packet) => {
-                                // Process the message
-                                if let Err(e) = GossipNode::process_incoming_message(
-                                    packet,
-                                    node_id,
-                                    &local_buckets,
-                                )
-                                .await
-                                {
-                                    event!(Level::WARN, "Failed to process gossip message: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                event!(Level::WARN, "Failed to deserialize gossip packet: {}", e);
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // Channel closed - break the loop
-                        event!(Level::WARN, "Message receiver channel closed");
-                        break;
-                    }
-                    Err(_) => {
-                        // Timeout - continue loop
-                        continue;
-                    }
-                }
+        rate_limiter: &Arc<RwLock<RateLimiter<VersionedTokenBucket>>>,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        match GossipPacket::deserialize(&data) {
+            Ok(packet) => {
+                debug!("[{}] Received gossip packet", node_id);
+                Self::process_incoming_message(node_id, rate_limiter, packet).await
             }
-        });
+            Err(e) => {
+                debug!("[{}] Failed to deserialize packet: {}", node_id, e);
+                Err(ColibriError::Transport(format!(
+                    "Deserialization failed: {}",
+                    e
+                )))
+            }
+        }
+    }
+
+    /// Handle gossip tick - for now just send a heartbeat
+    /// TODO: Implement proper delta-state gossip when we have change tracking
+    async fn handle_gossip_tick(
+        node_id: u32,
+        _rate_limiter: &Arc<RwLock<RateLimiter<VersionedTokenBucket>>>,
+        transport: &UdpTransport,
+        _last_gossip_buckets: &mut HashMap<String, Instant>,
+        gossip_round: &mut u64,
+    ) -> Result<()> {
+        // For now, just send a heartbeat to keep connections alive
+        let message = GossipMessage::Heartbeat {
+            node_id,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            version_vector: HashMap::new(),
+        };
+
+        let packet = GossipPacket::new(message);
+        Self::send_gossip_packet(node_id, packet, transport).await?;
+
+        *gossip_round += 1;
+        debug!(
+            "[{}] Sent heartbeat in gossip round {}",
+            node_id, *gossip_round
+        );
+
+        Ok(())
+    }
+
+    /// Send a gossip packet to a random peer
+    async fn send_gossip_packet(
+        node_id: u32,
+        packet: GossipPacket,
+        transport: &UdpTransport,
+    ) -> Result<()> {
+        match packet.serialize() {
+            Ok(data) => {
+                debug!("[{}] Sending gossip packet", node_id);
+                let _peer = transport
+                    .send_to_random_peer(&data)
+                    .await
+                    .map_err(|e| ColibriError::Transport(format!("Send failed: {}", e)))?;
+                Ok(())
+            }
+            Err(e) => {
+                debug!("[{}] Failed to serialize packet: {}", node_id, e);
+                Err(ColibriError::Transport(format!(
+                    "Serialization failed: {}",
+                    e
+                )))
+            }
+        }
     }
 
     /// Process a single incoming gossip message
     async fn process_incoming_message(
+        node_id: u32,
+        rate_limiter: &Arc<RwLock<RateLimiter<VersionedTokenBucket>>>,
         packet: GossipPacket,
-        local_node_id: u32,
-        local_buckets: &DashMap<String, VersionedTokenBucket>,
     ) -> Result<()> {
         match packet.message {
-            GossipMessage::StateSync {
-                entries,
-                sender_node_id,
-                membership_version: _,
-            } => {
-                // Don't process our own messages
-                if sender_node_id == local_node_id {
-                    event!(Level::DEBUG, "Ignoring our own gossip message");
-                    return Ok(());
-                }
-
-                event!(
-                    Level::DEBUG,
-                    "Processing StateSync from node {} with {} entries",
-                    sender_node_id,
-                    entries.len()
-                );
-
-                // Merge each incoming entry
-                for (client_id, incoming_bucket) in entries {
-                    if let Some(mut current_entry) = local_buckets.get_mut(&client_id) {
-                        // Try to merge with existing bucket
-                        if current_entry.merge(incoming_bucket, local_node_id) {
-                            event!(
-                                Level::DEBUG,
-                                "Merged gossip update for client: {} from node {}",
-                                client_id,
-                                sender_node_id
-                            );
-                        } else {
-                            event!(
-                                Level::DEBUG,
-                                "Rejected stale gossip update for client: {} from node {}",
-                                client_id,
-                                sender_node_id
-                            );
-                        }
-                    } else {
-                        // No existing entry, accept incoming state
-                        local_buckets.insert(client_id.clone(), incoming_bucket);
-                        event!(
-                            Level::DEBUG,
-                            "Accepted new gossip state for client: {} from node {}",
-                            client_id,
-                            sender_node_id
-                        );
-                    }
-                }
-
-                event!(
-                    Level::DEBUG,
-                    "Completed processing StateSync from node {}",
-                    sender_node_id
-                );
-            }
             GossipMessage::StateRequest { .. } => {
-                event!(Level::DEBUG, "Received StateRequest - not yet implemented");
+                debug!("[{}] Received StateRequest - not yet implemented", node_id);
                 // TODO: Implement state request handling
             }
             GossipMessage::DeltaStateSync {
@@ -427,41 +364,19 @@ impl GossipNode {
                 last_seen_versions: _,
             } => {
                 // Don't process our own messages
-                if sender_node_id == local_node_id {
-                    event!(Level::DEBUG, "Ignoring our own delta gossip message");
+                if sender_node_id == node_id {
+                    debug!("[{}] Ignoring our own delta gossip message", node_id);
                     return Ok(());
                 }
 
-                event!(
-                    Level::DEBUG,
-                    "Processing DeltaStateSync from node {} with {} updates",
+                debug!(
+                    "[{}] Processing DeltaStateSync from node {} with {} updates",
+                    node_id,
                     sender_node_id,
                     updates.len()
                 );
 
-                // Merge each incoming update
-                for (client_id, incoming_bucket) in updates {
-                    if let Some(mut current_entry) = local_buckets.get_mut(&client_id) {
-                        // Try to merge with existing bucket
-                        if current_entry.merge(incoming_bucket, local_node_id) {
-                            event!(
-                                Level::DEBUG,
-                                "Merged delta update for client: {} from node {}",
-                                client_id,
-                                sender_node_id
-                            );
-                        }
-                    } else {
-                        // No existing entry, accept incoming state
-                        local_buckets.insert(client_id.clone(), incoming_bucket);
-                        event!(
-                            Level::DEBUG,
-                            "Accepted new delta state for client: {} from node {}",
-                            client_id,
-                            sender_node_id
-                        );
-                    }
-                }
+                Self::merge_gossip_state_static(node_id, rate_limiter, updates).await;
             }
             GossipMessage::StateResponse {
                 responding_node_id,
@@ -469,39 +384,34 @@ impl GossipNode {
                 current_versions: _,
             } => {
                 // Don't process our own messages
-                if responding_node_id == local_node_id {
+                if responding_node_id == node_id {
                     return Ok(());
                 }
 
-                event!(
-                    Level::DEBUG,
-                    "Processing StateResponse from node {} with {} updates",
+                debug!(
+                    "[{}] Processing StateResponse from node {} with {} updates",
+                    node_id,
                     responding_node_id,
                     requested_data.len()
                 );
 
                 // Merge each incoming update
-                for (client_id, incoming_bucket) in requested_data {
-                    if let Some(mut current_entry) = local_buckets.get_mut(&client_id) {
-                        current_entry.merge(incoming_bucket, local_node_id);
-                    } else {
-                        local_buckets.insert(client_id, incoming_bucket);
-                    }
-                }
+                Self::merge_gossip_state_static(node_id, rate_limiter, requested_data).await;
             }
             GossipMessage::Heartbeat {
-                node_id,
+                node_id: heartbeat_node_id,
                 timestamp: _,
                 version_vector: _,
-                is_alive: _,
             } => {
                 // Don't process our own heartbeat
-                if node_id == local_node_id {
+                if heartbeat_node_id == node_id {
                     return Ok(());
                 }
 
-                event!(Level::DEBUG, "Received heartbeat from node {}", node_id);
-
+                debug!(
+                    "[{}] Received heartbeat from node {}",
+                    node_id, heartbeat_node_id
+                );
                 // TODO: Update peer liveness information
             }
         }
@@ -514,9 +424,10 @@ impl GossipNode {
 impl Node for GossipNode {
     /// Check remaining calls for a client using local state
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
-        let bucket = self.get_or_create_bucket(&client_id);
-        let calls_remaining = bucket.bucket.tokens_to_u32();
-
+        let rate_limiter = self.rate_limiter.read().await;
+        let calls_remaining = rate_limiter
+            .async_check_calls_remaining_for_client(client_id.as_str())
+            .await;
         debug!(
             "Check limit for client '{}': {} tokens remaining",
             client_id, calls_remaining
@@ -530,33 +441,14 @@ impl Node for GossipNode {
 
     /// Apply rate limiting using local state only
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        let mut bucket = self.get_or_create_bucket(&client_id);
-
-        // Try to consume one token
-        if bucket.bucket.try_consume(1) {
-            let calls_remaining = bucket.bucket.tokens_to_u32();
-
-            debug!(
-                "[{}] Rate limit SUCCESS for client '{}': {} tokens remaining",
-                self.node_id, client_id, calls_remaining
-            );
-
-            // Success - update our state and trigger gossip
-            let response = CheckCallsResponse {
-                client_id: client_id.clone(),
+        let mut rate_limiter = self.rate_limiter.write().await;
+        let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
+        if let Some(calls_remaining) = calls_left {
+            Ok(Some(CheckCallsResponse {
+                client_id,
                 calls_remaining,
-            };
-
-            // Update bucket with new state
-            self.update_bucket(client_id, bucket);
-
-            Ok(Some(response))
+            }))
         } else {
-            debug!(
-                "Rate limit EXCEEDED for client '{}': no tokens remaining",
-                client_id
-            );
-            // Rate limit exceeded
             Ok(None)
         }
     }
@@ -575,11 +467,13 @@ impl Node for GossipNode {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
     use tokio::sync::RwLock;
 
     use super::*;
+    use crate::limiters::token_bucket::Bucket;
 
     pub fn gen_settings() -> settings::Settings {
         settings::Settings {
@@ -596,14 +490,22 @@ mod tests {
         }
     }
 
+    pub fn rl_settings() -> settings::RateLimitSettings {
+        settings::RateLimitSettings {
+            node_id: 1,
+            rate_limit_max_calls_allowed: 1000,
+            rate_limit_interval_seconds: 60,
+        }
+    }
+
+    pub fn new_rate_limiter() -> RateLimiter<VersionedTokenBucket> {
+        RateLimiter::new(rl_settings())
+    }
+
     #[tokio::test]
     async fn test_gossip_node_single_mode() {
-        let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            settings::RateLimitSettings {
-                rate_limit_max_calls_allowed: 1000,
-                rate_limit_interval_seconds: 60,
-            },
-        )));
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
 
         // Create node with no topology (single mode even though Gossip specified)
         let mut conf = gen_settings();
@@ -612,18 +514,13 @@ mod tests {
 
         let node = GossipNode::new(conf, rate_limiter).await.unwrap();
         assert!(!node.has_gossip());
-        assert!(node.gossip_scheduler.is_none());
         assert!(node.transport.is_none());
     }
 
     #[tokio::test]
     async fn test_gossip_node_gossip_mode() {
-        let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            settings::RateLimitSettings {
-                rate_limit_max_calls_allowed: 1000,
-                rate_limit_interval_seconds: 60,
-            },
-        )));
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
 
         // Create node with topology (gossip mode) - use unique port
         let topology: HashSet<SocketAddr> =
@@ -635,7 +532,6 @@ mod tests {
 
         let node = GossipNode::new(conf, rate_limiter).await.unwrap();
         assert!(node.has_gossip());
-        assert!(node.gossip_scheduler.is_some());
         assert!(node.transport.is_some());
 
         // Test that we can get gossip stats
@@ -643,12 +539,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_triggers_gossip() {
-        let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            settings::RateLimitSettings {
-                rate_limit_max_calls_allowed: 10,
-                rate_limit_interval_seconds: 60,
-            },
-        )));
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
 
         // Create node with topology to enable gossip - use unique port
         let mut conf = gen_settings();
@@ -664,19 +556,21 @@ mod tests {
         assert!(result.is_some());
 
         // Check that the bucket was created locally
-        assert!(node.local_buckets.contains_key("test_client"));
+        assert!(node
+            .rate_limiter
+            .read()
+            .await
+            .get_bucket("test_client")
+            .is_some());
 
         // Check that gossip stats show activity
     }
 
     #[tokio::test]
     async fn test_merge_gossip_state() {
-        let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            settings::RateLimitSettings {
-                rate_limit_max_calls_allowed: 1000,
-                rate_limit_interval_seconds: 60,
-            },
-        )));
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
+
         let mut conf = gen_settings();
         conf.listen_port = 8084;
         let topology: HashSet<SocketAddr> =
@@ -688,83 +582,243 @@ mod tests {
 
         // Create some fake gossip state
         let mut entries = std::collections::HashMap::new();
-        let bucket = TokenBucket::new(500, Duration::from_secs(60));
-        let versioned_bucket = VersionedTokenBucket::new(bucket, 999); // Different node ID
+        let rl_settings = settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 500,
+            rate_limit_interval_seconds: 60,
+            node_id: 999,
+        };
+        let versioned_bucket = VersionedTokenBucket::new(&rl_settings); // Different node ID
         entries.insert("remote_client".to_string(), versioned_bucket);
 
         // Merge the state
-        node.merge_gossip_state(entries);
+        node.merge_gossip_state(entries).await;
 
         // Check that the state was merged
-        assert!(node.local_buckets.contains_key("remote_client"));
-        let stored_bucket = node.local_buckets.get("remote_client").unwrap();
-        assert_eq!(stored_bucket.last_updated_by, 999);
+        let stored_bucket = node.rate_limiter.read().await.get_bucket("remote_client");
+        assert!(stored_bucket.is_some());
+        assert_eq!(stored_bucket.unwrap().last_updated_by, 999);
     }
 
     #[tokio::test]
-    async fn test_message_processing_logic() {
-        let local_buckets = Arc::new(DashMap::new());
-        let local_node_id = 123;
+    async fn test_message_processing_delta_state_sync() {
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
 
-        // Create a fake incoming message
-        let mut entries = std::collections::HashMap::new();
-        let bucket = TokenBucket::new(750, Duration::from_secs(60));
-        let versioned_bucket = VersionedTokenBucket::new(bucket, 456); // Different node ID
-        entries.insert("test_client".to_string(), versioned_bucket);
+        let node = create_gossip_node(rate_limiter, 1).await;
 
-        let message = GossipMessage::StateSync {
-            entries,
-            sender_node_id: 456,
-            membership_version: 1,
+        // Create a delta state sync message from another node
+        let mut updates = HashMap::new();
+        let rl_settings = settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 200,
+            rate_limit_interval_seconds: 60,
+            node_id: 2, // Different node ID
         };
-        let packet = crate::node::gossip::GossipPacket::new(message);
+        let versioned_bucket = VersionedTokenBucket::new(&rl_settings);
+        updates.insert("client_from_node_2".to_string(), versioned_bucket);
+
+        let message = GossipMessage::DeltaStateSync {
+            updates,
+            sender_node_id: 2,
+            gossip_round: 1,
+            last_seen_versions: HashMap::new(),
+        };
+
+        let packet = GossipPacket::new(message);
 
         // Process the message
         let result =
-            GossipNode::process_incoming_message(packet, local_node_id, &local_buckets).await;
+            GossipNode::process_incoming_message(node.node_id(), &node.rate_limiter, packet).await;
         assert!(result.is_ok());
 
         // Verify the state was merged
-        assert!(local_buckets.contains_key("test_client"));
-        let stored_bucket = local_buckets.get("test_client").unwrap();
-        assert_eq!(stored_bucket.last_updated_by, 456);
+        let stored_bucket = node
+            .rate_limiter
+            .read()
+            .await
+            .get_bucket("client_from_node_2");
+        assert!(stored_bucket.is_some());
+        assert_eq!(stored_bucket.unwrap().last_updated_by, 2);
     }
 
     #[tokio::test]
-    async fn test_ignore_own_messages() {
-        let local_buckets = Arc::new(DashMap::new());
-        let local_node_id = 123;
+    async fn test_message_processing_ignores_own_messages() {
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
+
+        let node = create_gossip_node(rate_limiter, 123).await;
 
         // Create a message from our own node
-        let mut entries = std::collections::HashMap::new();
-        let bucket = TokenBucket::new(750, Duration::from_secs(60));
-        let versioned_bucket = VersionedTokenBucket::new(bucket, local_node_id);
-        entries.insert("self_client".to_string(), versioned_bucket);
-
-        let message = GossipMessage::StateSync {
-            entries,
-            sender_node_id: local_node_id, // Same as local_node_id
-            membership_version: 1,
+        let mut updates = HashMap::new();
+        let rl_settings = settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 200,
+            rate_limit_interval_seconds: 60,
+            node_id: 123, // Same as our node ID
         };
-        let packet = crate::node::gossip::GossipPacket::new(message);
+        let versioned_bucket = VersionedTokenBucket::new(&rl_settings);
+        updates.insert("self_client".to_string(), versioned_bucket);
+
+        let message = GossipMessage::DeltaStateSync {
+            updates,
+            sender_node_id: 123, // Same as local node
+            gossip_round: 1,
+            last_seen_versions: HashMap::new(),
+        };
+
+        let packet = GossipPacket::new(message);
 
         // Process the message
         let result =
-            GossipNode::process_incoming_message(packet, local_node_id, &local_buckets).await;
+            GossipNode::process_incoming_message(node.node_id(), &node.rate_limiter, packet).await;
         assert!(result.is_ok());
 
         // Verify our own message was ignored
-        assert!(!local_buckets.contains_key("self_client"));
+        assert!(node
+            .rate_limiter
+            .read()
+            .await
+            .get_bucket("self_client")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_message_processing_state_response() {
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
+
+        let node = create_gossip_node(rate_limiter, 1).await;
+
+        // Create a state response message
+        let mut requested_data = HashMap::new();
+        let rl_settings = settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 300,
+            rate_limit_interval_seconds: 60,
+            node_id: 3,
+        };
+        let versioned_bucket = VersionedTokenBucket::new(&rl_settings);
+        requested_data.insert("response_client".to_string(), versioned_bucket);
+
+        let message = GossipMessage::StateResponse {
+            responding_node_id: 3,
+            requested_data,
+            current_versions: HashMap::new(),
+        };
+
+        let packet = GossipPacket::new(message);
+
+        // Process the message
+        let result =
+            GossipNode::process_incoming_message(node.node_id(), &node.rate_limiter, packet).await;
+        assert!(result.is_ok());
+
+        // Verify the state was merged
+        let stored_bucket = node.rate_limiter.read().await.get_bucket("response_client");
+        assert!(stored_bucket.is_some());
+        assert_eq!(stored_bucket.unwrap().last_updated_by, 3);
+    }
+
+    #[tokio::test]
+    async fn test_message_processing_heartbeat() {
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
+
+        let node = create_gossip_node(rate_limiter, 1).await;
+
+        // Create a heartbeat message
+        let message = GossipMessage::Heartbeat {
+            node_id: 4,
+            timestamp: 1234567890,
+            version_vector: HashMap::new(),
+        };
+
+        let packet = GossipPacket::new(message);
+
+        // Process the message - should not error but currently does nothing
+        let result =
+            GossipNode::process_incoming_message(node.node_id(), &node.rate_limiter, packet).await;
+        assert!(result.is_ok());
+
+        // No state changes expected from heartbeat (TODO: track liveness)
+    }
+
+    #[tokio::test]
+    async fn test_channel_senders_available() {
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
+
+        let node = create_gossip_node(rate_limiter, 1).await;
+
+        // Verify we can get inbound channel sender
+        let inbound_sender = node.inbound_message_sender();
+
+        // Verify channel is not closed
+        assert!(!inbound_sender.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_serialize_deserialize_round_trip() {
+        // Test that our packet serialization works correctly
+        let mut updates = HashMap::new();
+        let rl_settings = settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 100,
+            rate_limit_interval_seconds: 60,
+            node_id: 5,
+        };
+        let versioned_bucket = VersionedTokenBucket::new(&rl_settings);
+        updates.insert("test_client".to_string(), versioned_bucket);
+
+        let message = GossipMessage::DeltaStateSync {
+            updates,
+            sender_node_id: 5,
+            gossip_round: 42,
+            last_seen_versions: HashMap::new(),
+        };
+
+        let original_packet = GossipPacket::new(message);
+
+        // Serialize and deserialize
+        let serialized = original_packet.serialize().expect("Failed to serialize");
+        let deserialized = GossipPacket::deserialize(&serialized).expect("Failed to deserialize");
+
+        // Verify packet ID is preserved
+        assert_eq!(original_packet.packet_id, deserialized.packet_id);
+
+        // Verify message content
+        match deserialized.message {
+            GossipMessage::DeltaStateSync {
+                sender_node_id,
+                gossip_round,
+                updates,
+                ..
+            } => {
+                assert_eq!(sender_node_id, 5);
+                assert_eq!(gossip_round, 42);
+                assert!(updates.contains_key("test_client"));
+            }
+            _ => panic!("Wrong message type after deserialization"),
+        }
+    }
+
+    // Helper function to create a gossip node for testing
+    async fn create_gossip_node(
+        rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>>,
+        node_id: u32,
+    ) -> GossipNode {
+        let mut conf = gen_settings();
+        conf.topology = HashSet::new(); // No transport needed for message processing tests
+        conf.run_mode = settings::RunMode::Single;
+        conf.rate_limit_max_calls_allowed = 1000;
+        conf.rate_limit_interval_seconds = 60;
+
+        // Override the rate limiter settings to use custom node ID
+        let mut node = GossipNode::new(conf, rate_limiter).await.unwrap();
+        node.rate_limit_settings.node_id = node_id;
+        node
     }
 
     #[tokio::test]
     async fn test_topology_parsing_with_http_urls() {
-        let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            settings::RateLimitSettings {
-                rate_limit_max_calls_allowed: 1000,
-                rate_limit_interval_seconds: 60,
-            },
-        )));
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
 
         // Test with HTTP URLs (like the justfile uses)
         let topology = [
@@ -785,21 +839,17 @@ mod tests {
 
         // Verify gossip is enabled (meaning topology was parsed successfully)
         assert!(node.has_gossip());
-        assert!(node.gossip_scheduler.is_some());
         assert!(node.transport.is_some());
 
         // Verify node has unique ID based on port
-        assert_ne!(node.node_id, 0);
+        assert_ne!(node.node_id(), 0);
     }
 
     #[tokio::test]
     async fn test_different_ports_generate_different_node_ids() {
-        let rate_limiter1 = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            settings::RateLimitSettings {
-                rate_limit_max_calls_allowed: 1000,
-                rate_limit_interval_seconds: 60,
-            },
-        )));
+        let rate_limiter1: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
+
         let rate_limiter2 = rate_limiter1.clone();
 
         // Create nodes with different ports - same topology to avoid differences there
@@ -825,30 +875,26 @@ mod tests {
         let node2 = GossipNode::new(conf, rate_limiter2).await.unwrap();
 
         // Verify nodes have different IDs
-        assert_ne!(node1.node_id, node2.node_id);
-        assert_ne!(node1.node_id, 0);
-        assert_ne!(node2.node_id, 0);
+        assert_ne!(node1.node_id(), node2.node_id());
+        assert_ne!(node1.node_id(), 0);
+        assert_ne!(node2.node_id(), 0);
 
         info!(
             "Node 1 (HTTP port 8001, UDP port 8401) has ID: {}",
-            node1.node_id
+            node1.node_id()
         );
         info!(
             "Node 2 (HTTP port 8002, UDP port 8402) has ID: {}",
-            node2.node_id
+            node2.node_id()
         );
     }
 
     #[tokio::test]
-    async fn test_transport_integration_methods() {
-        let rate_limiter = Arc::new(RwLock::new(crate::rate_limit::RateLimiter::new(
-            settings::RateLimitSettings {
-                rate_limit_max_calls_allowed: 1000,
-                rate_limit_interval_seconds: 60,
-            },
-        )));
+    async fn test_central_io_design_channels_created() {
+        let rate_limiter: Arc<RwLock<RateLimiter<VersionedTokenBucket>>> =
+            Arc::new(RwLock::new(new_rate_limiter()));
 
-        // Create node with gossip enabled
+        // Create node with gossip enabled to verify IO loop starts
         let topology: HashSet<SocketAddr> =
             HashSet::from(["http://localhost:9005".parse().unwrap()]);
         let mut conf = gen_settings();
@@ -857,6 +903,12 @@ mod tests {
         conf.listen_port = 8005;
         conf.listen_port_udp = 8405;
         let node = GossipNode::new(conf, rate_limiter).await.unwrap();
+
+        // Verify the central IO design: channels are available and IO loop should be running
         assert!(node.has_gossip());
+        assert!(!node.inbound_message_sender().is_closed());
+
+        // Give IO loop a moment to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
 }

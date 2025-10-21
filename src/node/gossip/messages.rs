@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use bincode::{Decode, Encode};
 
-use crate::versioned_bucket::VersionedTokenBucket;
+use crate::limiters::versioned_bucket::VersionedTokenBucket;
 
 /// Gossip message types for production delta-state protocol
 #[derive(Debug, Clone, Decode, Encode)]
@@ -42,14 +42,6 @@ pub enum GossipMessage {
         node_id: u32,
         timestamp: u64,
         version_vector: HashMap<u32, u64>, // Our knowledge of all nodes
-        is_alive: bool,
-    },
-
-    /// Legacy StateSync for backward compatibility
-    StateSync {
-        entries: HashMap<String, VersionedTokenBucket>,
-        sender_node_id: u32,
-        membership_version: u64,
     },
 }
 
@@ -57,7 +49,6 @@ pub enum GossipMessage {
 #[derive(Debug, Clone, Decode, Encode)]
 pub struct GossipPacket {
     pub message: GossipMessage,
-    pub compression_used: bool,
     pub packet_id: u64, // For deduplication
 }
 
@@ -66,18 +57,13 @@ impl GossipPacket {
     pub fn new(message: GossipMessage) -> Self {
         Self {
             message,
-            compression_used: false,
             packet_id: rand::random(), // Generate random packet ID
         }
     }
 
     /// Create a new gossip packet with specific ID
     pub fn new_with_id(message: GossipMessage, packet_id: u64) -> Self {
-        Self {
-            message,
-            compression_used: false,
-            packet_id,
-        }
+        Self { message, packet_id }
     }
 
     /// Serialize for INTERNAL cluster communication (UDP gossip)
@@ -97,6 +83,10 @@ impl GossipPacket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::limiters::token_bucket::Bucket;
+    use crate::limiters::versioned_bucket::VersionedTokenBucket;
+    use crate::settings;
 
     #[test]
     fn test_gossip_packet_serialization() {
@@ -126,38 +116,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_state_sync_message() {
-        let mut entries = HashMap::new();
-        entries.insert(
-            "client1".to_string(),
-            VersionedTokenBucket::new(
-                crate::token_bucket::TokenBucket::new(100, std::time::Duration::from_secs(60)),
-                1,
-            ),
-        );
-
-        let message = GossipMessage::StateSync {
-            entries,
-            sender_node_id: 2,
-            membership_version: 10,
-        };
-
-        let packet = GossipPacket::new(message);
-        let serialized = packet.serialize().expect("Failed to serialize");
-        let deserialized = GossipPacket::deserialize(&serialized).expect("Failed to deserialize");
-
-        match deserialized.message {
-            GossipMessage::StateSync {
-                entries,
-                sender_node_id,
-                membership_version,
-            } => {
-                assert_eq!(sender_node_id, 2);
-                assert_eq!(membership_version, 10);
-                assert!(entries.contains_key("client1"));
-            }
-            _ => panic!("Wrong message type"),
+    fn get_settings() -> settings::RateLimitSettings {
+        settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 100,
+            rate_limit_interval_seconds: 60,
+            node_id: 1,
         }
     }
 }

@@ -88,16 +88,12 @@ impl UdpSocketPool {
                 self.send_to(*target, data).await?;
                 Ok(*target)
             }
-            None => return Err(ColibriError::Transport("No peers available".to_string())),
+            None => Err(ColibriError::Transport("No peers available".to_string())),
         }
     }
 
     /// Send data to multiple random peers
-    pub async fn send_to_random_multiple(
-        &self,
-        data: &[u8],
-        count: usize,
-    ) -> Result<Vec<SocketAddr>> {
+    pub async fn send_to_random_peers(&self, data: &[u8], count: usize) -> Result<Vec<SocketAddr>> {
         if self.peers.is_empty() {
             return Err(ColibriError::Transport(
                 "No peers available for sending".to_string(),
@@ -105,9 +101,12 @@ impl UdpSocketPool {
         }
         // Now send to each peer without holding the main lock
         let mut successful_sends = Vec::new();
-        let mut rng = rand::rng();
-        for _ in 0..count {
-            let random_usize: usize = rng.random_range(0..self.peers.len());
+        // Do not allow the random thread_range to be used across await points: generate all random indexes now.
+        let rand_indexs = {
+            let mut rng = rand::rng();
+            [0..count].map(|_| rng.random_range(0..self.peers.len()))
+        };
+        for random_usize in rand_indexs {
             if let Some((target, _)) = self.peers.get_index(random_usize) {
                 match self.send_to(*target, data).await {
                     Ok(_) => successful_sends.push(*target),
@@ -243,7 +242,7 @@ mod tests {
 
         // Should attempt to send to 2 random peers
         // This will likely fail since nothing is listening, but tests the selection logic
-        let result = pool.send_to_random_multiple(b"test", 2).await;
+        let result = pool.send_to_random_peers(b"test", 2).await;
 
         // Either succeeds with 0-2 peers (if sends fail) or fails completely
         match result {

@@ -17,6 +17,7 @@ pub const DEFAULT_PORT_UDP: &str = "8412";
 
 #[derive(Clone, Debug, Decode, Encode)]
 pub struct RateLimitSettings {
+    pub node_id: u32,
     pub rate_limit_max_calls_allowed: u32,
     pub rate_limit_interval_seconds: u32,
 }
@@ -54,6 +55,7 @@ impl std::str::FromStr for RunMode {
 impl Default for RateLimitSettings {
     fn default() -> Self {
         Self {
+            node_id: 0,
             rate_limit_max_calls_allowed: 1000,
             rate_limit_interval_seconds: 60,
         }
@@ -108,6 +110,7 @@ impl Settings {
     }
     pub fn rate_limit_settings(&self) -> RateLimitSettings {
         RateLimitSettings {
+            node_id: self.node_id(),
             rate_limit_max_calls_allowed: self.rate_limit_max_calls_allowed,
             rate_limit_interval_seconds: self.rate_limit_interval_seconds,
         }

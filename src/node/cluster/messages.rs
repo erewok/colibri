@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bincode::{Decode, Encode};
 
 use super::membership::{ClusterMembership, NodeInfo};
-use crate::versioned_bucket::VersionedTokenBucket;
+use crate::limiters::versioned_bucket::VersionedTokenBucket;
 
 /// All possible gossip message types for cluster communication
 #[derive(Debug, Clone, Decode, Encode)]

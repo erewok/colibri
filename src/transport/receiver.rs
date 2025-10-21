@@ -12,7 +12,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
-use crate::error::{ColibriError, GossipError, Result};
+use crate::error::{ColibriError, Result};
 
 /// UDP message receiver with flexible handling patterns
 pub struct UdpReceiver {

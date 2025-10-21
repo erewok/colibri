@@ -1,4 +1,5 @@
-use colibri::rate_limit::RateLimiter;
+use colibri::limiters::rate_limit::RateLimiter;
+use colibri::limiters::versioned_bucket::VersionedTokenBucket;
 use colibri::settings::RateLimitSettings;
 
 #[test]
@@ -6,9 +7,10 @@ fn test_rate_limiter_integration() {
     let settings = RateLimitSettings {
         rate_limit_max_calls_allowed: 5,
         rate_limit_interval_seconds: 60,
+        node_id: 1, // Dummy node ID
     };
 
-    let mut limiter = RateLimiter::new(settings);
+    let mut limiter: RateLimiter<VersionedTokenBucket> = RateLimiter::new(settings);
 
     // Test basic rate limiting workflow
     let client_id = "integration_test_client";
@@ -35,9 +37,10 @@ fn test_rate_limiter_multiple_clients() {
     let settings = RateLimitSettings {
         rate_limit_max_calls_allowed: 3,
         rate_limit_interval_seconds: 1,
+        node_id: 1, // Dummy node ID
     };
 
-    let mut limiter = RateLimiter::new(settings);
+    let mut limiter: RateLimiter<VersionedTokenBucket> = RateLimiter::new(settings);
 
     // Test that different clients have independent limits
     assert!(limiter
@@ -71,9 +74,10 @@ fn test_rate_limiter_expire_functionality() {
     let settings = RateLimitSettings {
         rate_limit_max_calls_allowed: 10,
         rate_limit_interval_seconds: 1,
+        node_id: 1, // Dummy node ID
     };
 
-    let mut limiter = RateLimiter::new(settings);
+    let mut limiter: RateLimiter<VersionedTokenBucket> = RateLimiter::new(settings);
 
     // Make some requests to populate the cache
     limiter.limit_calls_for_client("test_client".to_string());

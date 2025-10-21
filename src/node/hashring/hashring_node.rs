@@ -6,13 +6,14 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::error::Result;
+use crate::limiters::rate_limit;
+use crate::limiters::token_bucket::TokenBucket;
 use crate::node::{
     generate_node_id_from_socket_addr,
     hashring::consistent_hashing,
     single_node::{local_check_limit, local_rate_limit},
     CheckCallsResponse, Node,
 };
-use crate::rate_limit;
 use crate::settings;
 
 pub enum ReplicationFactor {
@@ -26,13 +27,13 @@ pub struct HashringNode {
     pub topology: HashMap<u32, SocketAddr>,
     pub node_id: u32,
     // replication_factor: ReplicationFactor,
-    pub rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
+    pub rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>>,
 }
 
 impl HashringNode {
     pub fn new(
         settings: settings::Settings,
-        rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
+        rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>>,
     ) -> Result<Self> {
         let node_id = settings.node_id();
         let topology: HashMap<u32, SocketAddr> = settings

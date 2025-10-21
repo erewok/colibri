@@ -69,7 +69,7 @@ impl UdpTransport {
         self.socket_pool
             .read()
             .await
-            .send_to_random_multiple(data, count)
+            .send_to_random_peers(data, count)
             .await
     }
 

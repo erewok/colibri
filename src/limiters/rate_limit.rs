@@ -1,39 +1,76 @@
-/// Cache defines a Lazy-TTL based HashMap.
-/// This data structure offers a garbage collection
-/// method for expired items. Otherwise, it will store
-/// and offer access to TokenBucket instances.
-/// Access to this data structure requires mutability
-/// so it should happen inside something like a RwLock.
-///
-use std::collections::HashMap;
-
-use bincode::{Decode, Encode};
+// use bincode::{Decode, Encode};
 use chrono::Utc;
+use papaya::HashMap;
 
+use super::token_bucket::Bucket;
 use crate::settings;
-use crate::token_bucket;
-use crate::token_bucket::TokenBucket;
 
 /// Each rate-limited item will be stored in here.
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
-#[derive(Clone, Debug, Decode, Encode)]
-pub struct RateLimiter {
+/// This data structure offers a garbage collection
+/// method for expired items. Otherwise, it will store
+/// and offer access to TokenBucket instances.
+/// Access to this *whole* data structure requires mutability
+/// so it should happen inside something like a RwLock.
+#[derive(Clone, Debug)]
+pub struct RateLimiter<T: Bucket + Clone> {
     settings: settings::RateLimitSettings,
-    cache: HashMap<String, token_bucket::TokenBucket>,
+    /// Cache defines a Lazy-TTL based HashMap.
+    cache: HashMap<String, T>,
 }
 
-impl RateLimiter {
+impl<T: Bucket + Clone> RateLimiter<T> {
     pub fn new(rate_limit_settings: settings::RateLimitSettings) -> Self {
         Self {
             settings: rate_limit_settings,
             cache: HashMap::new(),
         }
     }
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    pub fn new_bucket(&self) -> T {
+        T::new(&self.settings)
+    }
+
+    pub fn node_id(&self) -> u32 {
+        self.settings.node_id
+    }
+
+    // It's possible that updates happen around this object, so RwLock recommended
+    pub fn get_bucket(&self, key: &str) -> Option<T> {
+        self.cache.pin_owned().get(key).cloned()
+    }
+    // It's possible that updates happen around this object, so RwLock recommended
+    pub fn set_bucket(&mut self, key: &str, bucket: T) -> bool {
+        self.cache
+            .pin_owned()
+            .insert(key.to_string(), bucket)
+            .is_some()
+    }
+
+    pub fn get_settings(&self) -> &settings::RateLimitSettings {
+        &self.settings
+    }
 
     /// Return actual calls remaining or a default value
     pub fn check_calls_remaining_for_client(&self, key: &str) -> u32 {
-        let bucket = self.cache.get(key);
-        bucket
+        self.cache
+            .pin()
+            .get(key)
+            .map(|b| b.tokens_to_u32())
+            .unwrap_or(self.settings.rate_limit_max_calls_allowed)
+    }
+
+    /// Return actual calls remaining or a default value
+    pub async fn async_check_calls_remaining_for_client(&self, key: &str) -> u32 {
+        self.cache
+            .pin_owned()
+            .get(key)
             .map(|b| b.tokens_to_u32())
             .unwrap_or(self.settings.rate_limit_max_calls_allowed)
     }
@@ -42,58 +79,126 @@ impl RateLimiter {
     pub fn expire_keys(&mut self) {
         let threshold = (self.settings.rate_limit_interval_seconds * 1000) as i64 * 2;
         let cutoff = Utc::now().timestamp_millis() - threshold;
-        let after_buckets_expired: HashMap<String, token_bucket::TokenBucket> = self
-            .cache
-            .extract_if(|_k, bucket| {
-                // check that last call was within cutoff
-                bucket.last_call > cutoff
-            })
-            .collect();
-        self.cache = after_buckets_expired;
+        // pin_owned is expensive but we need to mutate potentially the whole map
+        self.cache.pin_owned().retain(|_k, bucket| {
+            // check that last call was within cutoff
+            bucket.last_call() > cutoff
+        });
     }
 
     /// Check rate limit and decrement if call is allowed
     /// None -> not allowed
     pub fn limit_calls_for_client(&mut self, key: String) -> Option<u32> {
-        let mut bucket = match self.cache.get(&key) {
-            // We are going to modify and insert this bucket back into cache
-            Some(mut _bucket) => _bucket.to_owned(),
-            None => TokenBucket {
-                tokens: self.settings.rate_limit_max_calls_allowed.into(),
-                ..Default::default()
-            },
+        let limit_checker = |bucket: &T| {
+            let mut bucket = bucket.to_owned();
+            // Add more tokens at token bucket rate
+            bucket.add_tokens_to_bucket(&self.settings);
+            if bucket.check_if_allowed() {
+                // We only count this call if client is allowed to proceed
+                bucket.decrement();
+                bucket
+            } else {
+                // This result means no more calls allowed
+                bucket
+            }
         };
-        // Add more tokens at token bucket rate
-        bucket.add_tokens_to_bucket(&self.settings);
-        let result = if bucket.check_if_allowed() {
-            // We only count this call if client is allowed to proceed
-            bucket.decrement();
-            // Return result showing this call allowed and tokens remaining
-            Some(bucket.tokens_to_u32())
-        } else {
-            // This result means no more calls allowed
-            None
+        // Clobber entry in cache for this bucket if update
+        self.cache
+            .pin()
+            .update_or_insert_with(key.clone(), limit_checker, || self.new_bucket());
+
+        // Return result showing this call allowed and tokens remaining
+        self.cache.pin().get(&key).map(|b| b.tokens_to_u32())
+    }
+    /// Check rate limit and decrement if call is allowed
+    /// None -> not allowed
+    pub async fn async_limit_calls_for_client(&mut self, key: String) -> Option<u32> {
+        let limit_checker = |bucket: &T| {
+            // Add more tokens at token bucket rate
+            let mut _bucket = bucket.to_owned();
+            _bucket.add_tokens_to_bucket(&self.settings);
+            if _bucket.check_if_allowed() {
+                // We only count this call if client is allowed to proceed
+                _bucket.decrement();
+                _bucket
+            } else {
+                // This result means no more calls allowed
+                _bucket
+            }
         };
-        // Clobber entry in cache for this bucket
-        self.cache.insert(key, bucket);
-        result
+        // Clobber entry in cache for this bucket if update
+        self.cache
+            .pin_owned()
+            .update_or_insert_with(key.clone(), limit_checker, || self.new_bucket());
+
+        // Return result showing this call allowed and tokens remaining
+        self.cache.pin_owned().get(&key).map(|b| b.tokens_to_u32())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::time::{self, Duration};
+
+    use super::*;
+    use crate::limiters::token_bucket::TokenBucket;
+    use crate::limiters::versioned_bucket::VersionedTokenBucket;
 
     fn get_settings() -> settings::RateLimitSettings {
         settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
+            node_id: 1,
         }
     }
 
-    fn new_rate_limiter() -> RateLimiter {
+    fn new_rate_limiter() -> RateLimiter<TokenBucket> {
         RateLimiter::new(get_settings())
+    }
+
+    fn new_rate_limiter_versioned() -> RateLimiter<VersionedTokenBucket> {
+        RateLimiter::new(get_settings())
+    }
+
+    #[tokio::test]
+    async fn async_expire_keys_works() {
+        // Async version of expire_keys test
+        let mut rl = new_rate_limiter();
+        assert!(
+            (rl.async_limit_calls_for_client("a1".to_string())
+                .await
+                .is_some())
+        );
+        assert!(
+            (rl.async_limit_calls_for_client("a1".to_string())
+                .await
+                .is_some())
+        );
+        let calls_remain = rl.async_check_calls_remaining_for_client("a1").await;
+        // sanity check (duplicated below) before we call expire
+        assert!(calls_remain > 0);
+        assert!(calls_remain < 5);
+        // sleep and expire
+        time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            (rl.async_limit_calls_for_client("b1".to_string())
+                .await
+                .is_some())
+        );
+        assert!(
+            (rl.async_limit_calls_for_client("b1".to_string())
+                .await
+                .is_some())
+        );
+        rl.expire_keys();
+        // this one should be expired
+        let calls_remain2 = rl.async_check_calls_remaining_for_client("a1").await;
+        assert_eq!(calls_remain2, 5);
+        // this one not expired
+        let calls_remain3 = rl.async_check_calls_remaining_for_client("b1").await;
+        // sanity check (duplicated below) before we call expire
+        assert!(calls_remain3 > 0);
+        assert!(calls_remain3 < 5);
     }
 
     #[tokio::test]
@@ -148,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_rate_limiter_per_client_isolation() {
-        let mut limiter = RateLimiter::new(get_settings());
+        let mut limiter = new_rate_limiter();
 
         // Exhaust tokens for client1
         for _ in 0..5 {
@@ -219,11 +324,12 @@ mod tests {
     #[test]
     fn test_rate_limiter_with_zero_tokens() {
         let zero_settings = settings::RateLimitSettings {
+            node_id: 1,
             rate_limit_max_calls_allowed: 0,
             rate_limit_interval_seconds: 1,
         };
 
-        let mut limiter = RateLimiter::new(zero_settings);
+        let mut limiter: RateLimiter<TokenBucket> = RateLimiter::new(zero_settings);
 
         // Should immediately deny any requests
         assert!(limiter
@@ -238,9 +344,10 @@ mod tests {
         let high_limit = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
+            node_id: 1,
         };
 
-        let mut limiter = RateLimiter::new(high_limit);
+        let mut limiter: RateLimiter<TokenBucket> = RateLimiter::new(high_limit);
         assert_eq!(limiter.check_calls_remaining_for_client("test"), 100);
 
         // Make 10 requests

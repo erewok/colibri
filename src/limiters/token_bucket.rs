@@ -5,6 +5,19 @@ use chrono::Utc;
 
 use crate::settings;
 
+pub trait Bucket {
+    fn add_tokens_to_bucket(
+        &mut self,
+        rate_limit_settings: &settings::RateLimitSettings,
+    ) -> &mut Self;
+    fn check_if_allowed(&self) -> bool;
+    fn decrement(&mut self) -> &mut Self;
+    fn last_call(&self) -> i64;
+    fn new(rate_limit_settings: &settings::RateLimitSettings) -> Self;
+    fn tokens_to_u32(&self) -> u32;
+    fn try_consume(&mut self, tokens_requested: u32) -> bool;
+}
+
 /// Each rate-limited item will be stored in here.
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
 #[derive(Clone, Debug, Decode, Encode)]
@@ -12,7 +25,7 @@ pub struct TokenBucket {
     // Count of tokens
     pub tokens: f64,
     // timestamp in unix milliseconds
-    pub last_call: i64,
+    last_call: i64,
 }
 
 impl Default for TokenBucket {
@@ -25,15 +38,17 @@ impl Default for TokenBucket {
     }
 }
 
-/// Rate limiting is implemented by a single bucket for each limited object.
-impl TokenBucket {
-    pub fn tokens_to_u32(&self) -> u32 {
-        self.tokens.trunc().clamp(0.0, u32::MAX.into()) as u32
+impl Bucket for TokenBucket {
+    /// Create a new TokenBucket with full capacity
+    fn new(rate_limit_settings: &settings::RateLimitSettings) -> Self {
+        Self {
+            tokens: rate_limit_settings.rate_limit_max_calls_allowed as f64,
+            last_call: Utc::now().timestamp_millis(),
+        }
     }
-
     /// Function for adding tokens to the bucket.
     /// Tokens are added at the rate of token_rate * time_since_last_request
-    pub fn add_tokens_to_bucket(
+    fn add_tokens_to_bucket(
         &mut self,
         rate_limit_settings: &settings::RateLimitSettings,
     ) -> &mut Self {
@@ -57,28 +72,25 @@ impl TokenBucket {
     }
 
     /// Subtract a full token (represents a request)
-    pub fn decrement(&mut self) -> &mut Self {
+    fn decrement(&mut self) -> &mut Self {
         self.tokens -= 1f64;
         self
     }
-
     /// Check if rate-limited.
     /// Must have at least 1 full token
-    pub fn check_if_allowed(&self) -> bool {
+    fn check_if_allowed(&self) -> bool {
         self.tokens >= 1f64
     }
-
-    /// Create a new TokenBucket for gossip compatibility
-    /// Note: This is a simplified constructor for gossip system use
-    pub fn new(capacity: u32, _window: std::time::Duration) -> Self {
-        Self {
-            tokens: capacity as f64,
-            last_call: Utc::now().timestamp_millis(),
-        }
+    /// Return timestamp of last call
+    fn last_call(&self) -> i64 {
+        self.last_call
     }
-
-    /// Try to consume tokens (gossip compatibility method)
-    pub fn try_consume(&mut self, tokens_requested: u32) -> bool {
+    /// Return number of tokens as u32, clamped to u32 range
+    fn tokens_to_u32(&self) -> u32 {
+        self.tokens.trunc().clamp(0.0, u32::MAX.into()) as u32
+    }
+    /// Try to consume tokens
+    fn try_consume(&mut self, tokens_requested: u32) -> bool {
         let requested = tokens_requested as f64;
         if self.tokens >= requested {
             self.tokens -= requested;
@@ -88,14 +100,10 @@ impl TokenBucket {
             false
         }
     }
-
-    /// Get current token capacity (for gossip compatibility)
-    pub fn capacity(&self) -> u32 {
-        // For the existing implementation, we don't track capacity separately
-        // This is a reasonable default for gossip use
-        100
-    }
 }
+
+/// Rate limiting is implemented by a single bucket for each limited object.
+impl TokenBucket {}
 
 #[cfg(test)]
 mod tests {
@@ -149,6 +157,7 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
+            node_id: 1,
         };
 
         for _n in 0..5 {
@@ -188,6 +197,7 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
+            node_id: 1,
         };
 
         let mut bucket = TokenBucket::default();
@@ -207,6 +217,7 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
+            node_id: 1,
         };
         let mut bucket = TokenBucket::default();
         let initial_tokens = bucket.tokens;
@@ -245,6 +256,7 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
+            node_id: 1,
         };
 
         // Should be 100 calls / 60 seconds = 1.666... calls per second
@@ -262,6 +274,7 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
+            node_id: 1,
         };
 
         let mut bucket = TokenBucket::default();

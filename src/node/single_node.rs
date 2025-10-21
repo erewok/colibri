@@ -4,12 +4,13 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::error::Result;
+use crate::limiters::rate_limit;
+use crate::limiters::token_bucket::TokenBucket;
 use crate::node::{CheckCallsResponse, Node};
-use crate::rate_limit;
 
 #[derive(Clone, Debug)]
 pub struct SingleNode {
-    pub rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
+    pub rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>>,
 }
 
 #[async_trait]
@@ -30,7 +31,7 @@ impl Node for SingleNode {
 
 pub async fn local_check_limit(
     client_id: String,
-    rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
+    rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>>,
 ) -> Result<CheckCallsResponse> {
     let rate_limiter = rate_limiter.read().await;
     let calls_remaining = rate_limiter.check_calls_remaining_for_client(client_id.as_str());
@@ -42,7 +43,7 @@ pub async fn local_check_limit(
 
 pub async fn local_rate_limit(
     client_id: String,
-    rate_limiter: Arc<RwLock<rate_limit::RateLimiter>>,
+    rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>>,
 ) -> Result<Option<CheckCallsResponse>> {
     let mut rate_limiter = rate_limiter.write().await;
     let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());

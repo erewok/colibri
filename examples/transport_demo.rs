@@ -110,24 +110,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 6: Direct Socket Pool and Receiver Access
     println!("\nDemonstrating direct component access...");
 
-    // Get direct access to receiver for message processing
-    let receiver = transport.receiver();
-    println!("✓ Got direct receiver access");
-    println!("  Receiver bound to: {}", receiver.local_addr());
-
-    // Example 8: Receiver Statistics
-    println!("\nReceiver statistics:");
-    let receiver_stats = receiver.get_stats();
-    println!(
-        "  Messages received: {}",
-        receiver_stats.messages_received.into_inner()
-    );
-    println!(
-        "  Receive errors: {}",
-        receiver_stats.receive_errors.into_inner()
-    );
-    println!("  Local address: {}", receiver.local_addr());
-
     // Example 9: Gossip-like Message Pattern
     println!("\nDemonstrating gossip-like message patterns...");
 
@@ -184,15 +166,7 @@ fn print_stats(stats: TransportStats) {
         stats.send_pool_stats.messages_sent.into_inner()
     );
     println!(
-        "  Messages Received: {}",
-        stats.receiver_stats.messages_received.into_inner()
-    );
-    println!(
         "  Send Errors: {}",
         stats.send_pool_stats.send_errors.into_inner()
-    );
-    println!(
-        "  Receive Errors: {}",
-        stats.receiver_stats.receive_errors.into_inner()
     );
 }

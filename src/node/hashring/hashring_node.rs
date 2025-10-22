@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use crate::error::Result;
@@ -27,33 +26,32 @@ pub struct HashringNode {
     pub topology: HashMap<u32, SocketAddr>,
     pub node_id: u32,
     // replication_factor: ReplicationFactor,
-    pub rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>>,
+    pub rate_limiter: Arc<Mutex<rate_limit::RateLimiter<TokenBucket>>>,
 }
 
-impl HashringNode {
-    pub fn new(
+#[async_trait]
+impl Node<TokenBucket> for HashringNode {
+    async fn new(
         settings: settings::Settings,
-        rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>>,
+        rate_limiter: rate_limit::RateLimiter<TokenBucket>,
     ) -> Result<Self> {
         let node_id = settings.node_id();
         let topology: HashMap<u32, SocketAddr> = settings
+            .transport_config()
             .topology
             .into_iter()
             .map(|socket_addr: std::net::SocketAddr| {
                 (generate_node_id_from_socket_addr(&socket_addr), socket_addr)
             })
             .collect();
+
         Ok(Self {
             topology,
             node_id,
             // replication_factor: ReplicationFactor,
-            rate_limiter,
+            rate_limiter: Arc::new(Mutex::new(rate_limiter)),
         })
     }
-}
-
-#[async_trait]
-impl Node for HashringNode {
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
         let number_of_buckets = self.topology.len().try_into()?;
         let bucket =
@@ -113,7 +111,12 @@ impl Node for HashringNode {
     }
 
     async fn expire_keys(&self) {
-        let mut rate_limiter = self.rate_limiter.write().await;
-        rate_limiter.expire_keys();
+        match self.rate_limiter.lock() {
+            Err(e) => {
+                tracing::error!("Failed to acquire rate_limiter lock: {}", e);
+                return;
+            }
+            Ok(mut rate_limiter) => rate_limiter.expire_keys(),
+        };
     }
 }

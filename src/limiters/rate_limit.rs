@@ -41,16 +41,14 @@ impl<T: Bucket + Clone> RateLimiter<T> {
         self.settings.node_id
     }
 
-    // It's possible that updates happen around this object, so RwLock recommended
+    // It's possible that updates happen around this object
     pub fn get_bucket(&self, key: &str) -> Option<T> {
-        self.cache.pin_owned().get(key).cloned()
+        self.cache.pin().get(key).cloned()
     }
-    // It's possible that updates happen around this object, so RwLock recommended
+
+    // It's possible that updates happen around this object
     pub fn set_bucket(&mut self, key: &str, bucket: T) -> bool {
-        self.cache
-            .pin_owned()
-            .insert(key.to_string(), bucket)
-            .is_some()
+        self.cache.pin().insert(key.to_string(), bucket).is_some()
     }
 
     pub fn get_settings(&self) -> &settings::RateLimitSettings {
@@ -61,15 +59,6 @@ impl<T: Bucket + Clone> RateLimiter<T> {
     pub fn check_calls_remaining_for_client(&self, key: &str) -> u32 {
         self.cache
             .pin()
-            .get(key)
-            .map(|b| b.tokens_to_u32())
-            .unwrap_or(self.settings.rate_limit_max_calls_allowed)
-    }
-
-    /// Return actual calls remaining or a default value
-    pub async fn async_check_calls_remaining_for_client(&self, key: &str) -> u32 {
-        self.cache
-            .pin_owned()
             .get(key)
             .map(|b| b.tokens_to_u32())
             .unwrap_or(self.settings.rate_limit_max_calls_allowed)
@@ -110,29 +99,15 @@ impl<T: Bucket + Clone> RateLimiter<T> {
         // Return result showing this call allowed and tokens remaining
         self.cache.pin().get(&key).map(|b| b.tokens_to_u32())
     }
-    /// Check rate limit and decrement if call is allowed
-    /// None -> not allowed
-    pub async fn async_limit_calls_for_client(&mut self, key: String) -> Option<u32> {
-        let limit_checker = |bucket: &T| {
-            // Add more tokens at token bucket rate
-            let mut _bucket = bucket.to_owned();
-            _bucket.add_tokens_to_bucket(&self.settings);
-            if _bucket.check_if_allowed() {
-                // We only count this call if client is allowed to proceed
-                _bucket.decrement();
-                _bucket
-            } else {
-                // This result means no more calls allowed
-                _bucket
-            }
-        };
-        // Clobber entry in cache for this bucket if update
-        self.cache
-            .pin_owned()
-            .update_or_insert_with(key.clone(), limit_checker, || self.new_bucket());
 
-        // Return result showing this call allowed and tokens remaining
-        self.cache.pin_owned().get(&key).map(|b| b.tokens_to_u32())
+    /// Get all current buckets
+    pub fn get_all_buckets(&self) -> std::collections::HashMap<String, T> {
+        let mut result = std::collections::HashMap::new();
+        let pin = self.cache.pin();
+        for (key, value) in pin.iter() {
+            result.insert(key.clone(), value.clone());
+        }
+        result
     }
 }
 
@@ -158,47 +133,6 @@ mod tests {
 
     fn new_rate_limiter_versioned() -> RateLimiter<VersionedTokenBucket> {
         RateLimiter::new(get_settings())
-    }
-
-    #[tokio::test]
-    async fn async_expire_keys_works() {
-        // Async version of expire_keys test
-        let mut rl = new_rate_limiter();
-        assert!(
-            (rl.async_limit_calls_for_client("a1".to_string())
-                .await
-                .is_some())
-        );
-        assert!(
-            (rl.async_limit_calls_for_client("a1".to_string())
-                .await
-                .is_some())
-        );
-        let calls_remain = rl.async_check_calls_remaining_for_client("a1").await;
-        // sanity check (duplicated below) before we call expire
-        assert!(calls_remain > 0);
-        assert!(calls_remain < 5);
-        // sleep and expire
-        time::sleep(Duration::from_secs(2)).await;
-        assert!(
-            (rl.async_limit_calls_for_client("b1".to_string())
-                .await
-                .is_some())
-        );
-        assert!(
-            (rl.async_limit_calls_for_client("b1".to_string())
-                .await
-                .is_some())
-        );
-        rl.expire_keys();
-        // this one should be expired
-        let calls_remain2 = rl.async_check_calls_remaining_for_client("a1").await;
-        assert_eq!(calls_remain2, 5);
-        // this one not expired
-        let calls_remain3 = rl.async_check_calls_remaining_for_client("b1").await;
-        // sanity check (duplicated below) before we call expire
-        assert!(calls_remain3 > 0);
-        assert!(calls_remain3 < 5);
     }
 
     #[tokio::test]

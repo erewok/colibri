@@ -1,7 +1,5 @@
 //! CLI for this application
 //!
-use std::net::SocketAddr;
-
 use crate::settings;
 
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
@@ -76,9 +74,9 @@ pub struct Cli {
     #[clap(
         long,
         env("COLIBRI_TOPOLOGY"),
-        help = "Socket Address for TCP (hashring) or UDP (gossip) (e.g., 1.2.3.4:8000,127.0.0.1:8001). If empty, runs in single-node mode."
+        help = "Addresses for TCP (hashring) or UDP (gossip) (e.g., somedomain:8000,1.2.3.4:7001). If empty, runs in single-node mode."
     )]
-    pub topology: Vec<SocketAddr>,
+    pub topology: Vec<String>,
     // failure_timeout_secs: u64, // Node failure detection timeout (default: 30)
     #[clap(
         long,

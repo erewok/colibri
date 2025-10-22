@@ -1,7 +1,7 @@
 //! Colibri application settings
 use bincode::{Decode, Encode};
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::node::node_id::generate_node_id;
 
@@ -20,6 +20,13 @@ pub struct RateLimitSettings {
     pub node_id: u32,
     pub rate_limit_max_calls_allowed: u32,
     pub rate_limit_interval_seconds: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransportConfig {
+    pub listen_tcp: SocketAddr,
+    pub listen_udp: SocketAddr,
+    pub topology: HashSet<SocketAddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -99,7 +106,7 @@ pub struct Settings {
     pub gossip_fanout: usize,    // Number of peers per gossip round (default: 4)
 
     // Cluster configuration information: topology
-    pub topology: HashSet<SocketAddr>,
+    pub topology: HashSet<String>,
     // Cluster Configuration
     pub failure_timeout_secs: u64, // Node failure detection timeout (default: 30)
 }
@@ -108,6 +115,31 @@ impl Settings {
     pub fn node_id(&self) -> u32 {
         generate_node_id(&self.listen_address, self.listen_port)
     }
+
+    pub fn transport_config(&self) -> TransportConfig {
+        let listen_tcp = format!("{}:{}", self.listen_address, self.listen_port)
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap();
+        let listen_udp = format!("{}:{}", self.listen_address, self.listen_port_udp)
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap();
+        let topology: HashSet<SocketAddr> = self
+            .topology
+            .iter()
+            .filter_map(|addr_str| addr_str.to_socket_addrs().ok())
+            .flatten()
+            .collect();
+        TransportConfig {
+            listen_tcp,
+            listen_udp,
+            topology,
+        }
+    }
+
     pub fn rate_limit_settings(&self) -> RateLimitSettings {
         RateLimitSettings {
             node_id: self.node_id(),

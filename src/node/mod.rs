@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -13,7 +10,7 @@ pub mod single_node;
 
 use crate::error::Result;
 use crate::limiters::rate_limit;
-use crate::limiters::token_bucket::TokenBucket;
+use crate::limiters::token_bucket::{Bucket, TokenBucket};
 use crate::limiters::versioned_bucket::VersionedTokenBucket;
 use crate::settings;
 pub use gossip::GossipNode;
@@ -31,7 +28,13 @@ pub struct CheckCallsResponse {
 }
 
 #[async_trait]
-pub trait Node {
+pub trait Node<T: Bucket + Clone> {
+    async fn new(
+        settings: settings::Settings,
+        rate_limiter: rate_limit::RateLimiter<T>,
+    ) -> Result<Self>
+    where
+        Self: Sized;
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse>;
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>>;
     async fn expire_keys(&self);
@@ -50,16 +53,16 @@ impl NodeWrapper {
         if settings.topology.is_empty() {
             info!("Starting in single-node mode (no other nodes specified)");
             // A rate_limiter holds rate-limiting data in memory
-            let rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>> =
-                Arc::new(RwLock::new(rate_limit::RateLimiter::new(rl_settings)));
-            Ok(Self::Single(SingleNode { rate_limiter }))
+            let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
+                rate_limit::RateLimiter::new(rl_settings);
+            Ok(Self::Single(SingleNode::new(settings, rate_limiter).await?))
         } else {
             match settings.run_mode {
                 settings::RunMode::Single => {
                     info!("Starting in single-node mode (ignoring specified topology)");
-                    let rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>> =
-                        Arc::new(RwLock::new(rate_limit::RateLimiter::new(rl_settings)));
-                    Ok(Self::Single(SingleNode { rate_limiter }))
+                    let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
+                        rate_limit::RateLimiter::new(rl_settings);
+                    Ok(Self::Single(SingleNode::new(settings, rate_limiter).await?))
                 }
                 settings::RunMode::Gossip => {
                     info!(
@@ -67,8 +70,8 @@ impl NodeWrapper {
                         settings.topology.len(),
                         settings.topology
                     );
-                    let rate_limiter: Arc<RwLock<rate_limit::RateLimiter<VersionedTokenBucket>>> =
-                        Arc::new(RwLock::new(rate_limit::RateLimiter::new(rl_settings)));
+                    let rate_limiter: rate_limit::RateLimiter<VersionedTokenBucket> =
+                        rate_limit::RateLimiter::new(rl_settings);
                     // Use GossipNode instead of broken MultiNode
                     let gossip_node = GossipNode::new(settings, rate_limiter).await?;
                     Ok(Self::Gossip(gossip_node))
@@ -80,9 +83,9 @@ impl NodeWrapper {
                         settings.topology
                     );
                     // Build hashring node
-                    let rate_limiter: Arc<RwLock<rate_limit::RateLimiter<TokenBucket>>> =
-                        Arc::new(RwLock::new(rate_limit::RateLimiter::new(rl_settings)));
-                    let hashring_node = HashringNode::new(settings, rate_limiter)?;
+                    let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
+                        rate_limit::RateLimiter::new(rl_settings);
+                    let hashring_node = HashringNode::new(settings, rate_limiter).await?;
                     Ok(Self::Hashring(hashring_node))
                 }
             }

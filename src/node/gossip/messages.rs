@@ -67,9 +67,9 @@ impl GossipPacket {
     }
 
     /// Serialize for INTERNAL cluster communication (UDP gossip)
-    pub fn serialize(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
+    pub fn serialize(&self) -> Result<bytes::Bytes, bincode::error::EncodeError> {
         let config = bincode::config::standard().with_big_endian();
-        bincode::encode_to_vec(self, config)
+        bincode::encode_to_vec(self, config).map(|b| bytes::Bytes::from(b))
     }
 
     /// Deserialize from INTERNAL cluster communication (UDP gossip)
@@ -84,8 +84,6 @@ impl GossipPacket {
 mod tests {
     use super::*;
 
-    use crate::limiters::token_bucket::Bucket;
-    use crate::limiters::versioned_bucket::VersionedTokenBucket;
     use crate::settings;
 
     #[test]

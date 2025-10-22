@@ -433,6 +433,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bincode",
+ "bytes",
  "chrono",
  "clap",
  "criterion",

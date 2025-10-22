@@ -1,11 +1,11 @@
 use std::collections::HashMap;
+use std::env::consts::DLL_EXTENSION;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::net::unix::pipe::Receiver;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, Mutex, oneshot};
 use tokio::time;
 use tracing::{debug, error, info};
 
@@ -101,7 +101,7 @@ impl GossipNode {
 
     /// Log current statistics about the gossip node state for debugging
     pub async fn log_stats(&self) {
-        let bucket_count = self.rate_limiter.lock().unwrap().len();
+        let bucket_count = self.rate_limiter.lock().await.len();
         debug!(
             "[{}] Gossip node stats: {} active client buckets",
             self.node_id(),
@@ -130,7 +130,7 @@ impl GossipNode {
 
         let node_id = self.node_id();
         // We are taking a single reference to this mutex here
-        let mut receiver  = self.udp_listener_chan.lock().unwrap();
+        let mut receiver  = self.udp_listener_chan.lock().await;
         loop {
             tokio::select! {
                 // Handle incoming messages from network
@@ -157,10 +157,8 @@ impl GossipNode {
     }
 
     async fn handle_gossip_tick(&self, gossip_round: u64) -> Result<()> {
-        debug!("[{}] Gossip tick round {}", self.node_id(), gossip_round);
-
         // Send delta updates for buckets that have changed
-        let updates = self.collect_gossip_updates();
+        let updates = self.collect_gossip_updates().await;
         if !updates.is_empty() {
             let message = GossipMessage::DeltaStateSync {
                 updates,
@@ -190,20 +188,11 @@ impl GossipNode {
     }
 
     /// Collect buckets that have been updated and should be gossiped
-    fn collect_gossip_updates(&self) -> HashMap<String, VersionedTokenBucket> {
+    async fn collect_gossip_updates(&self) -> HashMap<String, VersionedTokenBucket> {
         // For now, collect all buckets. In the future, this could be optimized
         // to only send buckets that have changed since the last gossip round.
-        match self.rate_limiter.lock() {
-            Ok(rl) => rl.get_all_buckets(),
-            Err(e) => {
-                debug!(
-                    "[{}] Failed to acquire lock for gossip updates: {}",
-                    self.node_id(),
-                    e
-                );
-                HashMap::new()
-            }
-        }
+        let rl = self.rate_limiter.lock().await;
+        rl.get_all_buckets()
     }
     /// Handle incoming gossip cmd from our channel
     async fn handle_command(&self, cmd: GossipCommand) -> Result<()> {
@@ -215,26 +204,17 @@ impl GossipNode {
                 client_id,
                 resp_chan,
             } => {
-                let result = match self.rate_limiter.lock() {
-                    Ok(rl) => {
-                        let calls_remaining =
-                            rl.check_calls_remaining_for_client(client_id.as_str());
-                        debug!(
-                            "Check limit for client '{}': {} tokens remaining",
-                            client_id, calls_remaining
-                        );
-                        Ok(CheckCallsResponse {
-                            client_id,
-                            calls_remaining,
-                        })
-                    }
-                    Err(e) => Err(ColibriError::Concurrency(format!(
-                        "[{}] Failed to acquire lock on rate_limiter: {}",
-                        self.node_id(),
-                        e
-                    ))),
-                };
-                if let Err(_) = resp_chan.send(result) {
+                let rl = self.rate_limiter.lock().await;
+                let calls_remaining = rl.check_calls_remaining_for_client(client_id.as_str());
+                debug!(
+                    "Check limit for client '{}': {} tokens remaining",
+                    client_id, calls_remaining
+                );
+
+                if let Err(_) = resp_chan.send(Ok(CheckCallsResponse {
+                    client_id,
+                    calls_remaining,
+                })) {
                     error!(
                         "[{}] Failed sending oneshot check_limit response",
                         self.node_id()
@@ -246,26 +226,18 @@ impl GossipNode {
                 client_id,
                 resp_chan,
             } => {
-                let result = match self.rate_limiter.lock() {
-                    Ok(mut rl) => {
-                        let calls_left = rl.limit_calls_for_client(client_id.to_string());
-                        if let Some(calls_remaining) = calls_left {
-                            let response = CheckCallsResponse {
-                                client_id,
-                                calls_remaining,
-                            };
-                            Ok(Some(response))
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    Err(e) => Err(ColibriError::Concurrency(format!(
-                        "[{}] Failed to acquire lock on rate_limiter: {}",
-                        self.node_id(),
-                        e
-                    ))),
-                };
-                if let Err(_) = resp_chan.send(result) {
+                let mut result =  self.rate_limiter.lock().await;
+                let calls_left = result.limit_calls_for_client(client_id.to_string());
+                let response: Option<CheckCallsResponse>;
+                if let Some(calls_remaining) = calls_left {
+                    response = Some(CheckCallsResponse {
+                        client_id,
+                        calls_remaining,
+                    });
+                } else {
+                    response = None;
+                }
+                if let Err(_) = resp_chan.send(Ok(response)) {
                     error!(
                         "[{}] Failed sending oneshot rate_limit response",
                         self.node_id()
@@ -342,13 +314,6 @@ impl GossipNode {
                         if heartbeat_node_id == self.node_id() {
                             return Ok(());
                         }
-
-                        debug!(
-                            "[{}] Received heartbeat from node {}",
-                            self.node_id(),
-                            heartbeat_node_id
-                        );
-                        // TODO: Update peer liveness information
                     }
                 };
                 Ok(())
@@ -379,7 +344,6 @@ impl GossipNode {
         }
         match packet.serialize() {
             Ok(data) => {
-                debug!("[{}] Sending gossip packet", self.node_id());
                 let _peer = self
                     .transport
                     .as_ref()
@@ -411,7 +375,7 @@ impl GossipNode {
 
         for (client_id, incoming_bucket) in entries.into_iter() {
             debug!("[{}] Processing client: {}", node_id, client_id);
-            if let Some(mut current_entry) = rate_limiter.lock().unwrap().get_bucket(&client_id) {
+            if let Some(mut current_entry) = rate_limiter.lock().await.get_bucket(&client_id) {
                 debug!(
                     "[{}] Found existing bucket for client: {}",
                     node_id, client_id
@@ -436,7 +400,7 @@ impl GossipNode {
                     );
                     rate_limiter
                         .lock()
-                        .unwrap()
+                        .await
                         .set_bucket(&client_id, current_entry);
                 } else {
                     debug!(
@@ -457,7 +421,7 @@ impl GossipNode {
                 );
                 rate_limiter
                     .lock()
-                    .unwrap()
+                    .await
                     .set_bucket(&client_id, incoming_bucket);
                 debug!(
                     "[{}] Finished setting new bucket for client: {}",
@@ -510,7 +474,6 @@ impl Node<VersionedTokenBucket> for GossipNode {
             None
         };
 
-
         Ok(Self {
             rate_limit_settings: rl_settings,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
@@ -544,16 +507,7 @@ impl Node<VersionedTokenBucket> for GossipNode {
 
     /// Expire keys from local buckets
     async fn expire_keys(&self) {
-        match self.rate_limiter.lock() {
-            Ok(mut rl) => {
-                rl.expire_keys();
-            }
-            Err(e) => debug!(
-                "[{}] Failed to acquire lock on rate_limiter: {}",
-                self.node_id(),
-                e
-            ),
-        }
+        self.rate_limiter.lock().await.expire_keys();
     }
 }
 
@@ -644,7 +598,7 @@ mod tests {
         assert!(node
             .rate_limiter
             .lock()
-            .unwrap()
+            .await
             .get_bucket("test_client")
             .is_some());
 
@@ -681,7 +635,7 @@ mod tests {
         let stored_bucket = node
             .rate_limiter
             .lock()
-            .unwrap()
+            .await
             .get_bucket("remote_client");
         assert!(stored_bucket.is_some());
         assert_eq!(stored_bucket.unwrap().last_updated_by, 999);
@@ -724,7 +678,7 @@ mod tests {
         let stored_bucket = node
             .rate_limiter
             .lock()
-            .unwrap()
+            .await
             .get_bucket("client_from_node_2");
         assert!(stored_bucket.is_some());
         assert_eq!(stored_bucket.unwrap().last_updated_by, 2);
@@ -767,7 +721,7 @@ mod tests {
         assert!(node
             .rate_limiter
             .lock()
-            .unwrap()
+            .await
             .get_bucket("self_client")
             .is_none());
     }
@@ -808,7 +762,7 @@ mod tests {
         let stored_bucket = node
             .rate_limiter
             .lock()
-            .unwrap()
+            .await
             .get_bucket("response_client");
         assert!(stored_bucket.is_some());
         assert_eq!(stored_bucket.unwrap().last_updated_by, 3);

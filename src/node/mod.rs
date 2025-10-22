@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -42,9 +44,9 @@ pub trait Node<T: Bucket + Clone> {
 
 #[derive(Clone, Debug)]
 pub enum NodeWrapper {
-    Single(SingleNode),
-    Gossip(GossipNode),
-    Hashring(HashringNode),
+    Single(Arc<SingleNode>),
+    Gossip(Arc<GossipNode>),
+    Hashring(Arc<HashringNode>),
 }
 
 impl NodeWrapper {
@@ -55,14 +57,14 @@ impl NodeWrapper {
             // A rate_limiter holds rate-limiting data in memory
             let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
                 rate_limit::RateLimiter::new(rl_settings);
-            Ok(Self::Single(SingleNode::new(settings, rate_limiter).await?))
+            Ok(Self::Single(Arc::new(SingleNode::new(settings, rate_limiter).await?)))
         } else {
             match settings.run_mode {
                 settings::RunMode::Single => {
                     info!("Starting in single-node mode (ignoring specified topology)");
                     let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
                         rate_limit::RateLimiter::new(rl_settings);
-                    Ok(Self::Single(SingleNode::new(settings, rate_limiter).await?))
+                    Ok(Self::Single(Arc::new(SingleNode::new(settings, rate_limiter).await?)))
                 }
                 settings::RunMode::Gossip => {
                     info!(
@@ -73,7 +75,11 @@ impl NodeWrapper {
                     let rate_limiter: rate_limit::RateLimiter<VersionedTokenBucket> =
                         rate_limit::RateLimiter::new(rl_settings);
                     // Use GossipNode instead of broken MultiNode
-                    let gossip_node = GossipNode::new(settings, rate_limiter).await?;
+                    let gossip_node = Arc::new(GossipNode::new(settings, rate_limiter).await?);
+                    let gossip_node_clone = gossip_node.clone();
+                    tokio::spawn(async move {
+                        gossip_node_clone.start().await
+                    });
                     Ok(Self::Gossip(gossip_node))
                 }
                 settings::RunMode::Hashring => {
@@ -86,7 +92,7 @@ impl NodeWrapper {
                     let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
                         rate_limit::RateLimiter::new(rl_settings);
                     let hashring_node = HashringNode::new(settings, rate_limiter).await?;
-                    Ok(Self::Hashring(hashring_node))
+                    Ok(Self::Hashring(Arc::new(hashring_node)))
                 }
             }
         }

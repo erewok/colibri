@@ -108,7 +108,8 @@ impl Cli {
     pub fn into_settings(self) -> settings::Settings {
         settings::Settings {
             listen_address: self.listen_address,
-            listen_port: self.listen_port,
+            listen_port_api: self.listen_port,
+            listen_port_tcp: self.listen_port_tcp,
             listen_port_udp: self.listen_port_udp,
             rate_limit_max_calls_allowed: self.rate_limit_max_calls_allowed,
             rate_limit_interval_seconds: self.rate_limit_interval_seconds,

@@ -152,7 +152,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_stats(stats: TransportStats) {
     println!("Transport Statistics:");
-    println!("  Local Address: {}", stats.local_addr);
     println!(
         "  Peer Count: {}",
         stats.send_pool_stats.peer_count.into_inner()

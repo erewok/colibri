@@ -7,10 +7,13 @@
 //! - EXTERNAL API communication (HTTP): Uses serde_json for human-readable format
 //!
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
+use tokio::sync::oneshot;
 
 use crate::limiters::versioned_bucket::VersionedTokenBucket;
+use crate::node::CheckCallsResponse;
 
 /// Gossip message types for production delta-state protocol
 #[derive(Debug, Clone, Decode, Encode)]
@@ -79,6 +82,30 @@ impl GossipPacket {
         Ok(result)
     }
 }
+
+
+pub enum GossipCommand {
+    ExpireKeys,
+    CheckLimit {
+        client_id: String,
+        resp_chan: oneshot::Sender<crate::error::Result<CheckCallsResponse>>,
+    },
+    RateLimit {
+        client_id: String,
+        resp_chan: oneshot::Sender<crate::error::Result<Option<CheckCallsResponse>>>,
+    },
+    GossipMessageReceived {
+        data: bytes::Bytes,
+        peer_addr: SocketAddr,
+    },
+}
+
+impl GossipCommand {
+    pub fn from_incoming_message(data: bytes::Bytes, peer_addr: SocketAddr) -> Self {
+        GossipCommand::GossipMessageReceived { data, peer_addr }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

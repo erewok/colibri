@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-use crate::error::Result;
+use crate::error::{ColibriError, Result};
 use crate::limiters::rate_limit;
 use crate::limiters::token_bucket::TokenBucket;
 use crate::node::{
@@ -110,13 +110,11 @@ impl Node<TokenBucket> for HashringNode {
         }
     }
 
-    async fn expire_keys(&self) {
-        match self.rate_limiter.lock() {
-            Err(e) => {
-                tracing::error!("Failed to acquire rate_limiter lock: {}", e);
-                return;
-            }
-            Ok(mut rate_limiter) => rate_limiter.expire_keys(),
-        };
+    async fn expire_keys(&self) -> Result<()> {
+        let mut rate_limiter = self.rate_limiter.lock().map_err(|e| ColibriError::Concurrency(
+            format!("Failed to acquire rate_limiter lock: {}", e),
+        ))?;
+        rate_limiter.expire_keys();
+        Ok(())
     }
 }

@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use clap::Parser;
 use tokio::time::{self, Duration};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use colibri::api;
@@ -34,17 +34,20 @@ async fn main() -> Result<()> {
 
     // Build Axum Router and get shared state
     let (api, app_state) = api::api(args.into_settings()).await?;
-    // let state_for_expiry = app_state.clone();
+    let state_for_expiry = app_state.clone();
 
-    // tokio::spawn(async move {
-    //     // Start Cache Expire Request Loop
-    //     info!("Starting Cache Expiry background task");
-    //     let mut interval = time::interval(Duration::from_millis(KEY_EXPIRY_INTERVAL));
-    //     loop {
-    //         interval.tick().await;
-    //         state_for_expiry.expire_keys().await;
-    //     }
-    // });
+    tokio::spawn(async move {
+        // Start Cache Expire Request Loop
+        info!("Starting Cache Expiry background task");
+        let mut interval = time::interval(Duration::from_millis(KEY_EXPIRY_INTERVAL));
+        loop {
+            interval.tick().await;
+            let _ = state_for_expiry
+                .expire_keys()
+                .await
+                .map_err(|e| error!("Failed to expire keys {}", e));
+        }
+    });
 
     // Start server
     info!("Starting Colibri on {}", socket_address);

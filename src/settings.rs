@@ -87,7 +87,10 @@ pub struct Settings {
     pub listen_address: String,
 
     // HTTP API listen port
-    pub listen_port: u16,
+    pub listen_port_api: u16,
+
+    // TCP Hashring listen port
+    pub listen_port_tcp: u16,
 
     // UDP listen port for Gossip
     pub listen_port_udp: u16,
@@ -113,11 +116,11 @@ pub struct Settings {
 
 impl Settings {
     pub fn node_id(&self) -> u32 {
-        generate_node_id(&self.listen_address, self.listen_port)
+        generate_node_id(&self.listen_address, self.listen_port_tcp)
     }
 
     pub fn transport_config(&self) -> TransportConfig {
-        let listen_tcp = format!("{}:{}", self.listen_address, self.listen_port)
+        let listen_tcp = format!("{}:{}", self.listen_address, self.listen_port_tcp)
             .to_socket_addrs()
             .unwrap()
             .next()

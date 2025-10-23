@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::error::Result;
+use crate::error::{ColibriError, Result};
 use crate::limiters::rate_limit;
 use crate::limiters::token_bucket::TokenBucket;
 use crate::node::{CheckCallsResponse, Node};
@@ -34,14 +34,12 @@ impl Node<TokenBucket> for SingleNode {
         local_rate_limit(client_id, self.rate_limiter.clone()).await
     }
 
-    async fn expire_keys(&self) {
-        match self.rate_limiter.lock() {
-            Err(e) => {
-                tracing::error!("Failed to acquire rate_limiter lock: {}", e);
-                return;
-            }
-            Ok(mut rate_limiter) => rate_limiter.expire_keys(),
-        };
+    async fn expire_keys(&self) -> Result<()> {
+        let mut rate_limiter = self.rate_limiter.lock().map_err(|e| ColibriError::Concurrency(
+            format!("Failed to acquire rate_limiter lock: {}", e),
+        ))?;
+        rate_limiter.expire_keys();
+        Ok(())
     }
 }
 

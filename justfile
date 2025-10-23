@@ -47,7 +47,7 @@ run-cluster:
     export srv2_udp=8402
     export srv3_udp=8403
     export RUST_LOG=debug
-
+    export RUSTFLAGS="--cfg tokio_unstable"
     # Start node 1 (knows about nodes 2 and 3)
     cargo run -- \
         --run-mode "gossip" \
@@ -99,19 +99,20 @@ test-cluster:
     #!/bin/bash -eux
     echo "Testing multi-node cluster..."
 
-    echo "Testing node 1 (port 8001):"
-    curl -X POST http://localhost:8001/rl/client1 || echo "Node 1 not responding"
+    echo "Sending 3 requests to node 1 (port 8001):"
+    gtimeout 4 curl -X POST http://localhost:8001/rl/client1 || echo "Node 1 not responding"
+    gtimeout 4 curl -X POST http://localhost:8001/rl/client1 || echo "Node 1 not responding"
+    gtimeout 4 curl -X POST http://localhost:8001/rl/client1 || echo "Node 1 not responding"
 
     echo "Testing node 2 (port 8002):"
-    curl -X POST http://localhost:8002/rl/client2 || echo "Node 2 not responding"
+    gtimeout 4 curl -X POST http://localhost:8002/rl/client2 || echo "Node 2 not responding"
+
+    echo "Back to node 1 (port 8001):"
+    gtimeout 4 curl -X POST http://localhost:8001/rl/client1 || echo "Node 1 not responding"
 
     echo "Testing node 3 (port 8003):"
-    curl -X POST http://localhost:8003/rl/client3 || echo "Node 3 not responding"
+    gtimeout 4 curl -X POST http://localhost:8003/rl/client3 || echo "Node 3 not responding"
 
-    echo "Testing consistent hashing (same client on different nodes):"
-    curl -X POST http://localhost:8001/rl/consistent-test
-    curl -X POST http://localhost:8002/rl/consistent-test
-    curl -X POST http://localhost:8003/rl/consistent-test
 
 # Run all tests locally
 test *args:

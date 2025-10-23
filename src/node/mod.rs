@@ -39,7 +39,7 @@ pub trait Node<T: Bucket + Clone> {
         Self: Sized;
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse>;
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>>;
-    async fn expire_keys(&self);
+    async fn expire_keys(&self) -> Result<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -76,10 +76,6 @@ impl NodeWrapper {
                         rate_limit::RateLimiter::new(rl_settings);
                     // Use GossipNode instead of broken MultiNode
                     let gossip_node = Arc::new(GossipNode::new(settings, rate_limiter).await?);
-                    let gossip_node_clone = gossip_node.clone();
-                    tokio::spawn(async move {
-                        gossip_node_clone.start().await
-                    });
                     Ok(Self::Gossip(gossip_node))
                 }
                 settings::RunMode::Hashring => {
@@ -98,7 +94,7 @@ impl NodeWrapper {
         }
     }
 
-    pub async fn expire_keys(&self) {
+    pub async fn expire_keys(&self) -> Result<()> {
         match self {
             Self::Single(node) => node.expire_keys().await,
             Self::Gossip(node) => node.expire_keys().await,

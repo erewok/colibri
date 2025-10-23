@@ -219,25 +219,45 @@ impl GossipController {
                 client_id,
                 resp_chan,
             } => {
-                let mut result = self
-                    .rate_limiter
-                    .lock()
-                    .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))?;
-                let calls_left = result.limit_calls_for_client(client_id.to_string());
-                let response: Option<CheckCallsResponse>;
-                if let Some(calls_remaining) = calls_left {
-                    response = Some(CheckCallsResponse {
-                        client_id,
-                        calls_remaining,
-                    });
-                } else {
-                    response = None;
+                let bucket: Option<EpochTokenBucket>;
+                // let mutable result with MutexGuard drop after this block
+                {
+                    let mut result = self
+                        .rate_limiter
+                        .lock()
+                        .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))?;
+
+                    let calls_left = result.limit_calls_for_client(client_id.to_string());
+                    let response: Option<CheckCallsResponse>;
+                    if let Some(calls_remaining) = calls_left {
+                        response = Some(CheckCallsResponse {
+                            client_id: client_id.clone(),
+                            calls_remaining,
+                        });
+                    } else {
+                        response = None;
+                    }
+                    if let Err(_) = resp_chan.send(Ok(response)) {
+                        error!(
+                            "[{}] Failed sending oneshot rate_limit response",
+                            self.node_id
+                        );
+                    }
+                    bucket = result.get_bucket(&client_id);
                 }
-                if let Err(_) = resp_chan.send(Ok(response)) {
-                    error!(
-                        "[{}] Failed sending oneshot rate_limit response",
-                        self.node_id
-                    );
+                // Send immediate gossip update after rate limiting
+                if let Some(bucket) = bucket {
+                    let updates = HashMap::from([
+                        (client_id.clone(), bucket)
+                    ]);
+                    let message = GossipMessage::DeltaStateSync {
+                        updates,
+                        sender_node_id: self.node_id,
+                        gossip_round: 0, // Immediate update, not part of regular round
+                        last_seen_versions: HashMap::new(),
+                    };
+                    let packet = GossipPacket::new(message);
+                    self.send_gossip_packet(packet).await?;
                 }
                 Ok(())
             }
@@ -336,6 +356,7 @@ impl GossipController {
                     .transport
                     .as_ref()
                     .unwrap()
+                    .clone()
                     .send_to_random_peers(&data, self.gossip_fanout)
                     .await
                     .map_err(|e| ColibriError::Transport(format!("Send failed: {}", e)))?;

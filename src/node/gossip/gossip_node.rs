@@ -7,9 +7,10 @@ use tracing::{debug, error, info};
 
 use super::{GossipCommand, GossipController};
 use crate::error::{ColibriError, Result};
-use crate::limiters::{epoch_bucket::EpochTokenBucket, rate_limit::RateLimiter};
+use crate::limiters::{rate_limit::RateLimiter, epoch_bucket::EpochTokenBucket};
 use crate::node::{CheckCallsResponse, Node, NodeId};
 use crate::{settings, transport};
+
 
 #[derive(Clone)]
 pub struct GossipNode {
@@ -147,6 +148,8 @@ impl Node<EpochTokenBucket> for GossipNode {
         Ok(())
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {

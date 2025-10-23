@@ -7,15 +7,14 @@ use tracing::{debug, error, info};
 
 use super::{GossipCommand, GossipController};
 use crate::error::{ColibriError, Result};
-use crate::limiters::{rate_limit::RateLimiter, versioned_bucket::VersionedTokenBucket};
-use crate::node::{CheckCallsResponse, Node};
+use crate::limiters::{epoch_bucket::EpochTokenBucket, rate_limit::RateLimiter};
+use crate::node::{CheckCallsResponse, Node, NodeId};
 use crate::{settings, transport};
-
 
 #[derive(Clone)]
 pub struct GossipNode {
     // rate-limit settings
-    pub node_id: u32,
+    pub node_id: NodeId,
     /// Local rate limiter - handles all bucket operations
     pub gossip_command_tx: Arc<mpsc::Sender<GossipCommand>>,
 
@@ -60,10 +59,10 @@ impl std::fmt::Debug for GossipNode {
 }
 
 #[async_trait]
-impl Node<VersionedTokenBucket> for GossipNode {
+impl Node<EpochTokenBucket> for GossipNode {
     async fn new(
         settings: settings::Settings,
-        rate_limiter: RateLimiter<VersionedTokenBucket>,
+        rate_limiter: RateLimiter<EpochTokenBucket>,
     ) -> Result<Self> {
         let node_id = settings.node_id();
         info!(
@@ -149,14 +148,11 @@ impl Node<VersionedTokenBucket> for GossipNode {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::limiters::token_bucket::Bucket;
 
     pub fn gen_settings() -> settings::Settings {
         settings::Settings {
@@ -176,13 +172,12 @@ mod tests {
 
     pub fn rl_settings() -> settings::RateLimitSettings {
         settings::RateLimitSettings {
-            node_id: 1,
             rate_limit_max_calls_allowed: 1000,
             rate_limit_interval_seconds: 60,
         }
     }
 
-    pub fn new_rate_limiter() -> RateLimiter<VersionedTokenBucket> {
-        RateLimiter::new(rl_settings())
+    pub fn new_rate_limiter() -> RateLimiter<EpochTokenBucket> {
+        RateLimiter::new(NodeId::new(1), rl_settings())
     }
 }

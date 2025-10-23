@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bincode::{Decode, Encode};
 
 use super::membership::{ClusterMembership, NodeInfo};
-use crate::limiters::versioned_bucket::VersionedTokenBucket;
+use crate::limiters::epoch_bucket::EpochTokenBucket;
 
 /// All possible gossip message types for cluster communication
 #[derive(Debug, Clone, Decode, Encode)]
@@ -24,14 +24,14 @@ pub enum ClusterMessage {
     NodeJoinResponse {
         accepted: bool,
         current_membership: ClusterMembership,
-        state_to_migrate: HashMap<String, VersionedTokenBucket>,
+        state_to_migrate: HashMap<String, EpochTokenBucket>,
         responder_node_id: u32,
     },
 
     /// Notification that a node is leaving gracefully
     NodeLeaveNotification {
         leaving_node_id: u32,
-        state_handoff: HashMap<String, VersionedTokenBucket>,
+        state_handoff: HashMap<String, EpochTokenBucket>,
         new_membership: ClusterMembership,
     },
 

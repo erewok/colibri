@@ -1,34 +1,66 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+
+use bincode::{Decode, Encode};
 use url::Url;
 
 use crate::settings;
 
+/// Node identifier in the cluster
+/// A simple wrapper around u32 for type safety
+/// Derives common traits for easy use
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Decode, Encode)]
+pub struct NodeId(u32);
+
+impl NodeId {
+    /// Create a new NodeId from a u32
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// Get the underlying u32 value
+    pub fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for NodeId {
+    fn from(id: u32) -> Self {
+        NodeId::new(id)
+    }
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Generate node ID as u32 from hostname and port
-pub fn generate_node_id(hostname: &str, port: u16) -> u32 {
+pub fn generate_node_id(hostname: &str, port: u16) -> NodeId {
     let mut hasher = DefaultHasher::new();
     hostname.hash(&mut hasher);
     port.hash(&mut hasher);
-    hasher.finish() as u32
+    NodeId::new(hasher.finish() as u32)
 }
 
 /// Generate node ID as u32 from hostname and standard port in a URL
-pub fn generate_node_id_from_url(url: &Url) -> u32 {
+pub fn generate_node_id_from_url(url: &Url) -> NodeId {
     let hostname = url.host_str().unwrap_or("localhost");
     let port = url.port().unwrap_or(settings::STANDARD_PORT_HTTP);
     generate_node_id(hostname, port)
 }
 
 /// Generate node ID as u32 from hostname and standard port in a URL
-pub fn generate_node_id_from_socket_addr(socket_addr: &SocketAddr) -> u32 {
+pub fn generate_node_id_from_socket_addr(socket_addr: &SocketAddr) -> NodeId {
     let hostname = socket_addr.ip().to_string();
     let port = socket_addr.port();
     generate_node_id(&hostname, port)
 }
 
-pub fn validate_node_id(node_id: u32) -> Result<u32, String> {
-    if node_id == 0 {
+pub fn validate_node_id(node_id: NodeId) -> Result<NodeId, String> {
+    if node_id.value() == 0 {
         return Err("Node ID cannot be zero (reserved value)".to_string());
     }
     Ok(node_id)
@@ -67,10 +99,16 @@ mod tests {
 
     #[test]
     fn test_validate_node_id() {
-        assert!(validate_node_id(0).is_err(), "Zero should be invalid");
-        assert!(validate_node_id(1).is_ok(), "Non-zero should be valid");
         assert!(
-            validate_node_id(u32::MAX).is_ok(),
+            validate_node_id(NodeId::new(0)).is_err(),
+            "Zero should be invalid"
+        );
+        assert!(
+            validate_node_id(NodeId::new(1)).is_ok(),
+            "Non-zero should be valid"
+        );
+        assert!(
+            validate_node_id(NodeId::new(u32::MAX)).is_ok(),
             "Max u32 should be valid"
         );
     }

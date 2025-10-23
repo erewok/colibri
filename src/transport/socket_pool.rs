@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use tracing::error;
 
 use crate::error::{ColibriError, Result};
+use crate::node::NodeId;
 
 /// Pool of UDP sockets for efficient peer communication
 #[derive(Clone, Debug)]
@@ -21,7 +22,7 @@ pub struct UdpSocketPool {
     // IndexMap for easily getting a random peer
     peers: IndexMap<SocketAddr, Arc<Mutex<UdpSocket>>>,
     // for debugging, identifying the node
-    node_id: u32,
+    node_id: NodeId,
     // for statistics and monitoring
     stats: Arc<SocketPoolStats>,
 }
@@ -37,11 +38,15 @@ pub struct SocketPoolStats {
 
 impl UdpSocketPool {
     /// Create a new socket pool
-    pub async fn new(node_id: u32, peer_addrs: &HashSet<std::net::SocketAddr>) -> Result<Self> {
+    pub async fn new(node_id: NodeId, peer_addrs: &HashSet<std::net::SocketAddr>) -> Result<Self> {
         let mut peers = IndexMap::new();
 
         for peer_addr in peer_addrs {
-            let local_addr: SocketAddr = if peer_addr.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+            let local_addr: SocketAddr = if peer_addr.is_ipv4() {
+                "0.0.0.0:0".parse().unwrap()
+            } else {
+                "[::]:0".parse().unwrap()
+            };
 
             // need to bind to a local address!
             let socket = UdpSocket::bind(local_addr)
@@ -178,7 +183,7 @@ mod tests {
         let two = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
         let peers: HashSet<SocketAddr> = HashSet::from([one.clone(), two.clone()]);
 
-        let pool = UdpSocketPool::new(1, &peers).await.unwrap();
+        let pool = UdpSocketPool::new(NodeId::new(1), &peers).await.unwrap();
 
         let stats = pool.get_stats();
         assert_eq!(stats.peer_count.load(Ordering::Relaxed), 2);
@@ -192,7 +197,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_management() {
-        let mut pool = UdpSocketPool::new(2, &HashSet::new()).await.unwrap();
+        let mut pool = UdpSocketPool::new(NodeId::new(2), &HashSet::new())
+            .await
+            .unwrap();
 
         let peer1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
         let peer2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
@@ -219,7 +226,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_random_no_peers() {
-        let pool = UdpSocketPool::new(1, &HashSet::new()).await.unwrap();
+        let pool = UdpSocketPool::new(NodeId::new(1), &HashSet::new())
+            .await
+            .unwrap();
 
         let result = pool.send_to_random(b"test").await;
         assert!(matches!(result, Err(ColibriError::Transport(_))));
@@ -227,7 +236,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_nonexistent_peer() {
-        let pool = UdpSocketPool::new(1, &HashSet::new()).await.unwrap();
+        let pool = UdpSocketPool::new(NodeId::new(1), &HashSet::new())
+            .await
+            .unwrap();
 
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
         let result = pool.send_to(peer, b"test").await;
@@ -242,7 +253,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8003),
         ]);
 
-        let pool = UdpSocketPool::new(2, &peers).await.unwrap();
+        let pool = UdpSocketPool::new(NodeId::new(2), &peers).await.unwrap();
 
         // Should attempt to send to 2 random peers
         // This will likely fail since nothing is listening, but tests the selection logic

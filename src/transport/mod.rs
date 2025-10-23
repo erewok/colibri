@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::error::Result;
+use crate::node::NodeId;
 use crate::settings;
 pub use receiver::{ReceiverStats, UdpReceiver};
 pub use socket_pool::{SocketPoolStats, UdpSocketPool};
@@ -30,7 +31,7 @@ impl UdpTransport {
     /// * `cluster_socket_addresses` - URLs of other cluster members
     /// * `pool_size_per_peer` - Number of sockets to create per peer
     pub async fn new(
-        node_id: u32,
+        node_id: NodeId,
         transport_config: &settings::TransportConfig,
     ) -> Result<Self> {
         // Create socket pool
@@ -81,9 +82,7 @@ impl UdpTransport {
     /// Get transport statistics
     pub async fn get_stats(&self) -> TransportStats {
         let send_pool_stats = self.socket_pool.read().await.get_stats();
-        TransportStats {
-            send_pool_stats,
-        }
+        TransportStats { send_pool_stats }
     }
 }
 
@@ -115,7 +114,7 @@ mod tests {
     #[tokio::test]
     async fn test_transport_creation() {
         let transport_config = get_transport_config();
-        let transport = UdpTransport::new(0, &transport_config)
+        let transport = UdpTransport::new(NodeId::new(0), &transport_config)
             .await
             .unwrap();
 
@@ -126,7 +125,7 @@ mod tests {
     async fn test_send_to_random_peer() {
         let transport_config = get_transport_config();
 
-        let transport = UdpTransport::new(0, &transport_config)
+        let transport = UdpTransport::new(NodeId::new(0), &transport_config)
             .await
             .unwrap();
 
@@ -139,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_management() {
         let transport_config = get_transport_config();
-        let mut transport = UdpTransport::new(0, &transport_config)
+        let mut transport = UdpTransport::new(NodeId::new(0), &transport_config)
             .await
             .unwrap();
 
@@ -158,7 +157,7 @@ mod tests {
     #[tokio::test]
     async fn test_stats() {
         let transport_config = get_transport_config();
-        let transport = UdpTransport::new(0, &transport_config)
+        let transport = UdpTransport::new(NodeId::new(0), &transport_config)
             .await
             .unwrap();
         let stats = transport.get_stats().await;

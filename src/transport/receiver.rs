@@ -28,7 +28,10 @@ pub struct ReceiverStats {
 
 impl UdpReceiver {
     /// Create a new UDP receiver
-    pub async fn new(bind_addr: SocketAddr, message_tx: Arc<mpsc::Sender<(bytes::Bytes, SocketAddr) >>) -> Result<Self> {
+    pub async fn new(
+        bind_addr: SocketAddr,
+        message_tx: Arc<mpsc::Sender<(bytes::Bytes, SocketAddr)>>,
+    ) -> Result<Self> {
         let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| ColibriError::Transport(format!("Socket creation failed: {}", e)))?;

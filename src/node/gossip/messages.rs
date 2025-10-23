@@ -12,37 +12,37 @@ use std::net::SocketAddr;
 use bincode::{Decode, Encode};
 use tokio::sync::oneshot;
 
-use crate::limiters::versioned_bucket::VersionedTokenBucket;
-use crate::node::CheckCallsResponse;
+use crate::limiters::epoch_bucket::EpochTokenBucket;
+use crate::node::{CheckCallsResponse, NodeId};
 
 /// Gossip message types for production delta-state protocol
 #[derive(Debug, Clone, Decode, Encode)]
 pub enum GossipMessage {
     /// Delta-state synchronization - only recently updated keys
     DeltaStateSync {
-        updates: HashMap<String, VersionedTokenBucket>, // Only changed keys
-        sender_node_id: u32,
+        updates: HashMap<String, EpochTokenBucket>, // Only changed keys
+        sender_node_id: NodeId,
         gossip_round: u64,
         last_seen_versions: HashMap<u32, u64>, // For anti-entropy
     },
 
     /// Request for specific state (anti-entropy)
     StateRequest {
-        requesting_node_id: u32,
+        requesting_node_id: NodeId,
         missing_keys: Option<Vec<String>>, // None = full sync
         since_version: HashMap<u32, u64>,  // What we already have
     },
 
     /// Response to state request with missing data
     StateResponse {
-        responding_node_id: u32,
-        requested_data: HashMap<String, VersionedTokenBucket>,
+        responding_node_id: NodeId,
+        requested_data: HashMap<String, EpochTokenBucket>,
         current_versions: HashMap<u32, u64>, // Our current knowledge
     },
 
     /// Heartbeat with version vectors for anti-entropy
     Heartbeat {
-        node_id: u32,
+        node_id: NodeId,
         timestamp: u64,
         version_vector: HashMap<u32, u64>, // Our knowledge of all nodes
     },
@@ -83,7 +83,6 @@ impl GossipPacket {
     }
 }
 
-
 pub enum GossipCommand {
     ExpireKeys,
     CheckLimit {
@@ -106,7 +105,6 @@ impl GossipCommand {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,7 +114,7 @@ mod tests {
     #[test]
     fn test_gossip_packet_serialization() {
         let message = GossipMessage::StateRequest {
-            requesting_node_id: 1,
+            requesting_node_id: NodeId::new(1),
             missing_keys: None,
             since_version: HashMap::new(),
         };
@@ -133,7 +131,7 @@ mod tests {
                 missing_keys,
                 since_version,
             } => {
-                assert_eq!(requesting_node_id, 1);
+                assert_eq!(requesting_node_id, NodeId::new(1));
                 assert!(missing_keys.is_none());
                 assert!(since_version.is_empty());
             }
@@ -145,7 +143,6 @@ mod tests {
         settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
-            node_id: 1,
         }
     }
 }

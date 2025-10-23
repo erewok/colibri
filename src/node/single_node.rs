@@ -35,9 +35,9 @@ impl Node<TokenBucket> for SingleNode {
     }
 
     async fn expire_keys(&self) -> Result<()> {
-        let mut rate_limiter = self.rate_limiter.lock().map_err(|e| ColibriError::Concurrency(
-            format!("Failed to acquire rate_limiter lock: {}", e),
-        ))?;
+        let mut rate_limiter = self.rate_limiter.lock().map_err(|e| {
+            ColibriError::Concurrency(format!("Failed to acquire rate_limiter lock: {}", e))
+        })?;
         rate_limiter.expire_keys();
         Ok(())
     }

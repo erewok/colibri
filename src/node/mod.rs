@@ -11,15 +11,15 @@ pub mod node_id;
 pub mod single_node;
 
 use crate::error::Result;
+use crate::limiters::epoch_bucket::EpochTokenBucket;
 use crate::limiters::rate_limit;
 use crate::limiters::token_bucket::{Bucket, TokenBucket};
-use crate::limiters::versioned_bucket::VersionedTokenBucket;
 use crate::settings;
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;
 pub use node_id::{
     generate_node_id, generate_node_id_from_socket_addr, generate_node_id_from_url,
-    validate_node_id,
+    validate_node_id, NodeId,
 };
 pub use single_node::SingleNode;
 
@@ -51,42 +51,55 @@ pub enum NodeWrapper {
 
 impl NodeWrapper {
     pub async fn new(settings: settings::Settings) -> Result<Self> {
+        let node_id = settings.node_id();
         let rl_settings = settings.rate_limit_settings();
         if settings.topology.is_empty() {
-            info!("Starting in single-node mode (no other nodes specified)");
+            info!(
+                "[Node<{}>] Starting in single-node mode (ignoring specified topology)",
+                node_id
+            );
             // A rate_limiter holds rate-limiting data in memory
             let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
-                rate_limit::RateLimiter::new(rl_settings);
-            Ok(Self::Single(Arc::new(SingleNode::new(settings, rate_limiter).await?)))
+                rate_limit::RateLimiter::new(node_id, rl_settings);
+            Ok(Self::Single(Arc::new(
+                SingleNode::new(settings, rate_limiter).await?,
+            )))
         } else {
             match settings.run_mode {
                 settings::RunMode::Single => {
-                    info!("Starting in single-node mode (ignoring specified topology)");
+                    info!(
+                        "[Node<{}>] Starting in single-node mode (ignoring specified topology)",
+                        node_id
+                    );
                     let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
-                        rate_limit::RateLimiter::new(rl_settings);
-                    Ok(Self::Single(Arc::new(SingleNode::new(settings, rate_limiter).await?)))
+                        rate_limit::RateLimiter::new(node_id, rl_settings);
+                    Ok(Self::Single(Arc::new(
+                        SingleNode::new(settings, rate_limiter).await?,
+                    )))
                 }
                 settings::RunMode::Gossip => {
                     info!(
-                        "Starting in gossip mode with {} other nodes: {:?}",
+                        "[Node<{}>] Starting in gossip mode with {} other nodes: {:?}",
+                        node_id,
                         settings.topology.len(),
                         settings.topology
                     );
-                    let rate_limiter: rate_limit::RateLimiter<VersionedTokenBucket> =
-                        rate_limit::RateLimiter::new(rl_settings);
+                    let rate_limiter: rate_limit::RateLimiter<EpochTokenBucket> =
+                        rate_limit::RateLimiter::new(node_id, rl_settings);
                     // Use GossipNode instead of broken MultiNode
                     let gossip_node = Arc::new(GossipNode::new(settings, rate_limiter).await?);
                     Ok(Self::Gossip(gossip_node))
                 }
                 settings::RunMode::Hashring => {
                     info!(
-                        "Starting in hashring mode with {} other nodes: {:?}",
+                        "[Node<{}>] Starting in hashring mode with {} other nodes: {:?}",
+                        node_id,
                         settings.topology.len(),
                         settings.topology
                     );
                     // Build hashring node
                     let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
-                        rate_limit::RateLimiter::new(rl_settings);
+                        rate_limit::RateLimiter::new(node_id, rl_settings);
                     let hashring_node = HashringNode::new(settings, rate_limiter).await?;
                     Ok(Self::Hashring(Arc::new(hashring_node)))
                 }

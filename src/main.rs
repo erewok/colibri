@@ -23,17 +23,18 @@ async fn main() -> Result<()> {
 
     // Parse args and env vars
     let args = cli::Cli::parse();
+    let settings = args.into_settings();
 
     // Socket server listen address setup
-    let listen_address: IpAddr = args
+    let listen_address: IpAddr = settings
         .listen_address
         .parse::<IpAddr>()
         .expect("Invalid ip address");
-    let socket_address = SocketAddr::from((listen_address, args.listen_port));
+    let socket_address = SocketAddr::from((listen_address, settings.listen_port_api));
     let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();
 
     // Build Axum Router and get shared state
-    let (api, app_state) = api::api(args.into_settings()).await?;
+    let (api, app_state) = api::api(settings).await?;
     let state_for_expiry = app_state.clone();
 
     tokio::spawn(async move {

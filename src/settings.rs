@@ -3,7 +3,7 @@ use bincode::{Decode, Encode};
 use std::collections::HashSet;
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use crate::node::node_id::generate_node_id;
+use crate::node::node_id::{generate_node_id, NodeId};
 
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -17,7 +17,6 @@ pub const DEFAULT_PORT_UDP: &str = "8412";
 
 #[derive(Clone, Debug, Decode, Encode)]
 pub struct RateLimitSettings {
-    pub node_id: u32,
     pub rate_limit_max_calls_allowed: u32,
     pub rate_limit_interval_seconds: u32,
 }
@@ -62,7 +61,6 @@ impl std::str::FromStr for RunMode {
 impl Default for RateLimitSettings {
     fn default() -> Self {
         Self {
-            node_id: 0,
             rate_limit_max_calls_allowed: 1000,
             rate_limit_interval_seconds: 60,
         }
@@ -115,7 +113,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn node_id(&self) -> u32 {
+    pub fn node_id(&self) -> NodeId {
         generate_node_id(&self.listen_address, self.listen_port_tcp)
     }
 
@@ -145,7 +143,6 @@ impl Settings {
 
     pub fn rate_limit_settings(&self) -> RateLimitSettings {
         RateLimitSettings {
-            node_id: self.node_id(),
             rate_limit_max_calls_allowed: self.rate_limit_max_calls_allowed,
             rate_limit_interval_seconds: self.rate_limit_interval_seconds,
         }

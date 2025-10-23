@@ -3,9 +3,11 @@
 use bincode::{Decode, Encode};
 use chrono::Utc;
 
+use crate::node::NodeId;
 use crate::settings;
 
 pub trait Bucket {
+    fn new(node_id: NodeId, rate_limit_settings: &settings::RateLimitSettings) -> Self;
     fn add_tokens_to_bucket(
         &mut self,
         rate_limit_settings: &settings::RateLimitSettings,
@@ -13,7 +15,6 @@ pub trait Bucket {
     fn check_if_allowed(&self) -> bool;
     fn decrement(&mut self) -> &mut Self;
     fn last_call(&self) -> i64;
-    fn new(rate_limit_settings: &settings::RateLimitSettings) -> Self;
     fn tokens_to_u32(&self) -> u32;
     fn try_consume(&mut self, tokens_requested: u32) -> bool;
 }
@@ -40,7 +41,7 @@ impl Default for TokenBucket {
 
 impl Bucket for TokenBucket {
     /// Create a new TokenBucket with full capacity
-    fn new(rate_limit_settings: &settings::RateLimitSettings) -> Self {
+    fn new(_node_id: NodeId, rate_limit_settings: &settings::RateLimitSettings) -> Self {
         Self {
             tokens: rate_limit_settings.rate_limit_max_calls_allowed as f64,
             last_call: Utc::now().timestamp_millis(),
@@ -157,7 +158,6 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
-            node_id: 1,
         };
 
         for _n in 0..5 {
@@ -197,7 +197,6 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
-            node_id: 1,
         };
 
         let mut bucket = TokenBucket::default();
@@ -217,7 +216,6 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
-            node_id: 1,
         };
         let mut bucket = TokenBucket::default();
         let initial_tokens = bucket.tokens;
@@ -256,7 +254,6 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
-            node_id: 1,
         };
 
         // Should be 100 calls / 60 seconds = 1.666... calls per second
@@ -274,7 +271,6 @@ mod tests {
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
-            node_id: 1,
         };
 
         let mut bucket = TokenBucket::default();

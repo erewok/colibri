@@ -3,6 +3,7 @@ use chrono::Utc;
 use papaya::HashMap;
 
 use super::token_bucket::Bucket;
+use crate::node::NodeId;
 use crate::settings;
 
 /// Each rate-limited item will be stored in here.
@@ -14,14 +15,16 @@ use crate::settings;
 /// so it should happen inside something like a RwLock.
 #[derive(Clone, Debug)]
 pub struct RateLimiter<T: Bucket + Clone> {
+    node_id: NodeId,
     settings: settings::RateLimitSettings,
     /// Cache defines a Lazy-TTL based HashMap.
     cache: HashMap<String, T>,
 }
 
 impl<T: Bucket + Clone> RateLimiter<T> {
-    pub fn new(rate_limit_settings: settings::RateLimitSettings) -> Self {
+    pub fn new(node_id: NodeId, rate_limit_settings: settings::RateLimitSettings) -> Self {
         Self {
+            node_id,
             settings: rate_limit_settings,
             cache: HashMap::new(),
         }
@@ -34,13 +37,8 @@ impl<T: Bucket + Clone> RateLimiter<T> {
     }
 
     pub fn new_bucket(&self) -> T {
-        T::new(&self.settings)
+        T::new(self.node_id, &self.settings)
     }
-
-    pub fn node_id(&self) -> u32 {
-        self.settings.node_id
-    }
-
     // It's possible that updates happen around this object
     pub fn get_bucket(&self, key: &str) -> Option<T> {
         self.cache.pin().get(key).cloned()
@@ -116,23 +114,22 @@ mod tests {
     use tokio::time::{self, Duration};
 
     use super::*;
+    use crate::limiters::epoch_bucket::EpochTokenBucket;
     use crate::limiters::token_bucket::TokenBucket;
-    use crate::limiters::versioned_bucket::VersionedTokenBucket;
 
     fn get_settings() -> settings::RateLimitSettings {
         settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
-            node_id: 1,
         }
     }
 
     fn new_rate_limiter() -> RateLimiter<TokenBucket> {
-        RateLimiter::new(get_settings())
+        RateLimiter::new(NodeId::new(1), get_settings())
     }
 
-    fn new_rate_limiter_versioned() -> RateLimiter<VersionedTokenBucket> {
-        RateLimiter::new(get_settings())
+    fn new_rate_limiter_versioned() -> RateLimiter<EpochTokenBucket> {
+        RateLimiter::new(NodeId::new(1), get_settings())
     }
 
     #[tokio::test]
@@ -258,12 +255,11 @@ mod tests {
     #[test]
     fn test_rate_limiter_with_zero_tokens() {
         let zero_settings = settings::RateLimitSettings {
-            node_id: 1,
             rate_limit_max_calls_allowed: 0,
             rate_limit_interval_seconds: 1,
         };
 
-        let mut limiter: RateLimiter<TokenBucket> = RateLimiter::new(zero_settings);
+        let mut limiter: RateLimiter<TokenBucket> = RateLimiter::new(NodeId::new(1), zero_settings);
 
         // Should immediately deny any requests
         assert!(limiter
@@ -278,10 +274,9 @@ mod tests {
         let high_limit = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
-            node_id: 1,
         };
 
-        let mut limiter: RateLimiter<TokenBucket> = RateLimiter::new(high_limit);
+        let mut limiter: RateLimiter<TokenBucket> = RateLimiter::new(NodeId::new(1), high_limit);
         assert_eq!(limiter.check_calls_remaining_for_client("test"), 100);
 
         // Make 10 requests

@@ -7,10 +7,9 @@ use tracing::{debug, error, info};
 
 use super::{GossipCommand, GossipController};
 use crate::error::{ColibriError, Result};
-use crate::limiters::{rate_limit::RateLimiter, epoch_bucket::EpochTokenBucket};
+use crate::limiters::{epoch_bucket::EpochTokenBucket, rate_limit::RateLimiter};
 use crate::node::{CheckCallsResponse, Node, NodeId};
 use crate::{settings, transport};
-
 
 #[derive(Clone)]
 pub struct GossipNode {
@@ -95,8 +94,8 @@ impl Node<EpochTokenBucket> for GossipNode {
         });
 
         Ok(Self {
-            node_id: node_id,
-            gossip_command_tx: gossip_command_tx,
+            node_id,
+            gossip_command_tx,
             controller_handle: Some(Arc::new(controller_handle)),
             receiver_handle: Some(Arc::new(receiver_handle)),
         })
@@ -107,7 +106,7 @@ impl Node<EpochTokenBucket> for GossipNode {
         let (tx, rx) = oneshot::channel();
         self.gossip_command_tx
             .send(GossipCommand::CheckLimit {
-                client_id: client_id,
+                client_id,
                 resp_chan: tx,
             })
             .await
@@ -126,7 +125,7 @@ impl Node<EpochTokenBucket> for GossipNode {
         let (tx, rx) = oneshot::channel();
         self.gossip_command_tx
             .send(GossipCommand::RateLimit {
-                client_id: client_id,
+                client_id,
                 resp_chan: tx,
             })
             .await
@@ -148,8 +147,6 @@ impl Node<EpochTokenBucket> for GossipNode {
         Ok(())
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

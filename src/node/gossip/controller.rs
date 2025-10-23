@@ -80,7 +80,7 @@ impl GossipController {
             rate_limit_settings: rl_settings,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             transport: transport.clone(),
-            transport_config: transport_config,
+            transport_config,
             gossip_interval_ms: settings.gossip_interval_ms,
             gossip_fanout: settings.gossip_fanout,
         })
@@ -204,10 +204,13 @@ impl GossipController {
                     client_id, calls_remaining
                 );
 
-                if let Err(_) = resp_chan.send(Ok(CheckCallsResponse {
-                    client_id,
-                    calls_remaining,
-                })) {
+                if resp_chan
+                    .send(Ok(CheckCallsResponse {
+                        client_id,
+                        calls_remaining,
+                    }))
+                    .is_err()
+                {
                     error!(
                         "[{}] Failed sending oneshot check_limit response",
                         self.node_id
@@ -237,7 +240,7 @@ impl GossipController {
                     } else {
                         response = None;
                     }
-                    if let Err(_) = resp_chan.send(Ok(response)) {
+                    if resp_chan.send(Ok(response)).is_err() {
                         error!(
                             "[{}] Failed sending oneshot rate_limit response",
                             self.node_id
@@ -247,9 +250,7 @@ impl GossipController {
                 }
                 // Send immediate gossip update after rate limiting
                 if let Some(bucket) = bucket {
-                    let updates = HashMap::from([
-                        (client_id.clone(), bucket)
-                    ]);
+                    let updates = HashMap::from([(client_id.clone(), bucket)]);
                     let message = GossipMessage::DeltaStateSync {
                         updates,
                         sender_node_id: self.node_id,
@@ -387,14 +388,14 @@ impl GossipController {
             let maybe_bucket = rate_limiter
                 .lock()
                 .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))
-                .map(|rl| rl.get_bucket(&client_id));
+                .map(|rl| rl.get_bucket(client_id));
             if let Ok(Some(mut current_entry)) = maybe_bucket {
                 debug!(
                     "[{}] Found existing bucket from client: {}",
                     node_id, client_id
                 );
                 // Try to merge with existing bucket
-                if current_entry.merge(&incoming_bucket) {
+                if current_entry.merge(incoming_bucket) {
                     debug!(
                         "[{}] Merged gossip update from client '{}': {} -> {} tokens, version {} -> {}",
                         node_id,
@@ -407,7 +408,7 @@ impl GossipController {
                     let _ = rate_limiter
                         .lock()
                         .map_err(|e| ColibriError::Concurrency(format!("Failed to lock {}", e)))
-                        .map(|mut rl| rl.set_bucket(&client_id, current_entry));
+                        .map(|mut rl| rl.set_bucket(client_id, current_entry));
                 } else {
                     debug!(
                         "[{}] Rejected gossip update for client '{}': incoming epoch {} <= current epoch {}",
@@ -423,7 +424,7 @@ impl GossipController {
                 let _ = rate_limiter
                     .lock()
                     .map_err(|e| ColibriError::Concurrency(format!("Failed to lock {}", e)))
-                    .map(|mut rl| rl.set_bucket(&client_id, incoming_bucket.clone()));
+                    .map(|mut rl| rl.set_bucket(client_id, incoming_bucket.clone()));
                 debug!(
                     "[{}] Finished setting new bucket for client: {}",
                     node_id, client_id

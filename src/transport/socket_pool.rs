@@ -52,7 +52,7 @@ impl UdpSocketPool {
             let socket = UdpSocket::bind(local_addr)
                 .await
                 .map_err(|e| ColibriError::Transport(format!("Socket creation failed: {}", e)))?;
-            peers.insert(peer_addr.clone(), Arc::new(Mutex::new(socket)));
+            peers.insert(*peer_addr, Arc::new(Mutex::new(socket)));
         }
 
         let stats = Arc::new(SocketPoolStats {
@@ -113,7 +113,7 @@ impl UdpSocketPool {
         // Do not allow the random thread_range to be used across await points: generate all random indexes now.
         let rand_indexs = {
             let mut rng = rand::rng();
-            [0..count].map(|_| rng.random_range(0..self.peers.len()))
+            [..count].map(|_| rng.random_range(0..self.peers.len()))
         };
         for random_usize in rand_indexs {
             if let Some((target, _)) = self.peers.get_index(random_usize) {

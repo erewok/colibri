@@ -1,5 +1,5 @@
-use colibri::limiters::rate_limit::RateLimiter;
 use colibri::limiters::epoch_bucket::EpochTokenBucket;
+use colibri::limiters::rate_limit::RateLimiter;
 use colibri::node::NodeId;
 use colibri::settings::RateLimitSettings;
 

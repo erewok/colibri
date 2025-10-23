@@ -50,9 +50,9 @@ pub async fn local_check_limit(
     match rate_limiter.lock() {
         Err(e) => {
             tracing::error!("Failed to acquire rate_limiter lock: {}", e);
-            return Err(crate::error::ColibriError::Concurrency(
+            Err(crate::error::ColibriError::Concurrency(
                 "Failed to acquire rate_limiter lock".to_string(),
-            ));
+            ))
         }
         Ok(rate_limiter) => {
             let calls_remaining = rate_limiter.check_calls_remaining_for_client(client_id.as_str());
@@ -71,9 +71,9 @@ pub async fn local_rate_limit(
     match rate_limiter.lock() {
         Err(e) => {
             tracing::error!("Failed to acquire rate_limiter lock: {}", e);
-            return Err(crate::error::ColibriError::Concurrency(
+            Err(crate::error::ColibriError::Concurrency(
                 "Failed to acquire rate_limiter lock".to_string(),
-            ));
+            ))
         }
         Ok(mut rate_limiter) => {
             let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());

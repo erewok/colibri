@@ -72,7 +72,7 @@ impl GossipPacket {
     /// Serialize for INTERNAL cluster communication (UDP gossip)
     pub fn serialize(&self) -> Result<bytes::Bytes, bincode::error::EncodeError> {
         let config = bincode::config::standard().with_big_endian();
-        bincode::encode_to_vec(self, config).map(|b| bytes::Bytes::from(b))
+        bincode::encode_to_vec(self, config).map(bytes::Bytes::from)
     }
 
     /// Deserialize from INTERNAL cluster communication (UDP gossip)

@@ -16,6 +16,12 @@ pub struct NodeCounter {
     pub consumed: u32,
 }
 
+impl Default for NodeCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NodeCounter {
     pub fn new() -> Self {
         Self {
@@ -56,7 +62,7 @@ impl Bucket for EpochTokenBucket {
     /// Create a new distributed token bucket
     fn new(node_id: NodeId, rate_limit_settings: &settings::RateLimitSettings) -> Self {
         let mut node_counters = HashMap::new();
-        node_counters.insert(node_id.clone(), NodeCounter::new());
+        node_counters.insert(node_id, NodeCounter::new());
 
         let now = Utc::now().timestamp_millis();
         Self {
@@ -201,8 +207,7 @@ impl EpochTokenBucket {
                 }
                 None => {
                     // New node we haven't seen before
-                    self.node_counters
-                        .insert(node_id.clone(), remote_counter.clone());
+                    self.node_counters.insert(*node_id, remote_counter.clone());
                     modifying_node_ids.insert(node_id);
                 }
             }
@@ -212,7 +217,7 @@ impl EpochTokenBucket {
         // total consumption in current epoch (for rate limiting across cluster)
         self.adjust_tokens_after_merge();
 
-        modifying_node_ids.len() > 0
+        !modifying_node_ids.is_empty()
     }
 
     /// Get max capacity

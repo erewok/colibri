@@ -1,3 +1,2 @@
-pub mod epoch_bucket;
-pub mod rate_limit;
+pub mod distributed_bucket;
 pub mod token_bucket;

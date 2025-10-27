@@ -1,7 +1,8 @@
 //! Colibri application settings
-use bincode::{Decode, Encode};
 use std::collections::HashSet;
 use std::net::{SocketAddr, ToSocketAddrs};
+
+use serde::{Deserialize, Serialize};
 
 use crate::node::node_id::{generate_node_id, NodeId};
 
@@ -15,7 +16,7 @@ pub const DEFAULT_PORT_TCP: &str = "8411";
 pub const STANDARD_PORT_UDP: u16 = 8412;
 pub const DEFAULT_PORT_UDP: &str = "8412";
 
-#[derive(Clone, Debug, Decode, Encode)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Hash)]
 pub struct RateLimitSettings {
     pub rate_limit_max_calls_allowed: u32,
     pub rate_limit_interval_seconds: u32,
@@ -114,7 +115,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn node_id(&self) -> NodeId {
-        generate_node_id(&self.listen_address, self.listen_port_tcp)
+        generate_node_id(&self.listen_address, self.listen_port_api)
     }
 
     pub fn transport_config(&self) -> TransportConfig {

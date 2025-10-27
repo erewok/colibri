@@ -59,7 +59,7 @@ pub enum SerializationError {
     /// JSON serialization/deserialization errors
     Json(serde_json::Error),
 
-    /// Binary decode/encode errors
+    /// Binary serialization/deserialization errors
     BinaryDecode(bincode::error::DecodeError),
     BinaryEncode(bincode::error::EncodeError),
 }

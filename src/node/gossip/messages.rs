@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use bincode::{Decode, Encode};
 use tokio::sync::oneshot;
 
-use crate::limiters::epoch_bucket::EpochTokenBucket;
+use crate::limiters::distributed_bucket::EpochTokenBucket;
 use crate::node::{CheckCallsResponse, NodeId};
 
 /// Gossip message types for production delta-state protocol
@@ -31,6 +31,7 @@ pub enum GossipMessage {
         requesting_node_id: NodeId,
         missing_keys: Option<Vec<String>>, // None = full sync
         since_version: HashMap<u32, u64>,  // What we already have
+        response_addr: SocketAddr,
     },
 
     /// Response to state request with missing data
@@ -117,6 +118,7 @@ mod tests {
             requesting_node_id: NodeId::new(1),
             missing_keys: None,
             since_version: HashMap::new(),
+            response_addr: "127.0.0.1:8410".parse().unwrap(),
         };
         let packet = GossipPacket::new(message);
 
@@ -130,10 +132,12 @@ mod tests {
                 requesting_node_id,
                 missing_keys,
                 since_version,
+                response_addr,
             } => {
                 assert_eq!(requesting_node_id, NodeId::new(1));
                 assert!(missing_keys.is_none());
                 assert!(since_version.is_empty());
+                assert_eq!(response_addr, "127.0.0.1:8410".parse().unwrap());
             }
             _ => panic!("Wrong message type after deserialization"),
         }

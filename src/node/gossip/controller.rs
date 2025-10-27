@@ -9,7 +9,8 @@ use tracing::{debug, error, info};
 
 use super::{GossipCommand, GossipMessage, GossipPacket};
 use crate::error::{ColibriError, Result};
-use crate::limiters::{epoch_bucket::EpochTokenBucket, rate_limit::RateLimiter};
+use crate::limiters::distributed_bucket::DistributedBucketLimiter;
+use crate::limiters::{distributed_bucket::EpochTokenBucket, token_bucket::TokenBucketLimiter};
 use crate::node::{CheckCallsResponse, NodeId};
 use crate::settings;
 use crate::transport::UdpTransport;
@@ -22,7 +23,7 @@ pub struct GossipController {
     // rate-limit settings
     pub rate_limit_settings: settings::RateLimitSettings,
     /// Local rate limiter - handles all bucket operations
-    pub rate_limiter: Arc<Mutex<RateLimiter<EpochTokenBucket>>>,
+    pub rate_limiter: Arc<Mutex<DistributedBucketLimiter>>,
     /// transport_config
     pub transport_config: settings::TransportConfig,
     /// Transport layer for sending UDP unicast gossip messages
@@ -46,7 +47,6 @@ impl std::fmt::Debug for GossipController {
 impl GossipController {
     pub async fn new(
         settings: settings::Settings,
-        rate_limiter: RateLimiter<EpochTokenBucket>,
     ) -> Result<Self> {
         let node_id = settings.node_id();
         info!(
@@ -54,6 +54,7 @@ impl GossipController {
             node_id, settings.listen_port_udp
         );
         let rl_settings = settings.rate_limit_settings();
+        let rate_limiter = DistributedBucketLimiter::new(node_id, rl_settings.clone());
 
         // Build transport
         let transport_config = settings.transport_config();
@@ -170,12 +171,10 @@ impl GossipController {
 
     /// Collect buckets that have been updated and should be gossiped
     async fn collect_gossip_updates(&self) -> Result<HashMap<String, EpochTokenBucket>> {
-        // For now, collect all buckets. In the future, this could be optimized
-        // to only send buckets that have changed since the last gossip round.
         self.rate_limiter
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))
-            .map(|rl| rl.get_all_buckets())
+            .map(|rl| rl.gossip_delta_state())
     }
     /// Handle incoming gossip cmd from our channel
     async fn handle_command(&self, cmd: GossipCommand) -> Result<()> {
@@ -198,7 +197,7 @@ impl GossipController {
                     .rate_limiter
                     .lock()
                     .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))?;
-                let calls_remaining = rl.check_calls_remaining_for_client(client_id.as_str());
+                let calls_remaining = rl.check_calls_remaining_for_client(&client_id);
                 debug!(
                     "Check limit for client '{}': {} tokens remaining",
                     client_id, calls_remaining
@@ -391,7 +390,7 @@ impl GossipController {
                 .map(|rl| rl.get_bucket(client_id));
             if let Ok(Some(mut current_entry)) = maybe_bucket {
                 debug!(
-                    "[{}] Found existing bucket from client: {}",
+                    "[{}] Found existing bucket for key: {}",
                     node_id, client_id
                 );
                 // Try to merge with existing bucket
@@ -465,9 +464,8 @@ mod tests {
     //! All tests use isolated controller instances to ensure test independence.
 
     use super::*;
-    use crate::limiters::epoch_bucket::EpochTokenBucket;
-    use crate::limiters::rate_limit::RateLimiter;
-    use crate::limiters::token_bucket::Bucket;
+    use crate::limiters::distributed_bucket::PNCounterClockBucket;
+    use crate::limiters::token_bucket::TokenBucketLimiter;
     use crate::node::NodeId;
     use crate::settings::{RunMode, Settings};
     use std::collections::HashMap;
@@ -494,7 +492,7 @@ mod tests {
     // Helper function to create a test controller
     async fn create_test_controller() -> GossipController {
         let settings = create_test_settings();
-        let rate_limiter = RateLimiter::new(settings.node_id(), settings.rate_limit_settings());
+        let rate_limiter = TokenBucketLimiter::new(settings.node_id(), settings.rate_limit_settings());
 
         GossipController::new(settings, rate_limiter)
             .await
@@ -938,6 +936,7 @@ mod tests {
             requesting_node_id: NodeId::new(6),
             missing_keys: Some(vec!["missing_key".to_string()]),
             since_version: HashMap::new(),
+            response_addr: peer_addr,
         };
 
         let packet = GossipPacket::new(message);

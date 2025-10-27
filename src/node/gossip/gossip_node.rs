@@ -7,7 +7,6 @@ use tracing::{debug, error, info};
 
 use super::{GossipCommand, GossipController};
 use crate::error::{ColibriError, Result};
-use crate::limiters::{epoch_bucket::EpochTokenBucket, rate_limit::RateLimiter};
 use crate::node::{CheckCallsResponse, Node, NodeId};
 use crate::{settings, transport};
 
@@ -15,6 +14,7 @@ use crate::{settings, transport};
 pub struct GossipNode {
     // rate-limit settings
     pub node_id: NodeId,
+
     /// Local rate limiter - handles all bucket operations
     pub gossip_command_tx: Arc<mpsc::Sender<GossipCommand>>,
 
@@ -59,12 +59,11 @@ impl std::fmt::Debug for GossipNode {
 }
 
 #[async_trait]
-impl Node<EpochTokenBucket> for GossipNode {
+impl Node for GossipNode {
     async fn new(
+        node_id: NodeId,
         settings: settings::Settings,
-        rate_limiter: RateLimiter<EpochTokenBucket>,
     ) -> Result<Self> {
-        let node_id = settings.node_id();
         info!(
             "Created GossipNode with ID: {} (port: {})",
             node_id, settings.listen_port_udp
@@ -79,7 +78,7 @@ impl Node<EpochTokenBucket> for GossipNode {
         let gossip_command_tx = Arc::new(gossip_command_tx);
 
         // Start the GossipCommand controller loop
-        let controller = GossipController::new(settings.clone(), rate_limiter).await?;
+        let controller = GossipController::new(settings.clone()).await?;
         let controller_handle = tokio::spawn(async move {
             controller.start(gossip_command_rx).await;
         });
@@ -177,7 +176,4 @@ mod tests {
         }
     }
 
-    pub fn new_rate_limiter() -> RateLimiter<EpochTokenBucket> {
-        RateLimiter::new(NodeId::new(1), rl_settings())
-    }
 }

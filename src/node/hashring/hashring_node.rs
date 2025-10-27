@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::rate_limit;
+use crate::limiters::token_bucket;
 use crate::limiters::token_bucket::TokenBucket;
 use crate::node::{
     generate_node_id_from_socket_addr,
@@ -26,16 +26,19 @@ pub struct HashringNode {
     pub topology: HashMap<NodeId, SocketAddr>,
     pub node_id: NodeId,
     // replication_factor: ReplicationFactor,
-    pub rate_limiter: Arc<Mutex<rate_limit::RateLimiter<TokenBucket>>>,
+    pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
 }
 
 #[async_trait]
-impl Node<TokenBucket> for HashringNode {
+impl Node for HashringNode {
     async fn new(
+        node_id: NodeId,
         settings: settings::Settings,
-        rate_limiter: rate_limit::RateLimiter<TokenBucket>,
     ) -> Result<Self> {
-        let node_id = settings.node_id();
+        let rl_settings = settings.rate_limit_settings();
+        let rate_limiter: token_bucket::TokenBucketLimiter =
+                        token_bucket::TokenBucketLimiter::new(node_id, rl_settings);
+
         let topology: HashMap<NodeId, SocketAddr> = settings
             .transport_config()
             .topology

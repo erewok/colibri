@@ -11,9 +11,6 @@ pub mod node_id;
 pub mod single_node;
 
 use crate::error::Result;
-use crate::limiters::epoch_bucket::EpochTokenBucket;
-use crate::limiters::rate_limit;
-use crate::limiters::token_bucket::{Bucket, TokenBucket};
 use crate::settings;
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;
@@ -30,10 +27,10 @@ pub struct CheckCallsResponse {
 }
 
 #[async_trait]
-pub trait Node<T: Bucket + Clone> {
+pub trait Node {
     async fn new(
+        node_id: NodeId,
         settings: settings::Settings,
-        rate_limiter: rate_limit::RateLimiter<T>,
     ) -> Result<Self>
     where
         Self: Sized;
@@ -52,17 +49,15 @@ pub enum NodeWrapper {
 impl NodeWrapper {
     pub async fn new(settings: settings::Settings) -> Result<Self> {
         let node_id = settings.node_id();
-        let rl_settings = settings.rate_limit_settings();
         if settings.topology.is_empty() {
             info!(
                 "[Node<{}>] Starting in single-node mode (ignoring specified topology)",
                 node_id
             );
             // A rate_limiter holds rate-limiting data in memory
-            let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
-                rate_limit::RateLimiter::new(node_id, rl_settings);
+
             Ok(Self::Single(Arc::new(
-                SingleNode::new(settings, rate_limiter).await?,
+                SingleNode::new(node_id, settings).await?,
             )))
         } else {
             match settings.run_mode {
@@ -71,10 +66,8 @@ impl NodeWrapper {
                         "[Node<{}>] Starting in single-node mode (ignoring specified topology)",
                         node_id
                     );
-                    let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
-                        rate_limit::RateLimiter::new(node_id, rl_settings);
                     Ok(Self::Single(Arc::new(
-                        SingleNode::new(settings, rate_limiter).await?,
+                        SingleNode::new(node_id, settings).await?,
                     )))
                 }
                 settings::RunMode::Gossip => {
@@ -84,10 +77,8 @@ impl NodeWrapper {
                         settings.topology.len(),
                         settings.topology
                     );
-                    let rate_limiter: rate_limit::RateLimiter<EpochTokenBucket> =
-                        rate_limit::RateLimiter::new(node_id, rl_settings);
                     // Use GossipNode instead of broken MultiNode
-                    let gossip_node = Arc::new(GossipNode::new(settings, rate_limiter).await?);
+                    let gossip_node = Arc::new(GossipNode::new(node_id, settings).await?);
                     Ok(Self::Gossip(gossip_node))
                 }
                 settings::RunMode::Hashring => {
@@ -98,9 +89,7 @@ impl NodeWrapper {
                         settings.topology
                     );
                     // Build hashring node
-                    let rate_limiter: rate_limit::RateLimiter<TokenBucket> =
-                        rate_limit::RateLimiter::new(node_id, rl_settings);
-                    let hashring_node = HashringNode::new(settings, rate_limiter).await?;
+                    let hashring_node = HashringNode::new(node_id, settings).await?;
                     Ok(Self::Hashring(Arc::new(hashring_node)))
                 }
             }

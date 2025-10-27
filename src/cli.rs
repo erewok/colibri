@@ -89,7 +89,7 @@ pub struct Cli {
     // Gossip settings
     #[clap(
         long,
-        default_value = "25",
+        default_value = "25000",
         env("COLIBRI_GOSSIP_INTERVAL_MS"),
         help = "Gossip interval in milliseconds"
     )]
@@ -97,7 +97,7 @@ pub struct Cli {
 
     #[clap(
         long,
-        default_value = "4",
+        default_value = "1",
         env("COLIBRI_GOSSIP_FANOUT"),
         help = "Number of peers to gossip to per round"
     )]

@@ -3,25 +3,26 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::rate_limit;
-use crate::limiters::token_bucket::TokenBucket;
-use crate::node::{CheckCallsResponse, Node};
+use crate::limiters::token_bucket;
+use crate::node::{CheckCallsResponse, Node, NodeId};
 use crate::settings;
 
 #[derive(Clone, Debug)]
 pub struct SingleNode {
-    pub rate_limiter: Arc<Mutex<rate_limit::RateLimiter<TokenBucket>>>,
+    pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
 }
 
 #[async_trait]
-impl Node<TokenBucket> for SingleNode {
+impl Node for SingleNode {
     async fn new(
-        _settings: settings::Settings,
-        rate_limiter: rate_limit::RateLimiter<TokenBucket>,
+        node_id: NodeId,
+        settings: settings::Settings,
     ) -> Result<Self>
     where
         Self: Sized,
     {
+        let rate_limiter: token_bucket::TokenBucketLimiter =
+                token_bucket::TokenBucketLimiter::new(node_id, settings.rate_limit_settings());
         Ok(Self {
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
         })
@@ -45,7 +46,7 @@ impl Node<TokenBucket> for SingleNode {
 
 pub async fn local_check_limit(
     client_id: String,
-    rate_limiter: Arc<Mutex<rate_limit::RateLimiter<TokenBucket>>>,
+    rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
 ) -> Result<CheckCallsResponse> {
     match rate_limiter.lock() {
         Err(e) => {
@@ -66,7 +67,7 @@ pub async fn local_check_limit(
 
 pub async fn local_rate_limit(
     client_id: String,
-    rate_limiter: Arc<Mutex<rate_limit::RateLimiter<TokenBucket>>>,
+    rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
 ) -> Result<Option<CheckCallsResponse>> {
     match rate_limiter.lock() {
         Err(e) => {

@@ -1,5 +1,5 @@
-use colibri::limiters::epoch_bucket::EpochTokenBucket;
-use colibri::limiters::rate_limit::RateLimiter;
+use colibri::limiters::distributed_bucket::EpochTokenBucket;
+use colibri::limiters::token_bucket::TokenBucketLimiter;
 use colibri::node::NodeId;
 use colibri::settings::RateLimitSettings;
 
@@ -10,7 +10,7 @@ fn test_rate_limiter_integration() {
         rate_limit_interval_seconds: 60,
     };
 
-    let mut limiter: RateLimiter<EpochTokenBucket> = RateLimiter::new(NodeId::new(1), settings);
+    let mut limiter: TokenBucketLimiter<EpochTokenBucket> = TokenBucketLimiter::new(NodeId::new(1), settings);
 
     // Test basic rate limiting workflow
     let client_id = "integration_test_client";
@@ -39,7 +39,7 @@ fn test_rate_limiter_multiple_clients() {
         rate_limit_interval_seconds: 1,
     };
 
-    let mut limiter: RateLimiter<EpochTokenBucket> = RateLimiter::new(NodeId::new(1), settings);
+    let mut limiter: TokenBucketLimiter<EpochTokenBucket> = TokenBucketLimiter::new(NodeId::new(1), settings);
 
     // Test that different clients have independent limits
     assert!(limiter
@@ -75,7 +75,7 @@ fn test_rate_limiter_expire_functionality() {
         rate_limit_interval_seconds: 1,
     };
 
-    let mut limiter: RateLimiter<EpochTokenBucket> = RateLimiter::new(NodeId::new(1), settings);
+    let mut limiter: TokenBucketLimiter<EpochTokenBucket> = TokenBucketLimiter::new(NodeId::new(1), settings);
 
     // Make some requests to populate the cache
     limiter.limit_calls_for_client("test_client".to_string());

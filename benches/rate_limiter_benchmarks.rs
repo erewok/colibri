@@ -1,4 +1,4 @@
-use colibri::limiters::distributed_bucket::EpochTokenBucket;
+use colibri::limiters::distributed_bucket::DistributedBucketLimiter;
 use colibri::limiters::token_bucket::TokenBucketLimiter;
 use colibri::settings::RateLimitSettings;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -8,13 +8,12 @@ fn benchmark_rate_limiter_sequential(c: &mut Criterion) {
     let settings = RateLimitSettings {
         rate_limit_max_calls_allowed: 1000000, // High limit to avoid blocking
         rate_limit_interval_seconds: 3600,
-        node_id: 0,
     };
 
     c.bench_function("rate_limiter_sequential", |b| {
         let mut counter = 0;
         b.iter(|| {
-            let mut limiter: TokenBucketLimiter<EpochTokenBucket> = TokenBucketLimiter::new(settings.clone());
+            let mut limiter: DistributedBucketLimiter = DistributedBucketLimiter::new(1.into(), settings.clone());
             counter += 1;
             let client_id = format!("benchmark_client_{}", counter % 1000);
             black_box(limiter.limit_calls_for_client(client_id))
@@ -26,10 +25,9 @@ fn benchmark_rate_limiter_check_remaining(c: &mut Criterion) {
     let settings = RateLimitSettings {
         rate_limit_max_calls_allowed: 1000000,
         rate_limit_interval_seconds: 3600,
-        node_id: 0,
     };
 
-    let limiter: TokenBucketLimiter<EpochTokenBucket> = TokenBucketLimiter::new(settings);
+    let limiter: DistributedBucketLimiter = DistributedBucketLimiter::new(1.into(), settings.clone());
 
     c.bench_function("rate_limiter_check_remaining", |b| {
         let mut counter = 0;

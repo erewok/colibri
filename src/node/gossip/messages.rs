@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
+use crdts::VClock;
 use tokio::sync::oneshot;
 
-use crate::limiters::distributed_bucket::EpochTokenBucket;
+use crate::limiters::distributed_bucket::DeltaState;
 use crate::node::{CheckCallsResponse, NodeId};
 
 /// Gossip message types for production delta-state protocol
@@ -20,32 +21,38 @@ use crate::node::{CheckCallsResponse, NodeId};
 pub enum GossipMessage {
     /// Delta-state synchronization - only recently updated keys
     DeltaStateSync {
-        updates: HashMap<String, EpochTokenBucket>, // Only changed keys
+        response_addr: SocketAddr,
+        #[bincode(with_serde)]
+        updates: DeltaState, // Only changed keys
+        #[bincode(with_serde)]
         sender_node_id: NodeId,
-        gossip_round: u64,
-        last_seen_versions: HashMap<u32, u64>, // For anti-entropy
     },
 
     /// Request for specific state (anti-entropy)
     StateRequest {
-        requesting_node_id: NodeId,
         missing_keys: Option<Vec<String>>, // None = full sync
-        since_version: HashMap<u32, u64>,  // What we already have
         response_addr: SocketAddr,
+        #[bincode(with_serde)]
+        requesting_node_id: NodeId,
     },
 
     /// Response to state request with missing data
     StateResponse {
+        response_addr: SocketAddr,
+        #[bincode(with_serde)]
         responding_node_id: NodeId,
-        requested_data: HashMap<String, EpochTokenBucket>,
-        current_versions: HashMap<u32, u64>, // Our current knowledge
+        #[bincode(with_serde)]
+        requested_data: DeltaState,
     },
 
     /// Heartbeat with version vectors for anti-entropy
     Heartbeat {
-        node_id: NodeId,
+        response_addr: SocketAddr,
         timestamp: u64,
-        version_vector: HashMap<u32, u64>, // Our knowledge of all nodes
+        #[bincode(with_serde)]
+        node_id: NodeId,
+        #[bincode(with_serde)]
+        vclock: VClock<NodeId>,
     },
 }
 
@@ -117,7 +124,6 @@ mod tests {
         let message = GossipMessage::StateRequest {
             requesting_node_id: NodeId::new(1),
             missing_keys: None,
-            since_version: HashMap::new(),
             response_addr: "127.0.0.1:8410".parse().unwrap(),
         };
         let packet = GossipPacket::new(message);
@@ -131,12 +137,10 @@ mod tests {
             GossipMessage::StateRequest {
                 requesting_node_id,
                 missing_keys,
-                since_version,
                 response_addr,
             } => {
                 assert_eq!(requesting_node_id, NodeId::new(1));
                 assert!(missing_keys.is_none());
-                assert!(since_version.is_empty());
                 assert_eq!(response_addr, "127.0.0.1:8410".parse().unwrap());
             }
             _ => panic!("Wrong message type after deserialization"),

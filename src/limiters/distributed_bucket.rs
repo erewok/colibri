@@ -18,7 +18,7 @@
 /// - Thus, allow nodes to gossip their token bucket state and *merge* updates.
 
 use chrono::Utc;
-use crdts::{CmRDT, CvRDT, Orswot, PNCounter, ResetRemove, VClock};
+use crdts::{CmRDT, CvRDT, Map, PNCounter, ResetRemove, VClock};
 use papaya::HashMap;
 use num_bigint::BigInt;
 use num_traits::cast::ToPrimitive;
@@ -27,6 +27,11 @@ use serde::{Deserialize, Serialize};
 use crate::limiters::token_bucket::Bucket;
 use crate::node::NodeId;
 use crate::settings;
+
+// Delta state for gossiping: list of (client_id, DistributedRequestCounter, is_tombstone)
+pub type ClientDelta = (String, DistributedRequestCounter, bool);
+pub type DeltaState = Vec<ClientDelta>;
+
 
 /// `TokenBucket` implementation is inspired by a PN-counter with a tombstone.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
@@ -177,7 +182,7 @@ pub struct DistributedBucketLimiter {
     /// Node ID of this bucket map owner
     pub node_id: NodeId,
     /// Tombstones for removed clients (vector clock tracks nodes performing removals)
-    pub tombstones: Orswot<String, NodeId>,
+    pub tombstones: Map<String, VClock<NodeId>, NodeId>,
     /// Per-node consumption counters for each client with add/remove semantics.
     pub node_counters: HashMap<String, DistributedRequestCounter>,
     /// Rate limit settings for token replenishment
@@ -195,7 +200,7 @@ impl DistributedBucketLimiter {
         Self {
             node_id,
             node_counters: HashMap::new(),
-            tombstones: Orswot::new(),
+            tombstones: Map::new(),
             rate_limit_settings,
         }
     }
@@ -226,7 +231,8 @@ impl DistributedBucketLimiter {
             .collect();
 
         for client in keys_to_expire {
-            self.tombstones.add(client.to_owned(), self.tombstones.read_ctx().derive_add_ctx(self.node_id));
+            let add_ctx = self.tombstones.read_ctx().derive_add_ctx(self.node_id);
+            self.tombstones.update(client.to_owned(), add_ctx, |v,a| v.inc(self.node_id));
             self.node_counters.pin().remove(&client);
         }
     }
@@ -257,17 +263,58 @@ impl DistributedBucketLimiter {
                 None
             }
         })
-
     }
 
     /// Create state suitable for gossiping to other nodes
-    pub fn gossip_delta_state(&self) -> Vec<(String, DistributedRequestCounter)> {
+    pub fn gossip_delta_state(&self) -> DeltaState {
         // The problem here is selecting only the relevant entries to gossip.
         // We also don't want to send a massive amount of packets.
         // We break it into a vector in order to send smaller chunks.
         // If we do not broadcast and we have a lot of delta states to send
         // We may not end up gossiping everything we need to.
         todo!()
+    }
+    pub fn client_delta_state_for_gossip(&self, client_id: &String) -> ClientDelta {
+        let counter = self.node_counters.pin().get(client_id).cloned().unwrap_or_default();
+        let is_tombstone = self.tombstones.get(client_id).val.is_some();
+        (client_id.clone(), counter, is_tombstone)
+    }
+
+    pub fn accept_delta_state(&mut self, delta: DeltaState) {
+        for (client_id, incoming_counter, is_tombstone) in delta.iter() {
+            if *is_tombstone {
+                let add_ctx = self.tombstones.read_ctx().derive_add_ctx(self.node_id);
+                self.tombstones.update(client_id.clone(), add_ctx, |v, _a| {
+                    v.inc(incoming_counter.node_id)
+                });
+            };
+            self.node_counters.pin().update_or_insert_with(client_id.clone(), |_existing_counter| {
+                let mut existing_counter = _existing_counter.clone();
+                existing_counter.merge(incoming_counter.clone());
+                existing_counter
+            }, || incoming_counter.clone());
+        }
+    }
+
+    pub fn get_latest_updated_vclock(&self) -> VClock<NodeId> {
+        let largest = self.node_counters.pin().values()
+            .fold(VClock::new(), |acc, counter| {
+                if acc > counter.vclock {
+                    acc
+                } else {
+                    counter.vclock.clone()
+                }
+            });
+            let ctx = self.tombstones.read_ctx();
+            if largest < ctx.add_clock {
+                ctx.add_clock.clone()
+            } else {
+                largest
+            }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.node_counters.pin().is_empty()
     }
 
     pub fn len(&self) -> usize {

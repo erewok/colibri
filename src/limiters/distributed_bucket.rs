@@ -21,6 +21,7 @@ use num_bigint::BigInt;
 use num_traits::cast::ToPrimitive;
 use papaya::HashMap;
 use serde::{Deserialize, Serialize};
+use tracing::{info, debug};
 
 use crate::limiters::token_bucket::Bucket;
 use crate::node::NodeId;
@@ -45,9 +46,12 @@ pub struct DistributedRequestCounter {
 impl DistributedRequestCounter {
     /// Create a new DistributedRequestCounter for a given node
     pub fn new(node_id: NodeId) -> Self {
+        let fills = PNCounter::new();
+        // start with 1: matches initial token bucket state
+        fills.inc(node_id);
         Self {
             node_id,
-            refills: PNCounter::new(),
+            refills: fills,
             requests: PNCounter::new(),
             vclock: VClock::new(),
         }
@@ -55,28 +59,39 @@ impl DistributedRequestCounter {
     fn expire_op_steps(&mut self, op: &InternalPnCounterOp) {
         match op {
             InternalPnCounterOp::Fills(steps) => {
-                self.refills.dec_many(self.node_id, *steps);
+                let op = self.refills.dec_many(self.node_id, *steps);
+                self.refills.apply(op);
             }
             InternalPnCounterOp::Requests(steps) => {
-                self.requests.dec_many(self.node_id, *steps);
+                let op = self.requests.dec_many(self.node_id, *steps);
+                self.requests.apply(op);
             }
         }
-        self.vclock.inc(self.node_id);
+        let op = self.vclock.inc(self.node_id);
+        self.vclock.apply(op);
     }
 
     pub fn inc_refills(&mut self, node_id: NodeId, amount: u64) {
-        self.refills.inc_many(node_id, amount);
-        self.vclock.inc(node_id);
+        let op = self.refills.inc_many(node_id, amount);
+        self.refills.apply(op);
+        let op = self.vclock.inc(node_id);
+        self.vclock.apply(op);
     }
 
     pub fn dec_request(&mut self, node_id: NodeId) {
-        self.requests.dec(node_id);
-        self.vclock.inc(node_id);
+        let op = self.requests.dec(node_id);
+        self.requests.apply(op);
+        let op = self.vclock.inc(node_id);
+        self.vclock.apply(op);
     }
 
     pub fn tokens(&self) -> BigInt {
         let refills = self.refills.read();
         let requests = self.requests.read();
+        debug!(
+            "Calculating tokens: refills={}, requests={}",
+            refills, requests
+        );
         refills - requests
     }
 }
@@ -259,13 +274,9 @@ impl Bucket for DistributedBucket {
     ) -> &mut Self {
         // clear out old entries first: these decs will get shared via CRDT merge
         let expiration_threshold_ms =
-            (rate_limit_settings.rate_limit_interval_seconds * 1000) as i64;
+            (rate_limit_settings.rate_limit_interval_seconds * 1000 + 25) as i64;
+
         self.expire_entries(expiration_threshold_ms);
-
-        // figure out how many tokens to add based on time elapsed
-        // without the gossiped values before??
-
-        // self.last_call gets updated on gossip which means it's *fresher* than requsets
 
         // Same token replenishment logic as TokenBucket
         let diff_ms: i64 = Utc::now().timestamp_millis() - self.last_call;
@@ -276,17 +287,22 @@ impl Bucket for DistributedBucket {
             // no-op
             return self;
         }
-        // Tokens are added at the token rate
-        let tokens_to_add = rate_limit_settings.token_rate_milliseconds();
-        // Max calls is limited to: rate_limit_settings.rate_limit_max_calls_allowed
+        // Tokens are added at the token rate,
+        // but for distributed bucket, we only add whole tokens
+        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms);
+        // Max calls is limited to
         let steps = tokens_to_add.trunc() as u64;
-        self.last_call = Utc::now().timestamp_millis();
+        debug!(
+            "Adding tokens to bucket: diff_ms={}, tokens_to_add={} as steps={}",
+            diff_ms, tokens_to_add, steps
+        );
         self.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Fills(steps),
             timestamp_ms: self.last_call,
             vclock: self.vclock(),
         });
         self.counter.inc_refills(self.counter.node_id, steps);
+        self.last_call = Utc::now().timestamp_millis();
         self
     }
 
@@ -306,6 +322,7 @@ impl Bucket for DistributedBucket {
 
     fn check_if_allowed(&self) -> bool {
         let tokens = self.counter.tokens();
+        debug!("Checking if allowed: tokens={}", tokens);
         tokens >= 1.into()
     }
 

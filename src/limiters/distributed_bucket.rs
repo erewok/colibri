@@ -21,7 +21,7 @@ use num_bigint::BigInt;
 use num_traits::cast::ToPrimitive;
 use papaya::HashMap;
 use serde::{Deserialize, Serialize};
-use tracing::{info, debug};
+use tracing::debug;
 
 use crate::limiters::token_bucket::Bucket;
 use crate::node::NodeId;
@@ -445,7 +445,7 @@ impl DistributedBucketLimiter {
                 } else {
                     None
                 }
-        })
+            })
             .collect()
     }
     pub fn client_delta_state_for_gossip(

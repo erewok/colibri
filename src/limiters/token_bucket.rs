@@ -85,7 +85,6 @@ impl Bucket for TokenBucket {
     }
 }
 
-
 /// Each rate-limited item will be stored in here.
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
 /// This data structure offers a garbage collection
@@ -504,7 +503,8 @@ mod tests {
             rate_limit_interval_seconds: 1,
         };
 
-        let mut limiter: TokenBucketLimiter = TokenBucketLimiter::new(NodeId::new(1), zero_settings);
+        let mut limiter: TokenBucketLimiter =
+            TokenBucketLimiter::new(NodeId::new(1), zero_settings);
 
         // Should immediately deny any requests
         assert!(limiter

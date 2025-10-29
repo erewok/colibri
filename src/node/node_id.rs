@@ -11,7 +11,9 @@ use crate::settings;
 /// A simple wrapper around u32 for type safety
 /// Derives common traits for easy use
 /// Note: we implement Default here, but it's meaningless: 0 should *never* be a node-id in practice
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, PartialOrd, Ord, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, PartialOrd, Ord, Eq, Hash,
+)]
 pub struct NodeId(u32);
 
 impl NodeId {

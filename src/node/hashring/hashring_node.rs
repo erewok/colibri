@@ -6,7 +6,6 @@ use tracing::info;
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::token_bucket;
-use crate::limiters::token_bucket::TokenBucket;
 use crate::node::{
     generate_node_id_from_socket_addr,
     hashring::consistent_hashing,
@@ -31,13 +30,10 @@ pub struct HashringNode {
 
 #[async_trait]
 impl Node for HashringNode {
-    async fn new(
-        node_id: NodeId,
-        settings: settings::Settings,
-    ) -> Result<Self> {
+    async fn new(node_id: NodeId, settings: settings::Settings) -> Result<Self> {
         let rl_settings = settings.rate_limit_settings();
         let rate_limiter: token_bucket::TokenBucketLimiter =
-                        token_bucket::TokenBucketLimiter::new(node_id, rl_settings);
+            token_bucket::TokenBucketLimiter::new(node_id, rl_settings);
 
         let topology: HashMap<NodeId, SocketAddr> = settings
             .transport_config()

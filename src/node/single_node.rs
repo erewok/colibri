@@ -14,15 +14,12 @@ pub struct SingleNode {
 
 #[async_trait]
 impl Node for SingleNode {
-    async fn new(
-        node_id: NodeId,
-        settings: settings::Settings,
-    ) -> Result<Self>
+    async fn new(node_id: NodeId, settings: settings::Settings) -> Result<Self>
     where
         Self: Sized,
     {
         let rate_limiter: token_bucket::TokenBucketLimiter =
-                token_bucket::TokenBucketLimiter::new(node_id, settings.rate_limit_settings());
+            token_bucket::TokenBucketLimiter::new(node_id, settings.rate_limit_settings());
         Ok(Self {
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
         })

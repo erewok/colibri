@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -9,8 +8,8 @@ use tracing::{debug, error, info};
 
 use super::{GossipCommand, GossipMessage, GossipPacket};
 use crate::error::{ColibriError, Result};
-use crate::limiters::distributed_bucket::{ClientDelta, DeltaState, DistributedBucketLimiter};
-use crate::node::{gossip, CheckCallsResponse, NodeId};
+use crate::limiters::distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter};
+use crate::node::{CheckCallsResponse, NodeId};
 use crate::settings;
 use crate::transport::UdpTransport;
 
@@ -45,9 +44,7 @@ impl std::fmt::Debug for GossipController {
 }
 
 impl GossipController {
-    pub async fn new(
-        settings: settings::Settings,
-    ) -> Result<Self> {
+    pub async fn new(settings: settings::Settings) -> Result<Self> {
         let node_id = settings.node_id();
         info!(
             "Created GossipNode with ID: {} (port: {})",
@@ -158,7 +155,9 @@ impl GossipController {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                vclock: self.rate_limiter.lock()
+                vclock: self
+                    .rate_limiter
+                    .lock()
                     .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))?
                     .get_latest_updated_vclock(),
                 response_addr: self.response_addr,
@@ -172,7 +171,7 @@ impl GossipController {
     }
 
     /// Collect buckets that have been updated and should be gossiped
-    async fn collect_gossip_updates(&self) -> Result<DeltaState> {
+    async fn collect_gossip_updates(&self) -> Result<Vec<DistributedBucketExternal>> {
         self.rate_limiter
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))
@@ -223,7 +222,7 @@ impl GossipController {
                 client_id,
                 resp_chan,
             } => {
-                let dstate: Option<ClientDelta>;
+                let dstate: Option<DistributedBucketExternal>;
                 // let mutable result with MutexGuard drop after this block
                 {
                     let mut result = self
@@ -247,7 +246,7 @@ impl GossipController {
                             self.node_id
                         );
                     }
-                    dstate = Some(result.client_delta_state_for_gossip(&client_id));
+                    dstate = result.client_delta_state_for_gossip(&client_id);
                 }
                 // Send immediate gossip update after rate limiting
                 if let Some(dstate) = dstate {
@@ -278,7 +277,7 @@ impl GossipController {
                     GossipMessage::DeltaStateSync {
                         updates,
                         sender_node_id,
-                        response_addr,
+                        response_addr: _,
                     } => {
                         // Don't process our own messages
                         if sender_node_id == self.node_id {
@@ -297,7 +296,7 @@ impl GossipController {
                     GossipMessage::StateResponse {
                         responding_node_id,
                         requested_data,
-                        response_addr,
+                        response_addr: _,
                     } => {
                         // Don't process our own messages
                         if responding_node_id == self.node_id {
@@ -305,14 +304,12 @@ impl GossipController {
                         }
 
                         debug!(
-                            "[{}] Processing StateResponse from node {} with {} updates",
-                            self.node_id,
-                            responding_node_id,
-                            requested_data.len()
+                            "[{}] Processing StateResponse from node {} for key {}",
+                            self.node_id, responding_node_id, requested_data.client_id
                         );
 
                         // Merge each incoming update
-                        self.merge_gossip_state(requested_data).await;
+                        self.merge_gossip_state(vec![requested_data]).await;
                     }
                     GossipMessage::Heartbeat {
                         node_id: heartbeat_node_id,
@@ -373,7 +370,7 @@ impl GossipController {
     }
 
     /// Merge incoming gossip state from other nodes (public interface)
-    pub async fn merge_gossip_state(&self, entries: DeltaState) {
+    pub async fn merge_gossip_state(&self, entries: Vec<DistributedBucketExternal>) {
         let node_id = self.node_id;
         let rate_limiter = Arc::clone(&self.rate_limiter);
         debug!(
@@ -385,57 +382,7 @@ impl GossipController {
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Failed to lock {}", e)))
             .map(|mut rl| rl.accept_delta_state(entries));
-
-    //     for (client_id, incoming_bucket) in entries.iter() {
-    //         debug!("[{}] Processing client: {}", node_id, client_id);
-    //         let maybe_bucket = rate_limiter
-    //             .lock()
-    //             .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))
-    //             .map(|rl| rl.get_bucket(client_id));
-    //         if let Ok(Some(mut current_entry)) = maybe_bucket {
-    //             debug!(
-    //                 "[{}] Found existing bucket for key: {}",
-    //                 node_id, client_id
-    //             );
-    //             // Try to merge with existing bucket
-    //             if current_entry.merge(incoming_bucket) {
-    //                 debug!(
-    //                     "[{}] Merged gossip update from client '{}': {} -> {} tokens, version {} -> {}",
-    //                     node_id,
-    //                     client_id,
-    //                     current_entry.tokens,
-    //                     incoming_bucket.tokens,
-    //                     current_entry.node_id,
-    //                     incoming_bucket.node_id
-    //                 );
-    //                 let _ = rate_limiter
-    //                     .lock()
-    //                     .map_err(|e| ColibriError::Concurrency(format!("Failed to lock {}", e)))
-    //                     .map(|mut rl| rl.set_bucket(client_id, current_entry));
-    //             } else {
-    //                 debug!(
-    //                     "[{}] Rejected gossip update for client '{}': incoming epoch {} <= current epoch {}",
-    //                     node_id, client_id, incoming_bucket.current_epoch, current_entry.current_epoch
-    //                 );
-    //             }
-    //         } else {
-    //             // No existing entry, accept incoming state
-    //             debug!(
-    //                 "[{}] Accepted new gossip state from client '{}': tokens={}, epoch={}",
-    //                 node_id, client_id, incoming_bucket.tokens, incoming_bucket.current_epoch
-    //             );
-    //             let _ = rate_limiter
-    //                 .lock()
-    //                 .map_err(|e| ColibriError::Concurrency(format!("Failed to lock {}", e)))
-    //                 .map(|mut rl| rl.set_bucket(client_id, incoming_bucket.clone()));
-    //             debug!(
-    //                 "[{}] Finished setting new bucket for client: {}",
-    //                 node_id, client_id
-    //             );
-    //         }
-    //     }
-    //     debug!("[{}] merge_gossip_state_static completed", node_id);
-    // }
+        debug!("[{}] merge_gossip_state_static completed", node_id);
     }
 }
 

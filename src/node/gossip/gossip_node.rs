@@ -60,10 +60,7 @@ impl std::fmt::Debug for GossipNode {
 
 #[async_trait]
 impl Node for GossipNode {
-    async fn new(
-        node_id: NodeId,
-        settings: settings::Settings,
-    ) -> Result<Self> {
+    async fn new(node_id: NodeId, settings: settings::Settings) -> Result<Self> {
         info!(
             "Created GossipNode with ID: {} (port: {})",
             node_id, settings.listen_port_udp
@@ -175,5 +172,4 @@ mod tests {
             rate_limit_interval_seconds: 60,
         }
     }
-
 }

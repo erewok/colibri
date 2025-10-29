@@ -64,7 +64,7 @@ pub struct Cli {
     // Mode of multi-node operation
     #[clap(
         long,
-        default_value = "gossip",
+        default_value = "single",
         env("COLIBRI_RUN_MODE"),
         help = "run-mode: 'gossip', 'hashring', or 'single'"
     )]

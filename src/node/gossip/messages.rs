@@ -6,14 +6,13 @@
 //! - INTERNAL cluster communication (UDP gossip): Uses bincode for compact binary format
 //! - EXTERNAL API communication (HTTP): Uses serde_json for human-readable format
 //!
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
 use crdts::VClock;
 use tokio::sync::oneshot;
 
-use crate::limiters::distributed_bucket::DeltaState;
+use crate::limiters::distributed_bucket::DistributedBucketExternal;
 use crate::node::{CheckCallsResponse, NodeId};
 
 /// Gossip message types for production delta-state protocol
@@ -23,7 +22,7 @@ pub enum GossipMessage {
     DeltaStateSync {
         response_addr: SocketAddr,
         #[bincode(with_serde)]
-        updates: DeltaState, // Only changed keys
+        updates: Vec<DistributedBucketExternal>, // Only changed keys
         #[bincode(with_serde)]
         sender_node_id: NodeId,
     },
@@ -42,7 +41,7 @@ pub enum GossipMessage {
         #[bincode(with_serde)]
         responding_node_id: NodeId,
         #[bincode(with_serde)]
-        requested_data: DeltaState,
+        requested_data: DistributedBucketExternal,
     },
 
     /// Heartbeat with version vectors for anti-entropy

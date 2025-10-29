@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 pub mod cluster;
 pub mod gossip;
@@ -28,10 +28,7 @@ pub struct CheckCallsResponse {
 
 #[async_trait]
 pub trait Node {
-    async fn new(
-        node_id: NodeId,
-        settings: settings::Settings,
-    ) -> Result<Self>
+    async fn new(node_id: NodeId, settings: settings::Settings) -> Result<Self>
     where
         Self: Sized;
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse>;
@@ -76,6 +73,10 @@ impl NodeWrapper {
                         node_id,
                         settings.topology.len(),
                         settings.topology
+                    );
+                    warn!(
+                        "[Node<{}>] Gossip mode is experimental and likely does not work correctly!",
+                        node_id
                     );
                     // Use GossipNode instead of broken MultiNode
                     let gossip_node = Arc::new(GossipNode::new(node_id, settings).await?);

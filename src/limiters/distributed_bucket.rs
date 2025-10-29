@@ -160,6 +160,7 @@ enum InternalPnCounterOp {
 struct InternalRequestEntry {
     op: InternalPnCounterOp,
     timestamp_ms: i64,
+    vclock: VClock<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
@@ -203,6 +204,15 @@ impl DistributedBucket {
         }
         // All entries are expired
         true
+    }
+    pub fn has_updates_since_last_gossip(&self) -> bool {
+        let entry = self.requests.iter().last();
+        if let Some(entry) = entry {
+            if entry.vclock > self.counter.vclock {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn expire_entries(&mut self, expiration_threshold_ms: i64) {
@@ -274,6 +284,7 @@ impl Bucket for DistributedBucket {
         self.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Fills(steps),
             timestamp_ms: self.last_call,
+            vclock: self.vclock(),
         });
         self.counter.inc_refills(self.counter.node_id, steps);
         self
@@ -286,6 +297,7 @@ impl Bucket for DistributedBucket {
             self.requests.push(InternalRequestEntry {
                 op: InternalPnCounterOp::Requests(1),
                 timestamp_ms: Utc::now().timestamp_millis(),
+                vclock: self.vclock(),
             });
             self.counter.dec_request(self.counter.node_id);
         }
@@ -407,7 +419,17 @@ impl DistributedBucketLimiter {
         // We break it into a vector in order to send smaller chunks.
         // If we do not broadcast and we have a lot of delta states to send
         // We may not end up gossiping everything we need to.
-        todo!()
+        self.node_counters
+            .pin()
+            .iter()
+            .filter_map(|(client_id, bucket)| {
+                if bucket.has_updates_since_last_gossip() {
+                    Some(bucket.to_external(client_id))
+                } else {
+                    None
+                }
+        })
+            .collect()
     }
     pub fn client_delta_state_for_gossip(
         &self,

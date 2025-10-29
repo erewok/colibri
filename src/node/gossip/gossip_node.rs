@@ -128,7 +128,7 @@ impl Node for GossipNode {
             .map_err(|e| ColibriError::Transport(format!("Failed checking rate limit {}", e)))?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
-                "Failed checking rate limit {}",
+                "Failed rate limiting {}",
                 e
             )))
         })
@@ -139,7 +139,7 @@ impl Node for GossipNode {
         self.gossip_command_tx
             .send(GossipCommand::ExpireKeys)
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed checking rate limit {}", e)))?;
+            .map_err(|e| ColibriError::Transport(format!("Failed expiring keys {}", e)))?;
         Ok(())
     }
 }

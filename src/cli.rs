@@ -10,7 +10,7 @@ pub struct Cli {
     // Server listen address
     #[clap(
         long,
-        default_value = "0.0.0.0",
+        default_value = "127.0.0.1",
         env("COLIBRI_LISTEN_ADDRESS"),
         help = "IP Address to listen on"
     )]

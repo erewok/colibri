@@ -76,10 +76,14 @@ pub async fn local_rate_limit(
         Ok(mut rate_limiter) => {
             let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
             if let Some(calls_remaining) = calls_left {
-                Ok(Some(CheckCallsResponse {
-                    client_id,
-                    calls_remaining,
-                }))
+                if calls_remaining == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(CheckCallsResponse {
+                        client_id,
+                        calls_remaining,
+                    }))
+                }
             } else {
                 Ok(None)
             }

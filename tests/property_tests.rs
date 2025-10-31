@@ -1,4 +1,3 @@
-use colibri::limiters::token_bucket::TokenBucket;
 use proptest::prelude::*;
 
 use colibri::limiters::token_bucket::TokenBucketLimiter;
@@ -13,6 +12,7 @@ proptest! {
         interval in 1u32..60
     ) {
         let settings = RateLimitSettings {
+            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: max_calls,
             rate_limit_interval_seconds: interval,
         };
@@ -36,6 +36,7 @@ proptest! {
         max_calls in 1u32..50
     ) {
         let settings = RateLimitSettings {
+            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: max_calls,
             rate_limit_interval_seconds: 1,
         };

@@ -148,6 +148,7 @@ mod tests {
 
     fn get_settings() -> settings::RateLimitSettings {
         settings::RateLimitSettings {
+            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
         }

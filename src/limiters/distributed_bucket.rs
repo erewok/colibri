@@ -289,7 +289,9 @@ impl Bucket for DistributedBucket {
         }
         // Tokens are added at the token rate,
         // but for distributed bucket, we only add whole tokens
-        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms);
+        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds()
+            * f64::from(diff_ms)
+            / rate_limit_settings.cluster_participant_count as f64;
         // Max calls is limited to
         let steps = tokens_to_add.trunc() as u64;
         debug!(

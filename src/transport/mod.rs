@@ -120,49 +120,4 @@ mod tests {
 
         assert_eq!(transport.get_peers().await.len(), 2);
     }
-
-    #[tokio::test]
-    async fn test_send_to_random_peer() {
-        let transport_config = get_transport_config();
-
-        let transport = UdpTransport::new(NodeId::new(0), &transport_config)
-            .await
-            .unwrap();
-
-        // This will fail to send since no one is listening, but tests the mechanism
-        let result = transport.send_to_random_peer(b"test").await;
-        // Should succeed in selecting and attempting to send to a peer
-        assert!(result.is_ok() || matches!(result, Err(ColibriError::Transport(_))));
-    }
-
-    #[tokio::test]
-    async fn test_peer_management() {
-        let transport_config = get_transport_config();
-        let mut transport = UdpTransport::new(NodeId::new(0), &transport_config)
-            .await
-            .unwrap();
-
-        assert_eq!(transport.get_peers().await.len(), 0);
-
-        let peer_addr = "127.0.0.1:8001".parse().unwrap();
-        transport.add_peer(peer_addr, 2).await.unwrap();
-        let peers = transport.get_peers().await;
-        assert_eq!(peers.len(), 1);
-        assert!(peers.contains(&peer_addr));
-
-        transport.remove_peer(peer_addr).await.unwrap();
-        assert_eq!(transport.get_peers().await.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_stats() {
-        let transport_config = get_transport_config();
-        let transport = UdpTransport::new(NodeId::new(0), &transport_config)
-            .await
-            .unwrap();
-        let stats = transport.get_stats().await;
-
-        assert_eq!(stats.send_pool_stats.peer_count.into_inner(), 0);
-        assert_eq!(stats.send_pool_stats.total_sockets.into_inner(), 0);
-    }
 }

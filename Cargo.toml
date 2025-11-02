@@ -1,6 +1,6 @@
 [package]
 name = "colibri"
-version = "0.5.0-alpha.1"
+version = "0.5.0-dev.1"
 description = "Distributed rate-limiting as a service"
 authors = ["Erik Aker <eraker@gmail.com>"]
 homepage = "https://github.com/erewok/colibri"

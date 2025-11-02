@@ -116,7 +116,10 @@ impl TokenBucketLimiter {
     }
 
     pub fn new_bucket(&self) -> TokenBucket {
-        TokenBucket::new(self.node_id)
+        let mut bucket = TokenBucket::new(self.node_id);
+        // Start with full capacity for new buckets
+        bucket.tokens = self.settings.rate_limit_max_calls_allowed as f64;
+        bucket
     }
 
     // It's possible that updates happen around this object
@@ -154,28 +157,39 @@ impl TokenBucketLimiter {
     }
 
     /// Check rate limit and decrement if call is allowed
-    /// None -> not allowed
+    /// Returns Some(remaining_tokens) if allowed, None if rate limited
     pub fn limit_calls_for_client(&mut self, key: String) -> Option<u32> {
-        let limit_checker = |bucket: &TokenBucket| {
-            let mut bucket = bucket.to_owned();
-            // Add more tokens at token bucket rate
-            bucket.add_tokens_to_bucket(&self.settings);
-            if bucket.check_if_allowed() {
-                // We only count this call if client is allowed to proceed
-                bucket.decrement();
-                bucket
-            } else {
-                // This result means no more calls allowed
-                bucket
-            }
-        };
-        // Clobber entry in cache for this bucket if update
-        self.cache
-            .pin()
-            .update_or_insert_with(key.clone(), limit_checker, || self.new_bucket());
+        if let Some(bucket) = self.cache.pin().get(&key) {
+            // Update existing bucket
+            let mut updated_bucket = bucket.clone();
+            updated_bucket.add_tokens_to_bucket(&self.settings);
 
-        // Return result showing this call allowed and tokens remaining
-        self.cache.pin().get(&key).map(|b| b.tokens_to_u32())
+            if updated_bucket.check_if_allowed() {
+                // Call is allowed - decrement and update
+                updated_bucket.decrement();
+                let remaining = updated_bucket.tokens_to_u32();
+                self.cache.pin().insert(key, updated_bucket);
+                Some(remaining)
+            } else {
+                // Call not allowed - update bucket state but don't decrement
+                self.cache.pin().insert(key, updated_bucket);
+                None
+            }
+        } else {
+            // Create new bucket - first call is always allowed
+            let mut new_bucket = self.new_bucket();
+            new_bucket.decrement(); // Use one token
+                                    // if negative here, we'll have an unreliable value.
+                                    // so we need to safe-check *first* before returning `remaining`
+            let is_allowed = new_bucket.check_if_allowed();
+            let remaining = Some(new_bucket.tokens_to_u32());
+            self.cache.pin().insert(key, new_bucket);
+            if is_allowed {
+                remaining
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -234,19 +248,26 @@ mod tests {
             rate_limit_interval_seconds: 1,
         };
 
+        // Consume all tokens first
         for _n in 0..5 {
             assert!(bucket.tokens > 0.0);
-            assert!(bucket.tokens < 6.0);
-            bucket.add_tokens_to_bucket(&settings);
+            bucket.decrement();
         }
-        // exhausted tokens now
-        assert!((1.0 - bucket.tokens).is_sign_negative());
-        // sleep and expire
+        // tokens should be exhausted now
+        assert!(bucket.tokens <= 0.0);
+        assert!(!bucket.check_if_allowed());
+
+        // sleep and let tokens refill
         time::sleep(Duration::from_secs(2)).await;
 
-        assert!(bucket.tokens > 0.0);
-        assert!(bucket.tokens < 6.0);
+        // Set last_call to trigger token addition
+        bucket.last_call = Utc::now().timestamp_millis() - 1000; // 1 second ago
         bucket.add_tokens_to_bucket(&settings);
+
+        // Should have tokens again after refill
+        assert!(bucket.tokens > 0.0);
+        assert!(bucket.tokens <= 5.0);
+        assert!(bucket.check_if_allowed());
     }
 
     #[test]
@@ -513,11 +534,17 @@ mod tests {
         let mut limiter: TokenBucketLimiter =
             TokenBucketLimiter::new(NodeId::new(1), zero_settings);
 
+        // default is 0
+        assert_eq!(limiter.check_calls_remaining_for_client("test_client"), 0);
         // Should immediately deny any requests
         assert!(limiter
             .limit_calls_for_client("test_client".to_string())
             .is_none());
         assert_eq!(limiter.check_calls_remaining_for_client("test_client"), 0);
+        // calculating refills should also result in 0 remaining
+        assert!(limiter
+            .limit_calls_for_client("test_client".to_string())
+            .is_none());
     }
 
     #[test]

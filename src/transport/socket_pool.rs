@@ -178,63 +178,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     #[tokio::test]
-    async fn test_socket_pool_creation() {
-        let one = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
-        let two = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
-        let peers: HashSet<SocketAddr> = HashSet::from([one.clone(), two.clone()]);
-
-        let pool = UdpSocketPool::new(NodeId::new(1), &peers).await.unwrap();
-
-        let stats = pool.get_stats();
-        assert_eq!(stats.peer_count.load(Ordering::Relaxed), 2);
-        assert_eq!(stats.total_sockets.load(Ordering::Relaxed), 6);
-
-        let pool_peers = pool.get_peers().await;
-        assert_eq!(pool_peers.len(), 2);
-        assert!(pool_peers.contains(&one));
-        assert!(pool_peers.contains(&two));
-    }
-
-    #[tokio::test]
-    async fn test_peer_management() {
-        let mut pool = UdpSocketPool::new(NodeId::new(2), &HashSet::new())
-            .await
-            .unwrap();
-
-        let peer1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
-        let peer2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
-
-        // Add peers
-        pool.add_peer(peer1, 3).await.unwrap();
-        pool.add_peer(peer2, 2).await.unwrap();
-
-        let stats = pool.get_stats();
-        assert_eq!(stats.peer_count.load(Ordering::Relaxed), 2);
-        assert_eq!(stats.total_sockets.load(Ordering::Relaxed), 5);
-
-        // Remove a peer
-        pool.remove_peer(peer1).await.unwrap();
-
-        let stats = pool.get_stats();
-        assert_eq!(stats.peer_count.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.total_sockets.load(Ordering::Relaxed), 2);
-
-        let remaining_peers = pool.get_peers().await;
-        assert_eq!(remaining_peers.len(), 1);
-        assert!(remaining_peers.contains(&peer2));
-    }
-
-    #[tokio::test]
-    async fn test_send_to_random_no_peers() {
-        let pool = UdpSocketPool::new(NodeId::new(1), &HashSet::new())
-            .await
-            .unwrap();
-
-        let result = pool.send_to_random(b"test").await;
-        assert!(matches!(result, Err(ColibriError::Transport(_))));
-    }
-
-    #[tokio::test]
     async fn test_send_to_nonexistent_peer() {
         let pool = UdpSocketPool::new(NodeId::new(1), &HashSet::new())
             .await

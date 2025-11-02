@@ -53,11 +53,9 @@ impl NodeWrapper {
             )))
         } else {
             match settings.run_mode {
-                settings::RunMode::Single => {
-                    Ok(Self::Single(Arc::new(
-                        SingleNode::new(node_id, settings).await?,
-                    )))
-                }
+                settings::RunMode::Single => Ok(Self::Single(Arc::new(
+                    SingleNode::new(node_id, settings).await?,
+                ))),
                 settings::RunMode::Gossip => {
                     warn!(
                         "[Node<{}>] Gossip mode is experimental and likely does not work correctly!",

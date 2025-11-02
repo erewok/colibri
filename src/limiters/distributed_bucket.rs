@@ -303,8 +303,7 @@ impl Bucket for DistributedBucket {
         }
         // Tokens are added at the token rate,
         // but for distributed bucket, we only add whole tokens
-        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds()
-            * f64::from(diff_ms)
+        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms)
             / rate_limit_settings.cluster_participant_count as f64;
         // Max calls is limited to
         let steps = tokens_to_add.trunc() as u64;
@@ -569,7 +568,8 @@ mod tests {
         // Decrement requests (restore tokens, like undoing a request)
         counter.dec_request(node_id);
         assert_eq!(counter.tokens(), BigInt::from(5)); // 4 + 1
-    }    #[test]
+    }
+    #[test]
     fn test_distributed_request_counter_merge() {
         let node1 = NodeId::new(1);
         let node2 = NodeId::new(2);
@@ -675,7 +675,7 @@ mod tests {
         let node_id = NodeId::new(1);
         let mut bucket = DistributedBucket::new(node_id);
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1, // Use 1 to make calculation easier
+            cluster_participant_count: 1,       // Use 1 to make calculation easier
             rate_limit_max_calls_allowed: 1000, // Higher rate to ensure tokens are added
             rate_limit_interval_seconds: 1,
         };
@@ -747,9 +747,9 @@ mod tests {
         assert!(!bucket.can_expire(1000));
 
         // Clear recent entries and keep only old ones
-        bucket.requests.retain(|entry| {
-            Utc::now().timestamp_millis() - entry.timestamp_ms > 1500
-        });
+        bucket
+            .requests
+            .retain(|entry| Utc::now().timestamp_millis() - entry.timestamp_ms > 1500);
 
         // Now should be able to expire
         assert!(bucket.can_expire(1000));

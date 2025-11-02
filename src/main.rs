@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use clap::Parser;
 use tokio::time::{self, Duration};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use colibri::api;
@@ -23,17 +23,18 @@ async fn main() -> Result<()> {
 
     // Parse args and env vars
     let args = cli::Cli::parse();
+    let settings = args.into_settings();
 
     // Socket server listen address setup
-    let listen_address: IpAddr = args
+    let listen_address: IpAddr = settings
         .listen_address
         .parse::<IpAddr>()
         .expect("Invalid ip address");
-    let socket_address = SocketAddr::from((listen_address, args.listen_port));
+    let socket_address = SocketAddr::from((listen_address, settings.listen_port_api));
     let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();
 
     // Build Axum Router and get shared state
-    let (api, app_state) = api::api(args).await?;
+    let (api, app_state) = api::api(settings).await?;
     let state_for_expiry = app_state.clone();
 
     tokio::spawn(async move {
@@ -42,7 +43,10 @@ async fn main() -> Result<()> {
         let mut interval = time::interval(Duration::from_millis(KEY_EXPIRY_INTERVAL));
         loop {
             interval.tick().await;
-            state_for_expiry.expire_keys();
+            let _ = state_for_expiry
+                .expire_keys()
+                .await
+                .map_err(|e| error!("Failed to expire keys {}", e));
         }
     });
 

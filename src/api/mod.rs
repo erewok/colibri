@@ -10,12 +10,12 @@ use tokio::time::Duration;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 
-use crate::cli;
 use crate::error::Result;
 use crate::node;
+use crate::settings;
 
 /// Build an API with a rate-limiter and a strategy
-pub async fn api(settings: cli::Cli) -> Result<(Router, node::NodeWrapper)> {
+pub async fn api(settings: settings::Settings) -> Result<(Router, node::NodeWrapper)> {
     // App state will automatically check limits or ask other nodes
     let app_state = node::NodeWrapper::new(settings).await?;
 

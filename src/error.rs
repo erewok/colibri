@@ -27,6 +27,9 @@ pub enum ColibriError {
     /// System I/O errors
     Io(std::io::Error),
 
+    /// Transport layer errors
+    Transport(String),
+
     /// Serialization/deserialization errors
     Serialization(SerializationError),
 
@@ -37,9 +40,6 @@ pub enum ColibriError {
 /// Gossip protocol specific errors
 #[derive(Debug)]
 pub enum GossipError {
-    /// Transport layer errors
-    Transport(String),
-
     /// Message parsing or validation errors
     Message(String),
 
@@ -59,7 +59,7 @@ pub enum SerializationError {
     /// JSON serialization/deserialization errors
     Json(serde_json::Error),
 
-    /// Binary decode/encode errors
+    /// Binary serialization/deserialization errors
     BinaryDecode(bincode::error::DecodeError),
     BinaryEncode(bincode::error::EncodeError),
 }
@@ -73,6 +73,7 @@ impl fmt::Display for ColibriError {
             ColibriError::Api(msg) => write!(f, "API error: {}", msg),
             ColibriError::Gossip(err) => write!(f, "Gossip error: {}", err),
             ColibriError::Io(err) => write!(f, "I/O error: {}", err),
+            ColibriError::Transport(msg) => write!(f, "Transport error: {}", msg),
             ColibriError::Serialization(err) => write!(f, "Serialization error: {}", err),
             ColibriError::Concurrency(msg) => write!(f, "Concurrency error: {}", msg),
         }
@@ -82,7 +83,6 @@ impl fmt::Display for ColibriError {
 impl fmt::Display for GossipError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GossipError::Transport(msg) => write!(f, "Transport: {}", msg),
             GossipError::Message(msg) => write!(f, "Message: {}", msg),
             GossipError::NodeId(msg) => write!(f, "Node ID: {}", msg),
             GossipError::VectorClock(msg) => write!(f, "Vector clock: {}", msg),
@@ -154,6 +154,10 @@ impl IntoResponse for ColibriError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Internal server error: {}", io_err),
             ),
+            ColibriError::Transport(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Transport error: {}", msg),
+            ),
             ColibriError::Serialization(ser_err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Data processing error: {}", ser_err),
@@ -176,6 +180,7 @@ impl IntoResponse for ColibriError {
                     ColibriError::Api(_) => "api_error",
                     ColibriError::Gossip(_) => "gossip_error",
                     ColibriError::Io(_) => "io_error",
+                    ColibriError::Transport(_) => "transport_error",
                     ColibriError::Serialization(_) => "serialization_error",
                     ColibriError::Concurrency(_) => "concurrency_error",
                 }
@@ -196,6 +201,7 @@ impl ColibriError {
             ColibriError::Api(_) => StatusCode::BAD_REQUEST,
             ColibriError::Gossip(_) => StatusCode::SERVICE_UNAVAILABLE,
             ColibriError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ColibriError::Transport(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ColibriError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ColibriError::Concurrency(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -216,6 +222,7 @@ impl ColibriError {
                 "Service temporarily unavailable due to cluster issues.".to_string()
             }
             ColibriError::Io(_) => "Internal server error. Please try again later.".to_string(),
+            ColibriError::Transport(_) => "Transport error. Please try again later.".to_string(),
             ColibriError::Serialization(_) => {
                 "Data processing error. Please check your request format.".to_string()
             }
@@ -234,6 +241,7 @@ impl ColibriError {
             ColibriError::Api(_) => "api_error",
             ColibriError::Gossip(_) => "gossip_error",
             ColibriError::Io(_) => "io_error",
+            ColibriError::Transport(_) => "transport_error",
             ColibriError::Serialization(_) => "serialization_error",
             ColibriError::Concurrency(_) => "concurrency_error",
         }

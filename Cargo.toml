@@ -1,6 +1,6 @@
 [package]
 name = "colibri"
-version = "0.4.1"
+version = "0.5.0-dev.1"
 description = "Distributed rate-limiting as a service"
 authors = ["Erik Aker <eraker@gmail.com>"]
 homepage = "https://github.com/erewok/colibri"
@@ -13,11 +13,17 @@ anyhow = "1.0.100"
 async-trait = "0.1.89"
 axum = { version = "0.8.6", features = ["macros"] }
 bincode = { version = "2.0.1", features = ["serde"] }
+bytes = "1.4.0"
 chrono = { version = "0.4.42", features = ["clock"] }
-clap = { version = "4.5.49", features = ["derive", "env"] }
-dashmap = "6.1.0"
-hostname = "0.4.1"
-parking_lot = "0.12.5"
+clap = { version = "4.5.50", features = ["derive", "env"] }
+crdts = "7.3.2"
+gxhash = "3.4"
+hostname = "0.4"
+indexmap = "2.12.0"
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
+papaya = "0.2.3"
+rand = "0.9.2"
 reqwest = { version = "0.12.24", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -42,9 +48,12 @@ tower-http = { version = "0.6.6", features = [
 ] }
 tower-layer = "0.3.2"
 tower-service = "0.3.2"
+thiserror = "2.0.17"
+url = "2.5.7"
 tracing = "0.1.41"
 tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+console-subscriber = "0.4.1"
 
 [dev-dependencies]
 criterion = "0.7"
@@ -53,3 +62,7 @@ proptest = "1.4"
 rand = "0.9.2"
 tempfile = "3.23.0"
 tokio-test = "0.4"
+
+# [[example]]
+# name = "transport_demo"
+# path = "examples/transport_demo.rs"

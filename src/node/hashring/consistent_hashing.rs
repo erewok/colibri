@@ -1,5 +1,6 @@
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+use gxhash::GxHasher;
 
 pub const MAGIC_CONSTANT: u64 = 2862933555777941757;
 /// Jump consistent hashing implementation
@@ -8,20 +9,24 @@ pub const MAGIC_CONSTANT: u64 = 2862933555777941757;
 ///
 /// This implementation based on the paper.
 pub fn jump_consistent_hash(key: &str, number_of_buckets: u32) -> u32 {
-    let mut hasher: DefaultHasher = Default::default();
+    // Problematically, we have to hash the key string into a u64 first
+    // This may be a problem because different strings may collide into the same u64
+    // but we mostly need a *stable hash* for consistent hashing to work properly.
+    let mut hasher: GxHasher = GxHasher::default();
     key.hash(&mut hasher);
     let key_as_u64: u64 = hasher.finish();
+    let bucket_num = number_of_buckets as i64;
 
-    let mut b: u32 = 1;
-    let mut j: u32 = 0;
+    let mut b: i64 = -1;
+    let mut j: i64 = 0;
     let mut _key: u64 = key_as_u64;
-    while j < number_of_buckets {
+
+    while j < bucket_num {
         b = j;
-        _key = _key.wrapping_mul(MAGIC_CONSTANT) + 1;
-        let shiftkey = (_key >> 33) as u32;
-        j = (b + 1) * ((1 << 31) / (shiftkey + 1));
+        _key = _key.wrapping_mul(MAGIC_CONSTANT).wrapping_add(1);
+        j = ((b + 1) as f64 * ((1i64 << 31) as f64 / ((_key >> 33) + 1) as f64)) as i64;
     }
-    b
+    b as u32
 }
 
 /// Return bucket number to left and right of the selected one

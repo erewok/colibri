@@ -11,6 +11,7 @@ cargo run -- \
     --rate-limit-max-calls-allowed 4 \
     --rate-limit-interval-seconds 3 \
     --listen-port 8001 \
+    --topology "http://127.0.0.1:8001" \
     --topology "http://127.0.0.1:8002" \
     --topology "http://127.0.0.1:8003" &
 NODE1_PID=$!
@@ -22,6 +23,7 @@ cargo run -- \
     --rate-limit-interval-seconds 3 \
     --listen-port 8002 \
     --topology "http://127.0.0.1:8001" \
+    --topology "http://127.0.0.1:8002" \
     --topology "http://127.0.0.1:8003" &
 NODE2_PID=$!
 
@@ -32,10 +34,11 @@ cargo run -- \
     --rate-limit-interval-seconds 3 \
     --listen-port 8003 \
     --topology "http://127.0.0.1:8001" \
-    --topology "http://127.0.0.1:8002" &
+    --topology "http://127.0.0.1:8002" \
+    --topology "http://127.0.0.1:8003" &
 NODE3_PID=$!
 
-sleep 10
+sleep 7
 
 echo "All ${mode} nodes started. PIDs: $NODE1_PID, $NODE2_PID, $NODE3_PID"
 echo "Test with: curl -X POST http://localhost:8001/rl/test-client"
@@ -46,18 +49,18 @@ res1=$(curl -iX POST http://localhost:8001/rl/test-client)
 echo "Response: $res1"
 sleep 1
 
-# res2=$(curl -iX POST http://localhost:8002/rl/test-client)
-# echo "Response: $res2"
+res2=$(curl -iX POST http://localhost:8002/rl/test-client)
+echo "Response: $res2"
 
-# res3=$(curl -iX POST http://localhost:8003/rl/test-client)
-# echo "Response: $res3... sleeping to reset rate limit interval"
-# sleep 4 # Wait for rate limit interval to reset
+res3=$(curl -iX POST http://localhost:8003/rl/test-client)
+echo "Response: $res3... sleeping to reset rate limit interval"
+sleep 4 # Wait for rate limit interval to reset
 
-# res4=$(curl -iX POST http://localhost:8002/rl/test-client)
-# echo "Response: $res4"
+res4=$(curl -iX POST http://localhost:8002/rl/test-client)
+echo "Response: $res4"
 
-# res5=$(curl -iX POST http://localhost:8003/rl/test-client)
-# echo "Response: $res5"
+res5=$(curl -iX POST http://localhost:8003/rl/test-client)
+echo "Response: $res5"
 
 # Wait for interrupt and cleanup
 trap "echo 'Stopping all nodes...'; kill $NODE1_PID $NODE2_PID $NODE3_PID 2>/dev/null || true; exit 0" INT

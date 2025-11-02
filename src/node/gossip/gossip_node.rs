@@ -61,9 +61,13 @@ impl std::fmt::Debug for GossipNode {
 #[async_trait]
 impl Node for GossipNode {
     async fn new(node_id: NodeId, settings: settings::Settings) -> Result<Self> {
+        let listen_api = format!("{}:{}", settings.listen_address, settings.listen_port_api);
         info!(
-            "Created GossipNode with ID: {} (port: {})",
-            node_id, settings.listen_port_udp
+            "[Node<{}>] Gossip node starting at {} in gossip mode with {} other nodes: {:?}",
+            node_id,
+            listen_api,
+            settings.topology.len(),
+            settings.topology
         );
 
         // The the receive channel is only used in this loop

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::warn;
 
 pub mod cluster;
 pub mod gossip;
@@ -46,37 +46,19 @@ pub enum NodeWrapper {
 impl NodeWrapper {
     pub async fn new(settings: settings::Settings) -> Result<Self> {
         let node_id = settings.node_id();
-        let listen_api = format!("{}:{}", settings.listen_address, settings.listen_port_api);
-
+        // A rate_limiter holds all rate-limiting data in memory: no data persisted to disk!
         if settings.topology.is_empty() {
-            info!(
-                "[Node<{}>] Starting at {} in single-node mode (ignoring specified topology)",
-                node_id, listen_api
-            );
-            // A rate_limiter holds rate-limiting data in memory
-
             Ok(Self::Single(Arc::new(
                 SingleNode::new(node_id, settings).await?,
             )))
         } else {
             match settings.run_mode {
                 settings::RunMode::Single => {
-                    info!(
-                        "[Node<{}>] Starting at {} in single-node mode (ignoring specified topology)",
-                        node_id, listen_api
-                    );
                     Ok(Self::Single(Arc::new(
                         SingleNode::new(node_id, settings).await?,
                     )))
                 }
                 settings::RunMode::Gossip => {
-                    info!(
-                        "[Node<{}>] Starting at {} in gossip mode with {} other nodes: {:?}",
-                        node_id,
-                        listen_api,
-                        settings.topology.len(),
-                        settings.topology
-                    );
                     warn!(
                         "[Node<{}>] Gossip mode is experimental and likely does not work correctly!",
                         node_id
@@ -86,14 +68,6 @@ impl NodeWrapper {
                     Ok(Self::Gossip(gossip_node))
                 }
                 settings::RunMode::Hashring => {
-                    info!(
-                        "[Node<{}>] Starting at {} in hashring mode on with {} other nodes: {:?}",
-                        node_id,
-                        listen_api,
-                        settings.topology.len(),
-                        settings.topology
-                    );
-
                     // Build hashring node
                     let hashring_node = HashringNode::new(node_id, settings).await?;
                     Ok(Self::Hashring(Arc::new(hashring_node)))

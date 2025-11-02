@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{error, info, warn};
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::token_bucket;
@@ -23,7 +23,7 @@ pub struct HashringNode {
     pub node_id: NodeId,
     bucket: u32,
     number_of_buckets: u32,
-    listen_address: String,
+    listen_api: String,
     pub topology: HashMap<u32, String>,
     // replication_factor: ReplicationFactor,
     pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
@@ -31,42 +31,35 @@ pub struct HashringNode {
 
 #[async_trait]
 impl Node for HashringNode {
-    async fn new(node_id: NodeId, mut settings: settings::Settings) -> Result<Self> {
+    async fn new(node_id: NodeId, settings: settings::Settings) -> Result<Self> {
         let rl_settings = settings.rate_limit_settings();
         let rate_limiter: token_bucket::TokenBucketLimiter =
             token_bucket::TokenBucketLimiter::new(node_id, rl_settings);
 
         let listen_api = format!("{}:{}", settings.listen_address, settings.listen_port_api);
-        let listen_address = format!(
-            "http://{}:{}",
-            settings.listen_address, settings.listen_port_api
-        );
-        if !settings
+
+        // get the bucket count to use in consistent hashing calls (assuming self is present in topology)
+        let number_of_buckets = settings.topology.len().try_into()?;
+
+        // Use consistent hashing to assign buckets to nodes
+        // Every node must use the same identifiers for other nodes.
+        // This node must be a listed member of the topology.
+        let topology = settings
             .topology
             .iter()
-            .any(|addr| addr.contains(&listen_api))
-        {
-            warn!(
-                "[Node<{}>] Our listen address {} is not in the specified topology {:?}. Adding it.",
-                node_id, listen_address, settings.topology
-            );
-            settings.topology.insert(listen_address.clone());
-        }
-
-        let mut sorted_hosts: Vec<&String> = settings.topology.iter().collect();
-        sorted_hosts.sort();
-        let topology = sorted_hosts
-            .iter()
-            .enumerate()
-            .map(|(idx, host)| (idx as u32, host.to_string()))
+            .map(|host| {
+                (
+                    consistent_hashing::jump_consistent_hash(host.as_str(), number_of_buckets),
+                    host.to_string(),
+                )
+            })
             .collect::<HashMap<u32, String>>();
 
-        // find the bucket for this node
-        let number_of_buckets = settings.topology.len().try_into()?;
-        let bucket = topology
+        // find the bucket ID that consistently maps to *this* node's listen address
+        // fail early if this node's listen address is not in the topology
+        let bucket: u32 = topology
             .iter()
             .find_map(|(bucket, host)| {
-                debug!("Comparing host {} with listen_api {}", host, listen_api);
                 if host.contains(&listen_api) {
                     Some(*bucket)
                 } else {
@@ -74,20 +67,25 @@ impl Node for HashringNode {
                 }
             })
             .ok_or_else(|| {
-                ColibriError::Transport(format!(
-                    "Node address {} not found in topology {:?}",
-                    listen_api, topology
+                error!(
+                    "[Node<{}>] Critical failure: Listen address for this node {} not found in topology! {:?}",
+                    node_id, listen_api, settings.topology
+                );
+                ColibriError::Config(format!(
+                    "Listen address {} not found in topology",
+                    listen_api
                 ))
             })?;
+
         info!(
-            "[Node<{}>] Assigned to bucket {} out of {} buckets with topology {:?}",
-            node_id, bucket, number_of_buckets, topology
+            "[Node<{}>] Hashring node starting at {} with bucket {} out of {} buckets and topology {:?}",
+            node_id, listen_api, bucket, number_of_buckets, topology
         );
         Ok(Self {
             node_id,
             bucket,
             number_of_buckets,
-            listen_address,
+            listen_api,
             topology,
             // replication_factor: ReplicationFactor,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
@@ -106,9 +104,9 @@ impl Node for HashringNode {
             // Use bucket to select into the topology HashMap
             match self.topology.get(&bucket) {
                 Some(host) => {
-                    if host.contains(&self.listen_address) {
+                    if host.contains(&self.listen_api) {
                         // shouldn't happen, but just in case
-                        warn!("Host {} from bucket {} matches our own listen address (but not self.bucket? {}), using local check_limit", host, bucket, self.bucket);
+                        warn!("Host {} from bucket {} matches our own listen API (but not self.bucket? {}), using local check_limit", host, bucket, self.bucket);
                         return local_check_limit(client_id, self.rate_limiter.clone()).await;
                     }
                     let url = format!("{}/rl-check/{}", host, client_id);
@@ -138,9 +136,9 @@ impl Node for HashringNode {
             info!("Requesting data from bucket {}", bucket);
             match self.topology.get(&bucket) {
                 Some(host) => {
-                    if host.contains(&self.listen_address) {
+                    if host.contains(&self.listen_api) {
                         // shouldn't happen, but just in case
-                        warn!("Host {} from bucket {} matches our own listen address (but not self.bucket? {}), using local check_limit", host, bucket, self.bucket);
+                        warn!("Host {} from bucket {} matches our own listen API (but not self.bucket? {}), using local check_limit", host, bucket, self.bucket);
                         return local_rate_limit(client_id, self.rate_limiter.clone()).await;
                     }
                     let url = format!("{}/rl/{}", host, client_id);

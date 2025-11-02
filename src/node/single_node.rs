@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tracing::info;
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::token_bucket;
@@ -18,6 +19,11 @@ impl Node for SingleNode {
     where
         Self: Sized,
     {
+        let listen_api = format!("{}:{}", settings.listen_address, settings.listen_port_api);
+        info!(
+            "[Node<{}>] Starting at {} in single-node mode",
+            node_id, listen_api
+        );
         let rate_limiter: token_bucket::TokenBucketLimiter =
             token_bucket::TokenBucketLimiter::new(node_id, settings.rate_limit_settings());
         Ok(Self {

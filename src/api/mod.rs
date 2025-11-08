@@ -12,12 +12,10 @@ use tower_http::trace::TraceLayer;
 
 use crate::error::Result;
 use crate::node;
-use crate::settings;
 
 /// Build an API with a rate-limiter and a strategy
-pub async fn api(settings: settings::Settings) -> Result<(Router, node::NodeWrapper)> {
+pub async fn api(rl_node: node::NodeWrapper) -> Result<Router> {
     // App state will automatically check limits or ask other nodes
-    let app_state = node::NodeWrapper::new(settings).await?;
 
     // Endpoints
     let api = Router::new()
@@ -38,9 +36,9 @@ pub async fn api(settings: settings::Settings) -> Result<(Router, node::NodeWrap
                 .timeout(Duration::from_secs(10)),
         )
         .layer(TraceLayer::new_for_http())
-        .with_state(app_state.clone());
+        .with_state(rl_node);
 
-    Ok((api, app_state))
+    Ok(api)
 }
 
 async fn handle_error(error: BoxError) -> impl IntoResponse {

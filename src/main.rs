@@ -8,6 +8,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use colibri::api;
 use colibri::cli;
 use colibri::error::Result;
+use colibri::node;
 
 const KEY_EXPIRY_INTERVAL: u64 = 500;
 
@@ -35,9 +36,11 @@ async fn main() -> Result<()> {
         .await
         .expect("Failed to bind TCP listener");
 
+    // Our rate-limit node will function as app-state
+
+    let rl_node = node::NodeWrapper::new(settings).await?;
     // Build Axum Router and get shared state
-    let (api, app_state) = api::api(settings).await?;
-    let state_for_expiry = app_state.clone();
+    let api = api::api(rl_node.clone()).await?;
 
     tokio::spawn(async move {
         // Start Cache Expire Request Loop
@@ -45,7 +48,7 @@ async fn main() -> Result<()> {
         let mut interval = time::interval(Duration::from_millis(KEY_EXPIRY_INTERVAL));
         loop {
             interval.tick().await;
-            let _ = state_for_expiry
+            let _ = rl_node
                 .expire_keys()
                 .await
                 .map_err(|e| error!("Failed to expire keys {}", e));

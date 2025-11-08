@@ -31,7 +31,9 @@ async fn main() -> Result<()> {
         .parse::<IpAddr>()
         .expect("Invalid ip address");
     let socket_address = SocketAddr::from((listen_address, settings.listen_port_api));
-    let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(socket_address)
+        .await
+        .expect("Failed to bind TCP listener");
 
     // Build Axum Router and get shared state
     let (api, app_state) = api::api(settings).await?;

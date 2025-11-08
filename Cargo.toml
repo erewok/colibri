@@ -1,6 +1,6 @@
 [package]
 name = "colibri"
-version = "0.5.0-dev.1"
+version = "0.5.0-dev.2"
 description = "Distributed rate-limiting as a service"
 authors = ["Erik Aker <eraker@gmail.com>"]
 homepage = "https://github.com/erewok/colibri"
@@ -15,7 +15,7 @@ axum = { version = "0.8.6", features = ["macros"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 bytes = "1.4.0"
 chrono = { version = "0.4.42", features = ["clock"] }
-clap = { version = "4.5.50", features = ["derive", "env"] }
+clap = { version = "4.5.51", features = ["derive", "env"] }
 crdts = "7.3.2"
 gxhash = "3.4"
 hostname = "0.4"
@@ -53,12 +53,12 @@ url = "2.5.7"
 tracing = "0.1.41"
 tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
-console-subscriber = "0.4.1"
 
 [dev-dependencies]
+# console-subscriber = "0.5.0"
 criterion = "0.7"
 mock_instant = "0.6.0"
-proptest = "1.4"
+proptest = "1.9.0"
 rand = "0.9.2"
 tempfile = "3.23.0"
 tokio-test = "0.4"

@@ -25,6 +25,7 @@ pub enum GossipMessage {
         updates: Vec<DistributedBucketExternal>, // Only changed keys
         #[bincode(with_serde)]
         sender_node_id: NodeId,
+        propagation_factor: u8, // To limit spread
     },
 
     /// Request for specific state (anti-entropy)
@@ -116,8 +117,6 @@ impl GossipCommand {
 mod tests {
     use super::*;
 
-    use crate::settings;
-
     #[test]
     fn test_gossip_packet_serialization() {
         let message = GossipMessage::StateRequest {
@@ -143,14 +142,6 @@ mod tests {
                 assert_eq!(response_addr, "127.0.0.1:8410".parse().unwrap());
             }
             _ => panic!("Wrong message type after deserialization"),
-        }
-    }
-
-    fn get_settings() -> settings::RateLimitSettings {
-        settings::RateLimitSettings {
-            cluster_participant_count: 1,
-            rate_limit_max_calls_allowed: 100,
-            rate_limit_interval_seconds: 60,
         }
     }
 }

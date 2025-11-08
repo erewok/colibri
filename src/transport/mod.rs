@@ -97,7 +97,6 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::error::ColibriError;
 
     fn get_transport_config() -> settings::TransportConfig {
         let mut cluster_urls = HashSet::new();

@@ -150,10 +150,106 @@ impl Node for GossipNode {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    //! Simple tests for GossipNode functionality - traffic direction and command forwarding
 
     use super::*;
+    use std::collections::HashSet;
 
+    fn test_settings() -> settings::Settings {
+        settings::Settings {
+            listen_address: "127.0.0.1".to_string(),
+            listen_port_api: 8410,
+            listen_port_tcp: 8411,
+            listen_port_udp: 8412,
+            rate_limit_max_calls_allowed: 100,
+            rate_limit_interval_seconds: 60,
+            run_mode: settings::RunMode::Gossip,
+            gossip_interval_ms: 1000, // Longer for testing
+            gossip_fanout: 3,
+            topology: HashSet::new(), // Empty topology for simple tests
+            failure_timeout_secs: 30,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gossip_node_creation() {
+        let node_id = NodeId::new(1);
+        let settings = test_settings();
+
+        // Should create successfully
+        let node = GossipNode::new(node_id, settings).await.unwrap();
+
+        assert_eq!(node.node_id, node_id);
+        assert!(node.gossip_command_tx.is_closed() == false);
+        assert!(node.controller_handle.is_some());
+        assert!(node.receiver_handle.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_gossip_node_check_limit() {
+        let node_id = NodeId::new(1);
+        let settings = test_settings();
+        let node = GossipNode::new(node_id, settings).await.unwrap();
+
+        let client_id = "test_client".to_string();
+
+        // Check limit should work (returns full limit for new client)
+        let result = node.check_limit(client_id.clone()).await.unwrap();
+        assert_eq!(result.client_id, client_id);
+        assert_eq!(result.calls_remaining, 100); // From test_settings
+    }
+
+    #[tokio::test]
+    async fn test_gossip_node_rate_limit() {
+        let node_id = NodeId::new(1);
+        let settings = test_settings();
+        let node = GossipNode::new(node_id, settings).await.unwrap();
+
+        let client_id = "test_client".to_string();
+
+        // Rate limit should consume tokens and return remaining count
+        let result = node.rate_limit(client_id.clone()).await.unwrap();
+        assert!(result.is_some());
+
+        let response = result.unwrap();
+        assert_eq!(response.client_id, client_id);
+        assert!(response.calls_remaining < 100); // Should have consumed tokens
+    }
+
+    #[tokio::test]
+    async fn test_gossip_node_expire_keys() {
+        let node_id = NodeId::new(1);
+        let settings = test_settings();
+        let node = GossipNode::new(node_id, settings).await.unwrap();
+
+        // Should complete without error
+        node.expire_keys().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_gossip_node_command_forwarding() {
+        let node_id = NodeId::new(1);
+        let settings = test_settings();
+        let node = GossipNode::new(node_id, settings).await.unwrap();
+
+        let client_id = "test_client".to_string();
+
+        // Make multiple operations to verify command forwarding works
+        let check1 = node.check_limit(client_id.clone()).await.unwrap();
+        let rate1 = node.rate_limit(client_id.clone()).await.unwrap().unwrap();
+        let check2 = node.check_limit(client_id.clone()).await.unwrap();
+
+        // Check that operations are properly forwarded and processed
+        assert_eq!(check1.client_id, client_id);
+        assert_eq!(rate1.client_id, client_id);
+        assert_eq!(check2.client_id, client_id);
+
+        // After rate limiting, remaining calls should be less than initial
+        assert!(check2.calls_remaining < check1.calls_remaining);
+    }
+
+    // Helper functions (keeping for compatibility but marked as used)
+    #[allow(dead_code)]
     pub fn gen_settings() -> settings::Settings {
         settings::Settings {
             listen_address: "0.0.0.0".to_string(),
@@ -170,6 +266,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     pub fn rl_settings() -> settings::RateLimitSettings {
         settings::RateLimitSettings {
             cluster_participant_count: 1,

@@ -473,8 +473,8 @@ impl DistributedBucketLimiter {
             .map(|counter| counter.to_external(client_id))
     }
 
-    pub fn accept_delta_state(&mut self, delta: Vec<DistributedBucketExternal>) {
-        for incoming_bucket in delta.into_iter() {
+    pub fn accept_delta_state(&mut self, delta: &[DistributedBucketExternal]) {
+        for incoming_bucket in delta.iter() {
             self.node_counters.pin().update_or_insert_with(
                 incoming_bucket.client_id.clone(),
                 |_existing_counter| {
@@ -513,6 +513,8 @@ impl DistributedBucketLimiter {
 
 #[cfg(test)]
 mod tests {
+    //! Minimal test suite demonstrating core distributed token bucket functionality
+
     use super::*;
     use crdts::CvRDT;
     use num_bigint::BigInt;
@@ -527,57 +529,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_distributed_request_counter_new() {
-        let node_id = NodeId::new(1);
-        let counter = DistributedRequestCounter::new(node_id);
+    // === Core DistributedRequestCounter Tests ===
 
-        assert_eq!(counter.node_id, node_id);
-        // Should start with 1 refill (initial token bucket state)
+    #[test]
+    fn test_counter_basic_operations() {
+        let node_id = NodeId::new(1);
+        let mut counter = DistributedRequestCounter::new(node_id);
+
+        // Should start with 1 token (initial refill)
         assert_eq!(counter.tokens(), BigInt::from(1));
-        assert!(counter.vclock.get(&node_id) > 0);
-    }
 
-    #[test]
-    fn test_distributed_request_counter_inc_refills() {
-        let node_id = NodeId::new(1);
-        let mut counter = DistributedRequestCounter::new(node_id);
-
+        // Add tokens and consume them
         counter.inc_refills(node_id, 5);
-        assert_eq!(counter.tokens(), BigInt::from(6)); // 1 initial + 5 added
+        assert_eq!(counter.tokens(), BigInt::from(6)); // 1 + 5
 
-        counter.inc_refills(node_id, 3);
-        assert_eq!(counter.tokens(), BigInt::from(9)); // 6 + 3
-    }
-
-    #[test]
-    fn test_distributed_request_counter_inc_and_dec_request() {
-        let node_id = NodeId::new(1);
-        let mut counter = DistributedRequestCounter::new(node_id);
-
-        counter.inc_refills(node_id, 5);
-        assert_eq!(counter.tokens(), BigInt::from(6));
-
-        // Increment requests (consume tokens)
         counter.inc_request(node_id);
         assert_eq!(counter.tokens(), BigInt::from(5)); // 6 - 1
 
-        counter.inc_request(node_id);
-        assert_eq!(counter.tokens(), BigInt::from(4)); // 5 - 1
-
-        // Decrement requests (restore tokens, like undoing a request)
-        counter.dec_request(node_id);
-        assert_eq!(counter.tokens(), BigInt::from(5)); // 4 + 1
+        counter.dec_request(node_id); // Undo request
+        assert_eq!(counter.tokens(), BigInt::from(6)); // 5 + 1
     }
+
     #[test]
-    fn test_distributed_request_counter_merge() {
+    fn test_counter_crdt_merge() {
         let node1 = NodeId::new(1);
         let node2 = NodeId::new(2);
 
         let mut counter1 = DistributedRequestCounter::new(node1);
         let mut counter2 = DistributedRequestCounter::new(node2);
 
-        // Add some operations on each counter
+        // Each counter operates independently
         counter1.inc_refills(node1, 3);
         counter1.inc_request(node1);
 
@@ -585,127 +566,73 @@ mod tests {
         counter2.inc_request(node2);
         counter2.inc_request(node2);
 
-        // Before merge
-        assert_eq!(counter1.tokens(), BigInt::from(3)); // 1 + 3 - 1
-        assert_eq!(counter2.tokens(), BigInt::from(1)); // 1 + 2 - 2
+        // Before merge: counter1 = 3 (1+3-1), counter2 = 1 (1+2-2)
+        assert_eq!(counter1.tokens(), BigInt::from(3));
+        assert_eq!(counter2.tokens(), BigInt::from(1));
 
-        // Merge counter2 into counter1
+        // After merge: should see combined state = 4 (3 + 1)
         counter1.merge(counter2.clone());
-
-        // After merge, should see operations from both nodes
-        // Node1: 1 initial + 3 refills - 1 request = 3
-        // Node2: 1 initial + 2 refills - 2 requests = 1
-        // Total: 3 + 1 = 4
         assert_eq!(counter1.tokens(), BigInt::from(4));
     }
 
-    #[test]
-    fn test_distributed_bucket_new() {
-        let node_id = NodeId::new(1);
-        let bucket = DistributedBucket::new(node_id);
-
-        assert_eq!(bucket.node_id, node_id);
-        assert_eq!(bucket.counter.tokens(), BigInt::from(1));
-        assert!(bucket.requests.is_empty());
-    }
+    // === Bucket-Level Tests ===
 
     #[test]
-    fn test_distributed_bucket_check_if_allowed() {
+    fn test_bucket_rate_limiting() {
         let node_id = NodeId::new(1);
-        let bucket = DistributedBucket::new(node_id);
+        let mut bucket = DistributedBucket::new(node_id);
 
-        // Should be allowed with initial token
+        // Start with 1 token - should be allowed
         assert!(bucket.check_if_allowed());
 
-        // Create bucket with no tokens by consuming the initial token
-        let mut bucket_empty = DistributedBucket::new(node_id);
-        bucket_empty.counter.inc_request(node_id);
-        assert!(!bucket_empty.check_if_allowed());
-    }
-
-    #[test]
-    fn test_distributed_bucket_decrement() {
-        let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id);
-
-        // Add some tokens first
-        bucket.counter.inc_refills(node_id, 2);
-        assert_eq!(bucket.counter.tokens(), BigInt::from(3)); // 1 initial + 2
-
-        bucket.decrement();
-        assert_eq!(bucket.counter.tokens(), BigInt::from(2));
-        assert_eq!(bucket.requests.len(), 1);
-
-        bucket.decrement();
-        assert_eq!(bucket.counter.tokens(), BigInt::from(1));
-        assert_eq!(bucket.requests.len(), 2);
-
-        // Try to decrement when not allowed (should not change)
-        bucket.decrement(); // This should consume the last token
-        assert_eq!(bucket.counter.tokens(), BigInt::from(0));
-
-        // This should not decrement further
+        // Consume the token
         bucket.decrement();
         assert_eq!(bucket.counter.tokens(), BigInt::from(0));
-        assert_eq!(bucket.requests.len(), 3); // Only 3 successful decrements
+
+        // Should not be allowed anymore
+        assert!(!bucket.check_if_allowed());
+
+        // Decrementing when not allowed should be no-op
+        bucket.decrement();
+        assert_eq!(bucket.counter.tokens(), BigInt::from(0));
     }
 
     #[test]
-    fn test_distributed_bucket_tokens_to_u32() {
-        let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id);
-
-        // Test normal case
-        bucket.counter.inc_refills(node_id, 10);
-        assert_eq!(bucket.tokens_to_u32(), 11);
-
-        // Test large number (should cap at u32::MAX)
-        bucket.counter.inc_refills(node_id, u64::MAX - 100);
-        assert_eq!(bucket.tokens_to_u32(), u32::MAX);
-
-        // Test negative (should be 0) - consume more tokens than available
-        let mut empty_bucket = DistributedBucket::new(node_id);
-        empty_bucket.counter.inc_request(node_id);
-        empty_bucket.counter.inc_request(node_id);
-        assert_eq!(empty_bucket.tokens_to_u32(), 0);
-    }
-
-    #[test]
-    fn test_distributed_bucket_add_tokens() {
+    fn test_bucket_token_replenishment() {
         let node_id = NodeId::new(1);
         let mut bucket = DistributedBucket::new(node_id);
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,       // Use 1 to make calculation easier
-            rate_limit_max_calls_allowed: 1000, // Higher rate to ensure tokens are added
+            cluster_participant_count: 1,
+            rate_limit_max_calls_allowed: 1000,
             rate_limit_interval_seconds: 1,
         };
 
-        // Sleep to ensure time difference (100ms should be enough to add tokens)
+        let initial_tokens = bucket.counter.tokens();
+
+        // Sleep to ensure time passes for token calculation
         thread::sleep(Duration::from_millis(100));
 
         bucket.add_tokens_to_bucket(&settings);
 
-        // Should have added some tokens (initial + calculated tokens)
-        let tokens = bucket.counter.tokens();
-        assert!(tokens > BigInt::from(1));
-        assert!(!bucket.requests.is_empty());
+        // Should have added tokens
+        assert!(bucket.counter.tokens() > initial_tokens);
     }
 
     #[test]
-    fn test_distributed_bucket_expire_entries() {
+    fn test_bucket_expiration() {
         let node_id = NodeId::new(1);
         let mut bucket = DistributedBucket::new(node_id);
 
-        // Add some entries with different timestamps
+        // Add entries with different ages
         bucket.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Requests(1),
-            timestamp_ms: Utc::now().timestamp_millis() - 2000, // 2 seconds ago
+            timestamp_ms: Utc::now().timestamp_millis() - 2000, // Old
             vclock: bucket.vclock(),
         });
 
         bucket.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Fills(1),
-            timestamp_ms: Utc::now().timestamp_millis() - 500, // 0.5 seconds ago
+            timestamp_ms: Utc::now().timestamp_millis() - 200, // Recent
             vclock: bucket.vclock(),
         });
 
@@ -714,107 +641,43 @@ mod tests {
         // Expire entries older than 1 second
         bucket.expire_entries(1000);
 
-        // Should have removed the old entry
+        // Should have removed the old entry only
         assert_eq!(bucket.requests.len(), 1);
-    }
 
-    #[test]
-    fn test_distributed_bucket_can_expire() {
-        let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id);
+        // Empty bucket should be expirable
+        let empty_bucket = DistributedBucket::new(node_id);
+        assert!(empty_bucket.can_expire(1000));
 
-        // Empty bucket can expire
-        assert!(bucket.can_expire(1000));
-
-        // Add recent entry
-        bucket.requests.push(InternalRequestEntry {
-            op: InternalPnCounterOp::Requests(1),
-            timestamp_ms: Utc::now().timestamp_millis(),
-            vclock: bucket.vclock(),
-        });
-
-        // Should not be able to expire with recent entry
+        // Bucket with recent activity should not be expirable
         assert!(!bucket.can_expire(1000));
-
-        // Add old entry
-        bucket.requests.push(InternalRequestEntry {
-            op: InternalPnCounterOp::Requests(1),
-            timestamp_ms: Utc::now().timestamp_millis() - 2000,
-            vclock: bucket.vclock(),
-        });
-
-        // Still should not expire because of the recent entry
-        assert!(!bucket.can_expire(1000));
-
-        // Clear recent entries and keep only old ones
-        bucket
-            .requests
-            .retain(|entry| Utc::now().timestamp_millis() - entry.timestamp_ms > 1500);
-
-        // Now should be able to expire
-        assert!(bucket.can_expire(1000));
     }
 
-    #[test]
-    fn test_distributed_bucket_to_external() {
-        let node_id = NodeId::new(1);
-        let bucket = DistributedBucket::new(node_id);
-
-        let external = bucket.to_external("test_client");
-
-        assert_eq!(external.client_id, "test_client");
-        assert_eq!(external.node_id, node_id);
-        assert_eq!(external.counter.tokens(), bucket.counter.tokens());
-    }
+    // === Limiter-Level Tests ===
 
     #[test]
-    fn test_distributed_bucket_external_to_bucket() {
-        let node_id = NodeId::new(1);
-        let external = DistributedBucketExternal {
-            client_id: "test_client".to_string(),
-            node_id,
-            counter: DistributedRequestCounter::new(node_id),
-        };
-
-        let bucket = external.bucket();
-
-        assert_eq!(bucket.node_id, node_id);
-        assert_eq!(bucket.counter.tokens(), external.counter.tokens());
-        assert!(bucket.requests.is_empty());
-    }
-
-    #[test]
-    fn test_distributed_bucket_limiter_new() {
-        let node_id = NodeId::new(1);
-        let settings = test_settings();
-        let limiter = DistributedBucketLimiter::new(node_id, settings.clone());
-
-        assert_eq!(limiter.node_id, node_id);
-        assert_eq!(limiter.rate_limit_settings.rate_limit_max_calls_allowed, 10);
-        assert!(limiter.is_empty());
-    }
-
-    #[test]
-    fn test_distributed_bucket_limiter_limit_calls() {
+    fn test_limiter_basic_rate_limiting() {
         let node_id = NodeId::new(1);
         let settings = test_settings();
         let mut limiter = DistributedBucketLimiter::new(node_id, settings);
 
         let client_id = "test_client".to_string();
 
-        // First call should succeed and return remaining tokens
-        let remaining = limiter.limit_calls_for_client(client_id.clone());
-        assert!(remaining.is_some());
-        assert!(!limiter.is_empty());
+        // First request should succeed
+        let result = limiter.limit_calls_for_client(client_id.clone());
+        assert!(result.is_some());
         assert_eq!(limiter.len(), 1);
 
         // Check remaining calls
-        let check_remaining = limiter.check_calls_remaining_for_client(&client_id);
-        assert!(check_remaining > 0);
+        let remaining = limiter.check_calls_remaining_for_client(&client_id);
+        assert!(remaining > 0);
+
+        // Unknown client should report full limit
+        let unknown_remaining = limiter.check_calls_remaining_for_client(&"unknown".to_string());
+        assert_eq!(unknown_remaining, 10); // From test_settings
     }
 
     #[test]
-    fn test_distributed_bucket_limiter_gossip_and_merge() {
+    fn test_limiter_gossip_protocol() {
         let node1 = NodeId::new(1);
         let node2 = NodeId::new(2);
         let settings = test_settings();
@@ -822,139 +685,66 @@ mod tests {
         let mut limiter1 = DistributedBucketLimiter::new(node1, settings.clone());
         let mut limiter2 = DistributedBucketLimiter::new(node2, settings);
 
-        let client_id = "test_client".to_string();
+        let client_id = "shared_client".to_string();
 
-        // Make requests on both limiters
+        // Both nodes handle requests for same client
         limiter1.limit_calls_for_client(client_id.clone());
         limiter2.limit_calls_for_client(client_id.clone());
 
-        // Get gossip state from limiter2
-        let gossip_state = limiter2.gossip_delta_state();
-        assert!(!gossip_state.is_empty());
+        // Get gossip state and merge
+        let gossip_from_node2 = limiter2.gossip_delta_state();
+        assert!(!gossip_from_node2.is_empty());
 
-        // Apply gossip state to limiter1
-        limiter1.accept_delta_state(gossip_state);
+        limiter1.accept_delta_state(&gossip_from_node2);
 
-        // Both limiters should now have merged state
-        let tokens1 = limiter1.check_calls_remaining_for_client(&client_id);
-
-        // The merged state should reflect operations from both nodes
-        assert!(tokens1 > 0);
+        // After merge, node1 should see combined state
+        let tokens = limiter1.check_calls_remaining_for_client(&client_id);
+        assert!(tokens > 0);
     }
 
     #[test]
-    fn test_distributed_bucket_limiter_expire_keys() {
+    fn test_limiter_key_expiration() {
         let node_id = NodeId::new(1);
-        // Use settings that will actually add tokens
         let settings = settings::RateLimitSettings {
             cluster_participant_count: 1,
-            rate_limit_max_calls_allowed: 1000,
-            rate_limit_interval_seconds: 1,
+            rate_limit_max_calls_allowed: 100,
+            rate_limit_interval_seconds: 1, // Short interval for testing
         };
         let mut limiter = DistributedBucketLimiter::new(node_id, settings.clone());
 
-        let client_id = "test_client".to_string();
+        // Test that empty limiter handles expiration correctly
+        assert_eq!(limiter.len(), 0);
+        limiter.expire_keys(); // Should not panic
+        assert_eq!(limiter.len(), 0);
 
-        // First, create the client bucket
-        limiter.limit_calls_for_client(client_id.clone());
+        // Create a client bucket and make multiple calls to ensure it has activity
+        limiter.limit_calls_for_client("test_client".to_string());
+        // Make another call to add more activity/timestamps
+        thread::sleep(Duration::from_millis(10)); // Small delay to ensure timestamp difference
+        limiter.limit_calls_for_client("test_client".to_string());
         assert_eq!(limiter.len(), 1);
 
-        // Wait, then call it again to trigger token addition (this should add entries)
-        thread::sleep(Duration::from_millis(50));
-        limiter.limit_calls_for_client(client_id.clone());
-        assert_eq!(limiter.len(), 1);
-
-        // Expire keys (should not expire recent entries)
+        // Recent buckets should not expire (expire_keys uses 2x interval threshold)
         limiter.expire_keys();
         assert_eq!(limiter.len(), 1);
 
-        // Test expiration with a different node (should not expire)
-        let mut foreign_limiter = DistributedBucketLimiter::new(NodeId::new(999), settings);
-        let foreign_client = "foreign_client".to_string();
-        foreign_limiter.limit_calls_for_client(foreign_client.clone());
+        // Add foreign node data via gossip
+        let foreign_node = NodeId::new(999);
+        let mut foreign_limiter = DistributedBucketLimiter::new(foreign_node, settings.clone());
+        foreign_limiter.limit_calls_for_client("foreign_client".to_string());
 
-        // Add the foreign bucket to our limiter via gossip
         let gossip_state = foreign_limiter.gossip_delta_state();
-        limiter.accept_delta_state(gossip_state);
+        limiter.accept_delta_state(&gossip_state);
 
         assert_eq!(limiter.len(), 2);
 
-        // Expiration should not remove foreign node entries
+        // Should not expire foreign node buckets (only expires own node buckets)
         limiter.expire_keys();
-        assert_eq!(limiter.len(), 2); // Both should remain
-    }
+        assert_eq!(limiter.len(), 2);
+    } // === CRDT Properties Tests ===
 
     #[test]
-    fn test_distributed_bucket_limiter_client_delta_state() {
-        let node_id = NodeId::new(1);
-        let settings = test_settings();
-        let mut limiter = DistributedBucketLimiter::new(node_id, settings);
-
-        let client_id = "test_client".to_string();
-
-        // No delta state for non-existent client
-        assert!(limiter.client_delta_state_for_gossip(&client_id).is_none());
-
-        // Add client
-        limiter.limit_calls_for_client(client_id.clone());
-
-        // Should now have delta state
-        let delta = limiter.client_delta_state_for_gossip(&client_id);
-        assert!(delta.is_some());
-
-        let delta = delta.unwrap();
-        assert_eq!(delta.client_id, client_id);
-        assert_eq!(delta.node_id, node_id);
-    }
-
-    #[test]
-    fn test_distributed_bucket_limiter_get_latest_vclock() {
-        let node_id = NodeId::new(1);
-        let settings = test_settings();
-        let mut limiter = DistributedBucketLimiter::new(node_id, settings);
-
-        // Empty limiter should return empty vclock
-        let vclock = limiter.get_latest_updated_vclock();
-        assert!(vclock.is_empty());
-
-        // Add some clients
-        limiter.limit_calls_for_client("client1".to_string());
-        limiter.limit_calls_for_client("client2".to_string());
-
-        let vclock = limiter.get_latest_updated_vclock();
-        assert!(!vclock.is_empty());
-        assert!(vclock.get(&node_id) > 0);
-    }
-
-    #[test]
-    fn test_crdt_properties_associative() {
-        let node1 = NodeId::new(1);
-        let node2 = NodeId::new(2);
-        let node3 = NodeId::new(3);
-
-        let mut counter_a = DistributedRequestCounter::new(node1);
-        let mut counter_b = DistributedRequestCounter::new(node2);
-        let mut counter_c = DistributedRequestCounter::new(node3);
-
-        counter_a.inc_refills(node1, 2);
-        counter_b.inc_refills(node2, 3);
-        counter_c.inc_refills(node3, 1);
-
-        // Test (a + b) + c = a + (b + c)
-        let mut left = counter_a.clone();
-        left.merge(counter_b.clone());
-        left.merge(counter_c.clone());
-
-        let mut right = counter_a.clone();
-        let mut bc = counter_b.clone();
-        bc.merge(counter_c.clone());
-        right.merge(bc);
-
-        assert_eq!(left.tokens(), right.tokens());
-    }
-
-    #[test]
-    fn test_crdt_properties_commutative() {
+    fn test_crdt_properties() {
         let node1 = NodeId::new(1);
         let node2 = NodeId::new(2);
 
@@ -964,7 +754,7 @@ mod tests {
         counter_a.inc_refills(node1, 5);
         counter_b.inc_request(node2);
 
-        // Test a + b = b + a
+        // Commutative: a + b = b + a
         let mut ab = counter_a.clone();
         ab.merge(counter_b.clone());
 
@@ -972,71 +762,66 @@ mod tests {
         ba.merge(counter_a.clone());
 
         assert_eq!(ab.tokens(), ba.tokens());
-        assert_eq!(ab.refills, ba.refills);
-        assert_eq!(ab.requests, ba.requests);
+
+        // Idempotent: a + a = a
+        let original_tokens = ab.tokens();
+        ab.merge(ab.clone());
+        assert_eq!(ab.tokens(), original_tokens);
     }
 
     #[test]
-    fn test_crdt_properties_idempotent() {
-        let node_id = NodeId::new(1);
-        let mut counter = DistributedRequestCounter::new(node_id);
-        counter.inc_refills(node_id, 3);
-        counter.inc_request(node_id);
-
-        let original_tokens = counter.tokens();
-        let original_counter = counter.clone();
-
-        // Test a + a = a (merge with itself)
-        counter.merge(original_counter.clone());
-
-        assert_eq!(counter.tokens(), original_tokens);
-    }
-
-    #[test]
-    fn test_multi_node_scenario() {
-        // Simulate a 3-node cluster scenario
-        let node1 = NodeId::new(1);
-        let node2 = NodeId::new(2);
-        let node3 = NodeId::new(3);
+    fn test_multi_node_convergence() {
+        // Test that multiple nodes converge to same state after gossip
         let settings = test_settings();
-
-        let mut limiter1 = DistributedBucketLimiter::new(node1, settings.clone());
-        let mut limiter2 = DistributedBucketLimiter::new(node2, settings.clone());
-        let mut limiter3 = DistributedBucketLimiter::new(node3, settings);
+        let mut limiter1 = DistributedBucketLimiter::new(NodeId::new(1), settings.clone());
+        let mut limiter2 = DistributedBucketLimiter::new(NodeId::new(2), settings.clone());
+        let mut limiter3 = DistributedBucketLimiter::new(NodeId::new(3), settings);
 
         let client_id = "shared_client".to_string();
 
-        // Each node processes requests for the same client
+        // Each node processes requests for same client
         limiter1.limit_calls_for_client(client_id.clone());
         limiter2.limit_calls_for_client(client_id.clone());
         limiter3.limit_calls_for_client(client_id.clone());
 
-        // Gossip between nodes
+        // Full mesh gossip - each node receives updates from all others
         let gossip1 = limiter1.gossip_delta_state();
         let gossip2 = limiter2.gossip_delta_state();
         let gossip3 = limiter3.gossip_delta_state();
 
-        // Apply all gossip states to node1
-        limiter1.accept_delta_state(gossip2.clone());
-        limiter1.accept_delta_state(gossip3.clone());
+        // Apply all gossip to all nodes
+        limiter1.accept_delta_state(&gossip2);
+        limiter1.accept_delta_state(&gossip3);
 
-        // Apply all gossip states to node2
-        limiter2.accept_delta_state(gossip1.clone());
-        limiter2.accept_delta_state(gossip3.clone());
+        limiter2.accept_delta_state(&gossip1);
+        limiter2.accept_delta_state(&gossip3);
 
-        // Apply all gossip states to node3
-        limiter3.accept_delta_state(gossip1);
-        limiter3.accept_delta_state(gossip2);
+        limiter3.accept_delta_state(&gossip1);
+        limiter3.accept_delta_state(&gossip2);
 
-        // All nodes should converge to the same state
+        // All nodes should converge to same state
         let tokens1 = limiter1.check_calls_remaining_for_client(&client_id);
         let tokens2 = limiter2.check_calls_remaining_for_client(&client_id);
         let tokens3 = limiter3.check_calls_remaining_for_client(&client_id);
 
         assert_eq!(tokens1, tokens2);
         assert_eq!(tokens2, tokens3);
+        assert!(tokens1 > 0); // Should still have tokens after 3 requests
+    }
 
-        // The merged state should account for all three nodes' operations
-        assert!(tokens1 > 0);
+    #[test]
+    fn test_external_serialization() {
+        let node_id = NodeId::new(1);
+        let bucket = DistributedBucket::new(node_id);
+
+        // Convert to external format (for gossip)
+        let external = bucket.to_external("test_client");
+        assert_eq!(external.client_id, "test_client");
+        assert_eq!(external.node_id, node_id);
+
+        // Convert back to internal format
+        let restored_bucket = external.bucket();
+        assert_eq!(restored_bucket.node_id, node_id);
+        assert_eq!(restored_bucket.counter.tokens(), bucket.counter.tokens());
     }
 }

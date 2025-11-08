@@ -5,6 +5,7 @@ echo "Node 1 on port 8001"
 echo "Press Ctrl+C to stop node"
 
 export RUST_LOG=info
+
 # Start node 1 (knows about nodes 2 and 3)
 cargo run -- \
     --run-mode "single" \

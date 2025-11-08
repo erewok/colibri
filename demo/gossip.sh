@@ -2,11 +2,12 @@
 echo "Starting 3-node cluster..."
 echo "Node 1 on port 8001, Node 2 on port 8002, Node 3 on port 8003"
 echo "Press Ctrl+C to stop all nodes"
+
 export srv1_udp=8401
 export srv2_udp=8402
 export srv3_udp=8403
 export RUST_LOG=debug
-export RUSTFLAGS="--cfg tokio_unstable"
+# export RUSTFLAGS="--cfg tokio_unstable"
 # Start node 1 (knows about nodes 2 and 3)
 cargo run -- \
     --run-mode "gossip" \

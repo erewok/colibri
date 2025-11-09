@@ -10,6 +10,7 @@ use crate::error::{ColibriError, Result};
 use crate::node::{CheckCallsResponse, Node, NodeId};
 use crate::{settings, transport};
 
+/// Gossip-based distributed rate limiter node
 #[derive(Clone)]
 pub struct GossipNode {
     // rate-limit settings
@@ -147,25 +148,130 @@ impl Node for GossipNode {
         Ok(())
     }
 
-    // TODO: Implement these methods for GossipNode
-    async fn create_named_rule(&self, _rule_name: String, _settings: settings::RateLimitSettings) -> Result<()> {
-        Err(ColibriError::Api("create_named_rule not implemented for GossipNode".to_string()))
+    // Configurable rate limit methods
+    async fn create_named_rule(
+        &self,
+        rule_name: String,
+        settings: settings::RateLimitSettings,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.gossip_command_tx
+            .send(GossipCommand::CreateNamedRule {
+                rule_name,
+                settings,
+                resp_chan: tx,
+            })
+            .await
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending create_named_rule command {}", e))
+            })?;
+        rx.await.unwrap_or_else(|e| {
+            Err(ColibriError::Transport(format!(
+                "Failed receiving create_named_rule response {}",
+                e
+            )))
+        })
     }
 
-    async fn delete_named_rule(&self, _rule_name: String) -> Result<()> {
-        Err(ColibriError::Api("delete_named_rule not implemented for GossipNode".to_string()))
+    async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.gossip_command_tx
+            .send(GossipCommand::DeleteNamedRule {
+                rule_name,
+                resp_chan: tx,
+            })
+            .await
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending delete_named_rule command {}", e))
+            })?;
+        rx.await.unwrap_or_else(|e| {
+            Err(ColibriError::Transport(format!(
+                "Failed receiving delete_named_rule response {}",
+                e
+            )))
+        })
     }
 
     async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
-        Ok(vec![])
+        let (tx, rx) = oneshot::channel();
+        self.gossip_command_tx
+            .send(GossipCommand::ListNamedRules { resp_chan: tx })
+            .await
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending list_named_rules command {}", e))
+            })?;
+        rx.await.unwrap_or_else(|e| {
+            Err(ColibriError::Transport(format!(
+                "Failed receiving list_named_rules response {}",
+                e
+            )))
+        })
+    }
+    async fn get_named_rule(&self, rule_name: String) -> Result<settings::NamedRateLimitRule> {
+        let (tx, rx) = oneshot::channel();
+        self.gossip_command_tx
+            .send(GossipCommand::GetNamedRule {
+                rule_name,
+                resp_chan: tx,
+            })
+            .await
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending get_named_rule command {}", e))
+            })?;
+        rx.await.unwrap_or_else(|e| {
+            Err(ColibriError::Transport(format!(
+                "Failed receiving get_named_rules response {}",
+                e
+            )))
+        })
     }
 
-    async fn rate_limit_custom(&self, _rule_name: String, _key: String) -> Result<Option<CheckCallsResponse>> {
-        Err(ColibriError::Api("rate_limit_custom not implemented for GossipNode".to_string()))
+    async fn rate_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
+        let (tx, rx) = oneshot::channel();
+        self.gossip_command_tx
+            .send(GossipCommand::RateLimitCustom {
+                rule_name,
+                key,
+                resp_chan: tx,
+            })
+            .await
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending rate_limit_custom command {}", e))
+            })?;
+        rx.await.unwrap_or_else(|e| {
+            Err(ColibriError::Transport(format!(
+                "Failed receiving rate_limit_custom response {}",
+                e
+            )))
+        })
     }
 
-    async fn check_limit_custom(&self, _rule_name: String, _key: String) -> Result<CheckCallsResponse> {
-        Err(ColibriError::Api("check_limit_custom not implemented for GossipNode".to_string()))
+    async fn check_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<CheckCallsResponse> {
+        let (tx, rx) = oneshot::channel();
+        self.gossip_command_tx
+            .send(GossipCommand::CheckLimitCustom {
+                rule_name,
+                key,
+                resp_chan: tx,
+            })
+            .await
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending check_limit_custom command {}", e))
+            })?;
+        rx.await.unwrap_or_else(|e| {
+            Err(ColibriError::Transport(format!(
+                "Failed receiving check_limit_custom response {}",
+                e
+            )))
+        })
     }
 }
 

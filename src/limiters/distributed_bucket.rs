@@ -1,20 +1,4 @@
-/// What does a state-based CRDT implementation of a token bucket look like?
-/// Here we implement the distributed token bucket using two PN-counters: one for refills and one for requests.
-/// We rely heavily on the `crdts` crate for CRDT data structures and operations instead of reimplementing them.
-/// Our goals are CRDT goals:
-/// - Associative: (a + b) + c = a + (b + c)
-/// - Commutative: a + b = b + a
-/// - Idempotent: a + a = a
-/// 1. Semilattice join: merge(a, b) = least upper bound of a and b
-/// 2. Monotonicity: state only grows (no deletions*)
-///
-/// Goals:
-/// - Support distributed token bucket rate limiting across multiple nodes.
-/// - Handle concurrent updates and network partitions gracefully.
-/// - *WEAK* eventual consistency: allow temporary divergence but ensure convergence over time.
-/// - Ensure convergence of token counts across nodes using CRDT principles
-///   (associative, commutative, semilattice join); state-based CRDT (CvRDT).
-/// - Thus, allow nodes to gossip their token bucket state and *merge* updates.
+//! Distributed token bucket using CRDT for eventual consistency
 use chrono::Utc;
 use crdts::{CmRDT, CvRDT, PNCounter, ResetRemove, VClock};
 use num_bigint::BigInt;
@@ -27,19 +11,12 @@ use crate::limiters::token_bucket::Bucket;
 use crate::node::NodeId;
 use crate::settings;
 
-/// `TokenBucket` implementation is inspired by a PN-counter.
-/// We use two PNCounters: one for refills and one for requests.
-/// In the RateLimiter, we *also* track last_call timestamps
-/// and **all requests and refills** in order to expire old entries
-/// and decrement from this counter when entries pass the expiry window.
+/// Distributed request counter using CRDT PN-counters
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DistributedRequestCounter {
     pub node_id: NodeId,
-    // Tracks number of refills per NodeId
     refills: PNCounter<NodeId>,
-    // Tracks number of requests per NodeId
     requests: PNCounter<NodeId>,
-    // Tracks causal-order timing so we can see times *between* requests
     pub vclock: VClock<NodeId>,
 }
 
@@ -109,9 +86,7 @@ impl DistributedRequestCounter {
     }
 }
 
-// Here we implement operation-based CRDT for DistributedRequestCounter
-// Because we plan to gossip state around the cluster, we will primarily use CvRDT merge,
-// but we implement CmRDT as required for `Map` below.
+// Operation-based CRDT implementation
 impl CmRDT for DistributedRequestCounter {
     type Op = (
         crdts::pncounter::Op<NodeId>,
@@ -134,7 +109,7 @@ impl CmRDT for DistributedRequestCounter {
     }
 }
 
-// Here we implement state-based CRDT merge for DistributedRequestCounter
+// State-based CRDT merge implementation
 impl CvRDT for DistributedRequestCounter {
     type Validation = <PNCounter<NodeId> as CvRDT>::Validation;
 
@@ -191,6 +166,7 @@ struct InternalRequestEntry {
     vclock: VClock<NodeId>,
 }
 
+/// External representation for gossip protocol
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DistributedBucketExternal {
     pub client_id: String,
@@ -353,19 +329,11 @@ impl Bucket for DistributedBucket {
     }
 }
 
-/// Finally, we define the distributed token bucket map, which holds per-node, removable buckets
-/// Distributed token bucket that can be gossiped and merged across cluster nodes.
-/// The CRDT states we *send* to other nodes are RemovableBuckets.
+/// Distributed rate limiter using CRDT buckets
 #[derive(Clone, Debug)]
 pub struct DistributedBucketLimiter {
-    /// Node ID of this bucket map owner
     pub node_id: NodeId,
-    // /// Tombstones for removed clients (vector clock tracks nodes performing removals)
-    // pub tombstones: Map<String, VClock<NodeId>, NodeId>,
-    /// Client request counters distributed: shared state-based CRDT around the cluster
     node_counters: HashMap<String, DistributedBucket>,
-
-    /// Rate limit settings for token replenishment
     rate_limit_settings: settings::RateLimitSettings,
 }
 
@@ -528,8 +496,6 @@ mod tests {
             rate_limit_interval_seconds: 1,
         }
     }
-
-    // === Core DistributedRequestCounter Tests ===
 
     #[test]
     fn test_counter_basic_operations() {

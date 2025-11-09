@@ -9,11 +9,13 @@ use crate::limiters::token_bucket;
 use crate::node::{CheckCallsResponse, Node, NodeId};
 use crate::settings;
 
+/// Standalone rate limiter node
 #[derive(Clone, Debug)]
 pub struct SingleNode {
     pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
     pub rate_limit_config: Arc<RwLock<settings::RateLimitConfig>>,
-    pub named_rate_limiters: Arc<RwLock<HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>>>>,
+    pub named_rate_limiters:
+        Arc<RwLock<HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>>>>,
 }
 
 #[async_trait]
@@ -52,7 +54,11 @@ impl Node for SingleNode {
         Ok(())
     }
 
-    async fn create_named_rule(&self, rule_name: String, settings: settings::RateLimitSettings) -> Result<()> {
+    async fn create_named_rule(
+        &self,
+        rule_name: String,
+        settings: settings::RateLimitSettings,
+    ) -> Result<()> {
         // Add the rule to configuration
         {
             let mut config = self.rate_limit_config.write().map_err(|e| {
@@ -64,7 +70,7 @@ impl Node for SingleNode {
         // Create a new rate limiter for this rule
         let limiter = token_bucket::TokenBucketLimiter::new(
             crate::node::node_id::NodeId::new(1), // TODO: use proper node id
-            settings
+            settings,
         );
 
         let mut limiters = self.named_rate_limiters.write().map_err(|e| {
@@ -93,6 +99,21 @@ impl Node for SingleNode {
         Ok(())
     }
 
+    async fn get_named_rule(&self, rule_name: String) -> Result<settings::NamedRateLimitRule> {
+        let rl_settings = self
+            .rate_limit_config
+            .read()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e)))
+            .and_then(|rlconf| match rlconf.get_named_rule_settings(&rule_name) {
+                Some(settings) => Ok(settings.clone()),
+                None => Err(ColibriError::Api(format!("Rule '{}' not found", rule_name))),
+            })?;
+        Ok(settings::NamedRateLimitRule {
+            name: rule_name,
+            settings: rl_settings,
+        })
+    }
+
     async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
         let config = self.rate_limit_config.read().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
@@ -100,7 +121,11 @@ impl Node for SingleNode {
         Ok(config.list_named_rules())
     }
 
-    async fn rate_limit_custom(&self, rule_name: String, key: String) -> Result<Option<CheckCallsResponse>> {
+    async fn rate_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
         // Get the settings for this rule
         let settings = {
             let config = self.rate_limit_config.read().map_err(|e| {
@@ -119,7 +144,12 @@ impl Node for SingleNode {
             })?;
             match limiters.get(&rule_name) {
                 Some(limiter) => limiter.clone(),
-                None => return Err(ColibriError::Api(format!("Limiter for rule '{}' not found", rule_name))),
+                None => {
+                    return Err(ColibriError::Api(format!(
+                        "Limiter for rule '{}' not found",
+                        rule_name
+                    )))
+                }
             }
         };
 
@@ -127,7 +157,11 @@ impl Node for SingleNode {
         local_rate_limit_with_settings(key, rate_limiter, &settings).await
     }
 
-    async fn check_limit_custom(&self, rule_name: String, key: String) -> Result<CheckCallsResponse> {
+    async fn check_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<CheckCallsResponse> {
         // Get the limiter for this rule
         let rate_limiter = {
             let limiters = self.named_rate_limiters.read().map_err(|e| {
@@ -135,7 +169,12 @@ impl Node for SingleNode {
             })?;
             match limiters.get(&rule_name) {
                 Some(limiter) => limiter.clone(),
-                None => return Err(ColibriError::Api(format!("Limiter for rule '{}' not found", rule_name))),
+                None => {
+                    return Err(ColibriError::Api(format!(
+                        "Limiter for rule '{}' not found",
+                        rule_name
+                    )))
+                }
             }
         };
 
@@ -206,7 +245,8 @@ pub async fn local_rate_limit_with_settings(
             ))
         }
         Ok(mut rate_limiter) => {
-            let calls_left = rate_limiter.limit_calls_for_client_with_settings(client_id.to_string(), settings);
+            let calls_left =
+                rate_limiter.limit_calls_for_client_with_settings(client_id.to_string(), settings);
             if let Some(calls_remaining) = calls_left {
                 if calls_remaining == 0 {
                     Ok(None)

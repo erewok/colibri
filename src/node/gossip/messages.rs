@@ -54,6 +54,40 @@ pub enum GossipMessage {
         #[bincode(with_serde)]
         vclock: VClock<NodeId>,
     },
+
+    /// Rate limit configuration synchronization messages
+    RateLimitConfigCreate {
+        response_addr: SocketAddr,
+        #[bincode(with_serde)]
+        sender_node_id: NodeId,
+        rule_name: String,
+        #[bincode(with_serde)]
+        settings: crate::settings::RateLimitSettings,
+        timestamp: u64,
+    },
+
+    RateLimitConfigDelete {
+        response_addr: SocketAddr,
+        #[bincode(with_serde)]
+        sender_node_id: NodeId,
+        rule_name: String,
+        timestamp: u64,
+    },
+
+    RateLimitConfigRequest {
+        response_addr: SocketAddr,
+        #[bincode(with_serde)]
+        requesting_node_id: NodeId,
+        rule_name: Option<String>, // None = request all rules
+    },
+
+    RateLimitConfigResponse {
+        response_addr: SocketAddr,
+        #[bincode(with_serde)]
+        responding_node_id: NodeId,
+        #[bincode(with_serde)]
+        rules: Vec<crate::settings::NamedRateLimitRule>,
+    },
 }
 
 /// GossipPacket wraps messages for network transmission
@@ -104,6 +138,34 @@ pub enum GossipCommand {
     GossipMessageReceived {
         data: bytes::Bytes,
         peer_addr: SocketAddr,
+    },
+
+    // Rate limit configuration commands
+    CreateNamedRule {
+        rule_name: String,
+        settings: crate::settings::RateLimitSettings,
+        resp_chan: oneshot::Sender<crate::error::Result<()>>,
+    },
+    DeleteNamedRule {
+        rule_name: String,
+        resp_chan: oneshot::Sender<crate::error::Result<()>>,
+    },
+    GetNamedRule {
+        rule_name: String,
+        resp_chan: oneshot::Sender<crate::error::Result<crate::settings::NamedRateLimitRule>>,
+    },
+    ListNamedRules {
+        resp_chan: oneshot::Sender<crate::error::Result<Vec<crate::settings::NamedRateLimitRule>>>,
+    },
+    RateLimitCustom {
+        rule_name: String,
+        key: String,
+        resp_chan: oneshot::Sender<crate::error::Result<Option<CheckCallsResponse>>>,
+    },
+    CheckLimitCustom {
+        rule_name: String,
+        key: String,
+        resp_chan: oneshot::Sender<crate::error::Result<CheckCallsResponse>>,
     },
 }
 

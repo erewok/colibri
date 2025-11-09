@@ -15,12 +15,14 @@ use crate::node::{
 };
 use crate::settings;
 
+/// Replication factor for data distribution
 pub enum ReplicationFactor {
     One = 1,
     Two = 2,
     Three = 3,
 }
 
+/// Consistent hash ring distributed rate limiter node
 #[derive(Clone, Debug)]
 pub struct HashringNode {
     pub node_id: NodeId,
@@ -32,7 +34,8 @@ pub struct HashringNode {
     // replication_factor: ReplicationFactor,
     pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
     pub rate_limit_config: Arc<RwLock<settings::RateLimitConfig>>,
-    pub named_rate_limiters: Arc<RwLock<HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>>>>,
+    pub named_rate_limiters:
+        Arc<RwLock<HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>>>>,
 }
 
 #[async_trait]
@@ -45,20 +48,21 @@ impl Node for HashringNode {
         let listen_api = if settings.listen_address.contains("http") {
             format!("{}:{}", settings.listen_address, settings.listen_port_api)
         } else {
-            format!("http://{}:{}", settings.listen_address, settings.listen_port_api)
+            format!(
+                "http://{}:{}",
+                settings.listen_address, settings.listen_port_api
+            )
         };
 
-        // get the bucket count to use in consistent hashing calls (assuming self is present in topology)
         let number_of_buckets = settings.topology.len().try_into()?;
 
-        // Use consistent hashing to assign buckets to nodes
-        // Every node must use the same identifiers for other nodes.
-        // This node must be a listed member of the topology.
+        // Assign buckets using consistent hashing
         let topology = settings
             .topology
             .iter()
             .filter_map(|host| {
-                let bucketnum = consistent_hashing::jump_consistent_hash(host.as_str(), number_of_buckets);
+                let bucketnum =
+                    consistent_hashing::jump_consistent_hash(host.as_str(), number_of_buckets);
                 let host = if !host.contains("http") {
                     format!("http://{}", host)
                 } else {
@@ -69,15 +73,11 @@ impl Node for HashringNode {
                     .pool_idle_timeout(std::time::Duration::from_secs(90))
                     .build()
                     .ok()?;
-                Some((
-                    bucketnum,
-                    (url, client),
-                ))
+                Some((bucketnum, (url, client)))
             })
             .collect::<HashMap<u32, (Url, reqwest::Client)>>();
 
-        // find the bucket ID that consistently maps to *this* node's listen address
-        // fail early if this node's listen address is not in the topology
+        // Find this node's bucket assignment
         let bucket: u32 = topology
             .iter()
             .find_map(|(bucket, host)| {
@@ -125,8 +125,12 @@ impl Node for HashringNode {
         // Use bucket to select into the topology HashMap
         match self.get_topology_address_for_bucket(bucket) {
             Some((host, client)) => {
-                info!("[bucket {}] Requesting data from bucket {} at {}", self.bucket, bucket, host);
-                let path = paths::drop_leading_slash(paths::default_rate_limits::CHECK).replace("{client_id}", &client_id);
+                info!(
+                    "[bucket {}] Requesting data from bucket {} at {}",
+                    self.bucket, bucket, host
+                );
+                let path = paths::drop_leading_slash(paths::default_rate_limits::CHECK)
+                    .replace("{client_id}", &client_id);
                 let url = format!("{}{}", host, path);
                 client
                     .get(url)
@@ -135,9 +139,9 @@ impl Node for HashringNode {
                     .json()
                     .await
                     .map_err(Into::into)
-                }
-                // fallback to self?
-                None => local_check_limit(client_id, self.rate_limiter.clone()).await,
+            }
+            // fallback to self?
+            None => local_check_limit(client_id, self.rate_limiter.clone()).await,
         }
     }
 
@@ -147,15 +151,19 @@ impl Node for HashringNode {
             consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
         match self.get_topology_address_for_bucket(bucket) {
             Some((host, client)) => {
-                let path = paths::drop_leading_slash(paths::default_rate_limits::LIMIT).replace("{client_id}", &client_id);
+                let path = paths::drop_leading_slash(paths::default_rate_limits::LIMIT)
+                    .replace("{client_id}", &client_id);
                 let url = format!("{}{}", host, path);
-                info!("[bucket {}] Requesting data from bucket {} at {}", self.bucket, bucket, url);
+                info!(
+                    "[bucket {}] Requesting data from bucket {} at {}",
+                    self.bucket, bucket, url
+                );
                 let resp = client
                     .post(url)
                     .header("content-type", "application/json")
-                        .body("{}")
-                        .send()
-                        .await?;
+                    .body("{}")
+                    .send()
+                    .await?;
                 let status = resp.status().as_u16();
                 info!("Received status code {}", status);
                 if status == 429 {
@@ -177,7 +185,11 @@ impl Node for HashringNode {
         Ok(())
     }
 
-    async fn create_named_rule(&self, rule_name: String, settings: settings::RateLimitSettings) -> Result<()> {
+    async fn create_named_rule(
+        &self,
+        rule_name: String,
+        settings: settings::RateLimitSettings,
+    ) -> Result<()> {
         // Add the rule to our local configuration
         {
             let mut config = self.rate_limit_config.write().map_err(|e| {
@@ -195,11 +207,11 @@ impl Node for HashringNode {
             limiters.insert(rule_name.clone(), Arc::new(Mutex::new(rate_limiter)));
         }
 
-        // Propagate the rule to all other nodes in the topology
-        for (_, (node_address, _client)) in &self.topology {
+        // Propagate rule to other nodes
+        for (node_address, _client) in self.topology.values() {
             if !self.topology_address_is_self(node_address) {
-                // Send rule to remote node
-                let path = paths::drop_leading_slash(paths::custom::RULE_CONFIG).replace("{rule_name}", &rule_name);
+                let path = paths::drop_leading_slash(paths::custom::RULE_CONFIG)
+                    .replace("{rule_name}", &rule_name);
                 let url = format!("{}{}", node_address, path);
                 let client = reqwest::Client::new();
                 let response = client
@@ -210,12 +222,29 @@ impl Node for HashringNode {
                     .await;
 
                 if let Err(e) = response {
-                    warn!("Failed to sync rule {} to node {}: {}", rule_name, node_address, e);
-                    // Continue with other nodes rather than failing completely
+                    warn!(
+                        "Failed to sync rule {} to node {}: {}",
+                        rule_name, node_address, e
+                    );
                 }
             }
         }
         Ok(())
+    }
+
+    async fn get_named_rule(&self, rule_name: String) -> Result<settings::NamedRateLimitRule> {
+        let rl_settings = self
+            .rate_limit_config
+            .read()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e)))
+            .and_then(|rlconf| match rlconf.get_named_rule_settings(&rule_name) {
+                Some(settings) => Ok(settings.clone()),
+                None => Err(ColibriError::Api(format!("Rule '{}' not found", rule_name))),
+            })?;
+        Ok(settings::NamedRateLimitRule {
+            name: rule_name,
+            settings: rl_settings,
+        })
     }
 
     async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
@@ -236,15 +265,19 @@ impl Node for HashringNode {
         }
 
         // Propagate the deletion to all other nodes in the topology
-        for (_, (node_address, client)) in &self.topology {
+        for (node_address, client) in self.topology.values() {
             if !self.topology_address_is_self(node_address) {
                 // Delete rule from remote node
-                let path = paths::drop_leading_slash(paths::custom::RULE_CONFIG).replace("{rule_name}", &rule_name);
+                let path = paths::drop_leading_slash(paths::custom::RULE_CONFIG)
+                    .replace("{rule_name}", &rule_name);
                 let url = format!("{}{}", node_address, path);
                 let response = client.delete(&url).send().await;
 
                 if let Err(e) = response {
-                    warn!("Failed to delete rule {} from node {}: {}", rule_name, node_address, e);
+                    warn!(
+                        "Failed to delete rule {} from node {}: {}",
+                        rule_name, node_address, e
+                    );
                     // Continue with other nodes rather than failing completely
                 }
             }
@@ -259,12 +292,18 @@ impl Node for HashringNode {
         Ok(config.list_named_rules())
     }
 
-    async fn rate_limit_custom(&self, rule_name: String, key: String) -> Result<Option<CheckCallsResponse>> {
+    async fn rate_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
         // Use consistent hashing to determine which node should handle this key
         let bucket = consistent_hashing::jump_consistent_hash(&key, self.number_of_buckets);
         match self.get_topology_address_for_bucket(bucket) {
             Some((host, client)) => {
-                let path = paths::drop_leading_slash(paths::custom::LIMIT).replace("{rule_name}", &rule_name).replace("{key}", &key);
+                let path = paths::drop_leading_slash(paths::custom::LIMIT)
+                    .replace("{rule_name}", &rule_name)
+                    .replace("{key}", &key);
                 let url = format!("{}{}", host, path);
                 let response = client
                     .post(&url)
@@ -279,7 +318,10 @@ impl Node for HashringNode {
                     let resp: CheckCallsResponse = response.json().await?;
                     Ok(Some(resp))
                 } else {
-                    Err(ColibriError::Api(format!("Remote node returned status {}", status)))
+                    Err(ColibriError::Api(format!(
+                        "Remote node returned status {}",
+                        status
+                    )))
                 }
             }
             None => {
@@ -290,12 +332,18 @@ impl Node for HashringNode {
         }
     }
 
-    async fn check_limit_custom(&self, rule_name: String, key: String) -> Result<CheckCallsResponse> {
+    async fn check_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<CheckCallsResponse> {
         // Use consistent hashing to determine which node should handle this key
         let bucket = consistent_hashing::jump_consistent_hash(&key, self.number_of_buckets);
         match self.get_topology_address_for_bucket(bucket) {
             Some((host, client)) => {
-                let path = paths::drop_leading_slash(paths::custom::CHECK).replace("{rule_name}", &rule_name).replace("{key}", &key);
+                let path = paths::drop_leading_slash(paths::custom::CHECK)
+                    .replace("{rule_name}", &rule_name)
+                    .replace("{key}", &key);
                 let url = format!("{}{}", host, path);
                 let response = client.get(&url).send().await?;
                 let resp: CheckCallsResponse = response.json().await?;
@@ -323,16 +371,22 @@ impl HashringNode {
             return None;
         }
         match self.topology.get(&bucket) {
-            Some((node_address, client)) => if !self.topology_address_is_self(node_address) {
-                Some((node_address, client))
-            } else {
-                None
-            },
+            Some((node_address, client)) => {
+                if !self.topology_address_is_self(node_address) {
+                    Some((node_address, client))
+                } else {
+                    None
+                }
+            }
             None => None,
         }
     }
 
-    async fn local_rate_limit_custom(&self, rule_name: String, key: String) -> Result<Option<CheckCallsResponse>> {
+    async fn local_rate_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
         // Get the settings for this rule
         let settings = {
             let config = self.rate_limit_config.read().map_err(|e| {
@@ -351,7 +405,12 @@ impl HashringNode {
             })?;
             match limiters.get(&rule_name) {
                 Some(limiter) => limiter.clone(),
-                None => return Err(ColibriError::Api(format!("Limiter for rule '{}' not found", rule_name))),
+                None => {
+                    return Err(ColibriError::Api(format!(
+                        "Limiter for rule '{}' not found",
+                        rule_name
+                    )))
+                }
             }
         };
 
@@ -359,7 +418,11 @@ impl HashringNode {
         crate::node::single_node::local_rate_limit_with_settings(key, rate_limiter, &settings).await
     }
 
-    async fn local_check_limit_custom(&self, rule_name: String, key: String) -> Result<CheckCallsResponse> {
+    async fn local_check_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<CheckCallsResponse> {
         // Get the limiter for this rule
         let rate_limiter = {
             let limiters = self.named_rate_limiters.read().map_err(|e| {
@@ -367,7 +430,12 @@ impl HashringNode {
             })?;
             match limiters.get(&rule_name) {
                 Some(limiter) => limiter.clone(),
-                None => return Err(ColibriError::Api(format!("Limiter for rule '{}' not found", rule_name))),
+                None => {
+                    return Err(ColibriError::Api(format!(
+                        "Limiter for rule '{}' not found",
+                        rule_name
+                    )))
+                }
             }
         };
 

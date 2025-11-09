@@ -1,5 +1,4 @@
-/// All Paths are recorded here for use throughout this codebase
-
+//! All Paths are recorded here for use throughout this codebase
 pub mod base {
     pub const ROOT: &str = "/";
     pub const HEALTH: &str = "/health";
@@ -21,8 +20,8 @@ pub mod custom {
 }
 
 pub fn drop_leading_slash(path: &str) -> &str {
-    if path.starts_with('/') {
-        &path[1..]
+    if let Some(stripped) = path.strip_prefix('/') {
+        stripped
     } else {
         path
     }

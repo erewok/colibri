@@ -7,22 +7,17 @@ use url::Url;
 
 use crate::settings;
 
-/// Node identifier in the cluster
-/// A simple wrapper around u32 for type safety
-/// Derives common traits for easy use
-/// Note: we implement Default here, but it's meaningless: 0 should *never* be a node-id in practice
+/// Unique identifier for cluster nodes
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, PartialOrd, Ord, Eq, Hash,
 )]
 pub struct NodeId(u32);
 
 impl NodeId {
-    /// Create a new NodeId from a u32
     pub fn new(id: u32) -> Self {
         Self(id)
     }
 
-    /// Get the underlying u32 value
     pub fn value(&self) -> u32 {
         self.0
     }
@@ -40,7 +35,7 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-/// Generate node ID as u32 from hostname and port
+/// Generate node ID from hostname and port
 pub fn generate_node_id(hostname: &str, port: u16) -> NodeId {
     let mut hasher = DefaultHasher::new();
     hostname.hash(&mut hasher);
@@ -48,14 +43,14 @@ pub fn generate_node_id(hostname: &str, port: u16) -> NodeId {
     NodeId::new(hasher.finish() as u32)
 }
 
-/// Generate node ID as u32 from hostname and standard port in a URL
+/// Generate node ID from URL
 pub fn generate_node_id_from_url(url: &Url) -> NodeId {
     let hostname = url.host_str().unwrap_or("localhost");
     let port = url.port().unwrap_or(settings::STANDARD_PORT_HTTP);
     generate_node_id(hostname, port)
 }
 
-/// Generate node ID as u32 from hostname and standard port in a URL
+/// Generate node ID from socket address
 pub fn generate_node_id_from_socket_addr(socket_addr: &SocketAddr) -> NodeId {
     let hostname = socket_addr.ip().to_string();
     let port = socket_addr.port();

@@ -22,6 +22,11 @@ pub struct GossipController {
     pub rate_limit_settings: settings::RateLimitSettings,
     /// Local rate limiter - handles all bucket operations
     pub rate_limiter: Arc<Mutex<DistributedBucketLimiter>>,
+    /// Named rate limit configurations
+    pub rate_limit_config: Arc<Mutex<settings::RateLimitConfig>>,
+    /// Named rate limiters for custom configurations
+    pub named_rate_limiters:
+        Arc<Mutex<std::collections::HashMap<String, DistributedBucketLimiter>>>,
     /// transport_config
     pub transport_config: settings::TransportConfig,
     /// Transport layer for sending UDP unicast gossip messages
@@ -52,6 +57,7 @@ impl GossipController {
         );
         let rl_settings = settings.rate_limit_settings();
         let rate_limiter = DistributedBucketLimiter::new(node_id, rl_settings.clone());
+        let rl_settings_clone = rl_settings.clone();
 
         // Build transport
         let transport_config = settings.transport_config();
@@ -79,6 +85,10 @@ impl GossipController {
             node_id,
             rate_limit_settings: rl_settings,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
+            rate_limit_config: Arc::new(Mutex::new(settings::RateLimitConfig::new(
+                rl_settings_clone,
+            ))),
+            named_rate_limiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
             transport: transport.clone(),
             transport_config,
             response_addr,
@@ -262,6 +272,125 @@ impl GossipController {
                 }
                 Ok(())
             }
+
+            // Handle rate limit configuration commands
+            GossipCommand::CreateNamedRule {
+                rule_name,
+                settings,
+                resp_chan,
+            } => {
+                let result = self
+                    .create_named_rule_local(rule_name.clone(), settings.clone())
+                    .await;
+                if result.is_ok() {
+                    // Gossip the new rule to other nodes
+                    let message = GossipMessage::RateLimitConfigCreate {
+                        response_addr: self.response_addr,
+                        sender_node_id: self.node_id,
+                        rule_name,
+                        settings,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    let packet = GossipPacket::new(message);
+                    if let Err(e) = self.send_gossip_packet(packet).await {
+                        error!(
+                            "[{}] Failed to gossip new rule creation: {}",
+                            self.node_id, e
+                        );
+                    }
+                }
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending create_named_rule response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+            GossipCommand::GetNamedRule {
+                rule_name,
+                resp_chan,
+            } => {
+                let result = self.get_named_rule_local(rule_name.clone()).await;
+                if resp_chan.send(result).is_err() {
+                    error!("[{}] Failed sending get_named_rule response", self.node_id);
+                }
+                Ok(())
+            }
+
+            GossipCommand::DeleteNamedRule {
+                rule_name,
+                resp_chan,
+            } => {
+                let result = self.delete_named_rule_local(rule_name.clone()).await;
+                if result.is_ok() {
+                    // Gossip the rule deletion to other nodes
+                    let message = GossipMessage::RateLimitConfigDelete {
+                        response_addr: self.response_addr,
+                        sender_node_id: self.node_id,
+                        rule_name,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    let packet = GossipPacket::new(message);
+                    if let Err(e) = self.send_gossip_packet(packet).await {
+                        error!("[{}] Failed to gossip rule deletion: {}", self.node_id, e);
+                    }
+                }
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending delete_named_rule response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+
+            GossipCommand::ListNamedRules { resp_chan } => {
+                let result = self.list_named_rules_local().await;
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending list_named_rules response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+
+            GossipCommand::RateLimitCustom {
+                rule_name,
+                key,
+                resp_chan,
+            } => {
+                let result = self.rate_limit_custom_local(rule_name, key).await;
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending rate_limit_custom response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+
+            GossipCommand::CheckLimitCustom {
+                rule_name,
+                key,
+                resp_chan,
+            } => {
+                let result = self.check_limit_custom_local(rule_name, key).await;
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending check_limit_custom response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
         }
     }
     /// Process an incoming gossip packet
@@ -336,6 +465,125 @@ impl GossipController {
                             return Ok(());
                         }
                     }
+
+                    // Handle rate limit configuration messages
+                    GossipMessage::RateLimitConfigCreate {
+                        sender_node_id,
+                        rule_name,
+                        settings,
+                        timestamp: _,
+                        response_addr: _,
+                    } => {
+                        // Don't process our own messages
+                        if sender_node_id == self.node_id {
+                            return Ok(());
+                        }
+
+                        // Apply the rule creation locally
+                        if let Err(e) = self
+                            .create_named_rule_local(rule_name.clone(), settings)
+                            .await
+                        {
+                            error!(
+                                "[{}] Failed to apply gossiped rule creation for '{}': {}",
+                                self.node_id, rule_name, e
+                            );
+                        } else {
+                            info!(
+                                "[{}] Applied gossiped rule creation: '{}'",
+                                self.node_id, rule_name
+                            );
+                        }
+                    }
+
+                    GossipMessage::RateLimitConfigDelete {
+                        sender_node_id,
+                        rule_name,
+                        timestamp: _,
+                        response_addr: _,
+                    } => {
+                        // Don't process our own messages
+                        if sender_node_id == self.node_id {
+                            return Ok(());
+                        }
+
+                        // Apply the rule deletion locally
+                        if let Err(e) = self.delete_named_rule_local(rule_name.clone()).await {
+                            debug!(
+                                "[{}] Failed to apply gossiped rule deletion for '{}': {}",
+                                self.node_id, rule_name, e
+                            );
+                        } else {
+                            info!(
+                                "[{}] Applied gossiped rule deletion: '{}'",
+                                self.node_id, rule_name
+                            );
+                        }
+                    }
+
+                    GossipMessage::RateLimitConfigRequest {
+                        requesting_node_id,
+                        rule_name,
+                        response_addr: _,
+                    } => {
+                        // Don't process our own requests
+                        if requesting_node_id == self.node_id {
+                            return Ok(());
+                        }
+
+                        // Send back the requested rule(s)
+                        let rules = if let Some(rule_name) = rule_name {
+                            // Send specific rule
+                            if let Ok(config_rules) = self.list_named_rules_local().await {
+                                config_rules
+                                    .into_iter()
+                                    .filter(|r| r.name == rule_name)
+                                    .collect()
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            // Send all rules
+                            self.list_named_rules_local().await.unwrap_or_default()
+                        };
+
+                        let response_message = GossipMessage::RateLimitConfigResponse {
+                            response_addr: self.response_addr,
+                            responding_node_id: self.node_id,
+                            rules,
+                        };
+
+                        let response_packet = GossipPacket::new(response_message);
+                        if let Err(e) = self.send_gossip_packet(response_packet).await {
+                            error!("[{}] Failed to send config response: {}", self.node_id, e);
+                        }
+                    }
+
+                    GossipMessage::RateLimitConfigResponse {
+                        responding_node_id,
+                        rules,
+                        response_addr: _,
+                    } => {
+                        // Don't process our own responses
+                        if responding_node_id == self.node_id {
+                            return Ok(());
+                        }
+
+                        // Apply the received rules locally
+                        for rule in rules {
+                            if let Err(e) = self
+                                .create_named_rule_local(rule.name.clone(), rule.settings)
+                                .await
+                            {
+                                debug!(
+                                    "[{}] Failed to apply received rule '{}': {}",
+                                    self.node_id, rule.name, e
+                                );
+                            } else {
+                                debug!("[{}] Applied received rule: '{}'", self.node_id, rule.name);
+                            }
+                        }
+                    }
                 };
                 Ok(())
             }
@@ -397,6 +645,134 @@ impl GossipController {
             .map_err(|e| ColibriError::Concurrency(format!("Failed to lock {}", e)))
             .map(|mut rl| rl.accept_delta_state(entries));
         debug!("[{}] merge_gossip_state_static completed", node_id);
+    }
+
+    /// Create a named rate limit rule locally (without gossiping)
+    async fn create_named_rule_local(
+        &self,
+        rule_name: String,
+        settings: settings::RateLimitSettings,
+    ) -> Result<()> {
+        let mut config = self
+            .rate_limit_config
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))?;
+
+        config.add_named_rule(rule_name.clone(), settings.clone());
+
+        // Create the rate limiter for this rule
+        let mut limiters = self
+            .named_rate_limiters
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to lock limiters: {}", e)))?;
+
+        let rate_limiter = DistributedBucketLimiter::new(self.node_id, settings);
+        limiters.insert(rule_name, rate_limiter);
+
+        Ok(())
+    }
+    /// Get a named rate limit rule locally (without gossiping)
+    async fn get_named_rule_local(
+        &self,
+        rule_name: String,
+    ) -> Result<settings::NamedRateLimitRule> {
+        let config = self
+            .rate_limit_config
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))?;
+
+        if let Some(rule) = config.get_named_rule_settings(&rule_name) {
+            Ok(settings::NamedRateLimitRule {
+                name: rule_name,
+                settings: rule.clone(),
+            })
+        } else {
+            Err(ColibriError::Api(format!("Rule '{}' not found", rule_name)))
+        }
+    }
+
+    /// Delete a named rate limit rule locally (without gossiping)
+    async fn delete_named_rule_local(&self, rule_name: String) -> Result<()> {
+        let mut config = self
+            .rate_limit_config
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))?;
+
+        if config.remove_named_rule(&rule_name).is_some() {
+            // Remove the rate limiter for this rule
+            let mut limiters = self.named_rate_limiters.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to lock limiters: {}", e))
+            })?;
+
+            limiters.remove(&rule_name);
+            Ok(())
+        } else {
+            Err(ColibriError::Api(format!("Rule '{}' not found", rule_name)))
+        }
+    }
+
+    /// List all named rate limit rules locally
+    async fn list_named_rules_local(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+        let config = self
+            .rate_limit_config
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))?;
+
+        Ok(config.list_named_rules())
+    }
+
+    /// Apply rate limiting using a custom named rule locally
+    async fn rate_limit_custom_local(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
+        let mut limiters = self
+            .named_rate_limiters
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to lock limiters: {}", e)))?;
+
+        if let Some(rate_limiter) = limiters.get_mut(&rule_name) {
+            let calls_left = rate_limiter.limit_calls_for_client(key.clone());
+            if let Some(calls_remaining) = calls_left {
+                Ok(Some(CheckCallsResponse {
+                    client_id: key,
+                    calls_remaining,
+                }))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Err(ColibriError::Api(format!(
+                "Rate limit rule '{}' not found",
+                rule_name
+            )))
+        }
+    }
+
+    /// Check remaining calls using a custom named rule locally
+    async fn check_limit_custom_local(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<CheckCallsResponse> {
+        let limiters = self
+            .named_rate_limiters
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to lock limiters: {}", e)))?;
+
+        if let Some(rate_limiter) = limiters.get(&rule_name) {
+            let calls_remaining = rate_limiter.check_calls_remaining_for_client(&key);
+            Ok(CheckCallsResponse {
+                client_id: key,
+                calls_remaining,
+            })
+        } else {
+            Err(ColibriError::Api(format!(
+                "Rate limit rule '{}' not found",
+                rule_name
+            )))
+        }
     }
 }
 

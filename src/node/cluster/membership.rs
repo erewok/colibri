@@ -3,31 +3,31 @@ use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
 
-/// Cluster membership information shared between nodes
+/// Cluster membership state shared between nodes
 #[derive(Clone, Debug, Decode, Encode)]
 pub struct ClusterMembership {
     pub nodes: HashMap<u32, NodeInfo>,
-    pub membership_version: u64, // Incremented on each change
+    pub membership_version: u64,
 }
 
-/// Information about a cluster node
+/// Node information in the cluster
 #[derive(Clone, Debug, Decode, Encode)]
 pub struct NodeInfo {
     pub node_id: u32,
     pub address: SocketAddr,
     pub status: NodeStatus,
-    pub joined_at: u64, // Unix timestamp
-    pub last_seen: u64, // Unix timestamp
+    pub joined_at: u64,
+    pub last_seen: u64,
 }
 
-/// Status of a node in the cluster
+/// Node status in cluster lifecycle
 #[derive(Clone, Debug, Decode, Encode)]
 pub enum NodeStatus {
-    Joining, // Node is joining the cluster
-    Active,  // Node is fully active
-    Leaving, // Node announced it's leaving
-    Failed,  // Node failed to respond
-    Left,    // Node has left cleanly
+    Joining,
+    Active,
+    Leaving,
+    Failed,
+    Left,
 }
 
 impl ClusterMembership {

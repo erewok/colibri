@@ -22,11 +22,19 @@ pub async fn api(rl_node: node::NodeWrapper) -> Result<Router> {
         .route("/", routing::get(base::root))
         .route("/health", routing::get(base::health))
         .route("/about", routing::get(base::about))
+        // Default rate limiting (existing behavior)
         .route("/rl/{client_id}", routing::post(rate_limits::rate_limit))
         .route(
             "/rl-check/{client_id}",
             routing::get(rate_limits::check_limit),
         )
+        // Configuration management
+        .route("/rl-config/{rule_name}", routing::post(rate_limits::create_named_rate_limit_rule))
+        .route("/rl-config/{rule_name}", routing::delete(rate_limits::delete_named_rate_limit_rule))
+        .route("/rl-config", routing::get(rate_limits::list_named_rate_limit_rules))
+        // Custom rate limiting
+        .route("/rl/{rule_name}/{key}", routing::post(rate_limits::rate_limit_custom))
+        .route("/rl-check/{rule_name}/{key}", routing::get(rate_limits::check_limit_custom))
         .route("/expire-keys", routing::post(rate_limits::expire_keys))
         .layer(
             ServiceBuilder::new()

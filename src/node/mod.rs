@@ -34,6 +34,13 @@ pub trait Node {
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse>;
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>>;
     async fn expire_keys(&self) -> Result<()>;
+
+    // New methods for named rules
+    async fn create_named_rule(&self, rule_name: String, settings: settings::RateLimitSettings) -> Result<()>;
+    async fn delete_named_rule(&self, rule_name: String) -> Result<()>;
+    async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>>;
+    async fn rate_limit_custom(&self, rule_name: String, key: String) -> Result<Option<CheckCallsResponse>>;
+    async fn check_limit_custom(&self, rule_name: String, key: String) -> Result<CheckCallsResponse>;
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +101,46 @@ impl NodeWrapper {
             Self::Single(node) => node.rate_limit(client_id).await,
             Self::Gossip(node) => node.rate_limit(client_id).await,
             Self::Hashring(node) => node.rate_limit(client_id).await,
+        }
+    }
+
+    pub async fn create_named_rule(&self, rule_name: String, settings: settings::RateLimitSettings) -> Result<()> {
+        match self {
+            Self::Single(node) => node.create_named_rule(rule_name, settings).await,
+            Self::Gossip(node) => node.create_named_rule(rule_name, settings).await,
+            Self::Hashring(node) => node.create_named_rule(rule_name, settings).await,
+        }
+    }
+
+    pub async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
+        match self {
+            Self::Single(node) => node.delete_named_rule(rule_name).await,
+            Self::Gossip(node) => node.delete_named_rule(rule_name).await,
+            Self::Hashring(node) => node.delete_named_rule(rule_name).await,
+        }
+    }
+
+    pub async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+        match self {
+            Self::Single(node) => node.list_named_rules().await,
+            Self::Gossip(node) => node.list_named_rules().await,
+            Self::Hashring(node) => node.list_named_rules().await,
+        }
+    }
+
+    pub async fn rate_limit_custom(&self, rule_name: String, key: String) -> Result<Option<CheckCallsResponse>> {
+        match self {
+            Self::Single(node) => node.rate_limit_custom(rule_name, key).await,
+            Self::Gossip(node) => node.rate_limit_custom(rule_name, key).await,
+            Self::Hashring(node) => node.rate_limit_custom(rule_name, key).await,
+        }
+    }
+
+    pub async fn check_limit_custom(&self, rule_name: String, key: String) -> Result<CheckCallsResponse> {
+        match self {
+            Self::Single(node) => node.check_limit_custom(rule_name, key).await,
+            Self::Gossip(node) => node.check_limit_custom(rule_name, key).await,
+            Self::Hashring(node) => node.check_limit_custom(rule_name, key).await,
         }
     }
 }

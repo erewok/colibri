@@ -191,6 +191,42 @@ impl TokenBucketLimiter {
             }
         }
     }
+
+    /// Check rate limit and decrement if call is allowed using provided settings
+    /// Returns Some(remaining_tokens) if allowed, None if rate limited
+    pub fn limit_calls_for_client_with_settings(&mut self, key: String, settings: &settings::RateLimitSettings) -> Option<u32> {
+        if let Some(bucket) = self.cache.pin().get(&key) {
+            // Update existing bucket with provided settings
+            let mut updated_bucket = bucket.clone();
+            updated_bucket.add_tokens_to_bucket(settings);
+
+            if updated_bucket.check_if_allowed() {
+                // Call is allowed - decrement and update
+                updated_bucket.decrement();
+                let remaining = updated_bucket.tokens_to_u32();
+                self.cache.pin().insert(key, updated_bucket);
+                Some(remaining)
+            } else {
+                // Call not allowed - update bucket state but don't decrement
+                self.cache.pin().insert(key, updated_bucket);
+                None
+            }
+        } else {
+            // Create new bucket - first call is always allowed
+            let mut new_bucket = TokenBucket::new(self.node_id);
+            // Set tokens to max for the provided settings
+            new_bucket.tokens = f64::from(settings.rate_limit_max_calls_allowed);
+            new_bucket.decrement(); // Use one token
+            let is_allowed = new_bucket.check_if_allowed();
+            let remaining = Some(new_bucket.tokens_to_u32());
+            self.cache.pin().insert(key, new_bucket);
+            if is_allowed {
+                remaining
+            } else {
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]

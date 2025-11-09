@@ -171,6 +171,27 @@ impl Node for HashringNode {
         rate_limiter.expire_keys();
         Ok(())
     }
+
+    // TODO: Implement these methods for HashringNode
+    async fn create_named_rule(&self, _rule_name: String, _settings: settings::RateLimitSettings) -> Result<()> {
+        Err(ColibriError::Api("create_named_rule not implemented for HashringNode".to_string()))
+    }
+
+    async fn delete_named_rule(&self, _rule_name: String) -> Result<()> {
+        Err(ColibriError::Api("delete_named_rule not implemented for HashringNode".to_string()))
+    }
+
+    async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+        Ok(vec![])
+    }
+
+    async fn rate_limit_custom(&self, _rule_name: String, _key: String) -> Result<Option<CheckCallsResponse>> {
+        Err(ColibriError::Api("rate_limit_custom not implemented for HashringNode".to_string()))
+    }
+
+    async fn check_limit_custom(&self, _rule_name: String, _key: String) -> Result<CheckCallsResponse> {
+        Err(ColibriError::Api("check_limit_custom not implemented for HashringNode".to_string()))
+    }
 }
 
 #[cfg(test)]

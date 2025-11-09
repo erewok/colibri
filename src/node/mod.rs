@@ -43,7 +43,10 @@ pub trait Node {
     ) -> Result<()>;
     async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>>;
     async fn delete_named_rule(&self, rule_name: String) -> Result<()>;
-    async fn get_named_rule(&self, rule_name: String) -> Result<settings::NamedRateLimitRule>;
+    async fn get_named_rule(
+        &self,
+        rule_name: String,
+    ) -> Result<Option<settings::NamedRateLimitRule>>;
     async fn rate_limit_custom(
         &self,
         rule_name: String,
@@ -129,7 +132,10 @@ impl NodeWrapper {
         }
     }
 
-    pub async fn get_named_rule(&self, rule_name: String) -> Result<settings::NamedRateLimitRule> {
+    pub async fn get_named_rule(
+        &self,
+        rule_name: String,
+    ) -> Result<Option<settings::NamedRateLimitRule>> {
         match self {
             Self::Single(node) => node.get_named_rule(rule_name).await,
             Self::Gossip(node) => node.get_named_rule(rule_name).await,

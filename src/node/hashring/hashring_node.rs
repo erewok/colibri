@@ -190,12 +190,26 @@ impl Node for HashringNode {
         rule_name: String,
         settings: settings::RateLimitSettings,
     ) -> Result<()> {
+        // check if already exists
+        {
+            let config = self.rate_limit_config.read().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            if config.get_named_rule_settings(&rule_name).is_some() {
+                return Ok(());
+            }
+        }
+
         // Add the rule to our local configuration
         {
             let mut config = self.rate_limit_config.write().map_err(|e| {
                 ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
             })?;
-            config.add_named_rule(rule_name.clone(), settings.clone());
+            let rule = settings::NamedRateLimitRule {
+                name: rule_name.clone(),
+                settings: settings.clone(),
+            };
+            config.add_named_rule(&rule);
         }
 
         // Create a new rate limiter for this rule
@@ -232,19 +246,22 @@ impl Node for HashringNode {
         Ok(())
     }
 
-    async fn get_named_rule(&self, rule_name: String) -> Result<settings::NamedRateLimitRule> {
-        let rl_settings = self
-            .rate_limit_config
+    async fn get_named_rule(
+        &self,
+        rule_name: String,
+    ) -> Result<Option<settings::NamedRateLimitRule>> {
+        self.rate_limit_config
             .read()
             .map_err(|e| ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e)))
-            .and_then(|rlconf| match rlconf.get_named_rule_settings(&rule_name) {
-                Some(settings) => Ok(settings.clone()),
-                None => Err(ColibriError::Api(format!("Rule '{}' not found", rule_name))),
-            })?;
-        Ok(settings::NamedRateLimitRule {
-            name: rule_name,
-            settings: rl_settings,
-        })
+            .and_then(|rlconf| {
+                Ok(rlconf
+                    .get_named_rule_settings(&rule_name)
+                    .cloned()
+                    .map(|rl_settings| settings::NamedRateLimitRule {
+                        name: rule_name,
+                        settings: rl_settings,
+                    }))
+            })
     }
 
     async fn delete_named_rule(&self, rule_name: String) -> Result<()> {

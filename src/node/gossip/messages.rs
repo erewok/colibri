@@ -152,7 +152,8 @@ pub enum GossipCommand {
     },
     GetNamedRule {
         rule_name: String,
-        resp_chan: oneshot::Sender<crate::error::Result<crate::settings::NamedRateLimitRule>>,
+        resp_chan:
+            oneshot::Sender<crate::error::Result<Option<crate::settings::NamedRateLimitRule>>>,
     },
     ListNamedRules {
         resp_chan: oneshot::Sender<crate::error::Result<Vec<crate::settings::NamedRateLimitRule>>>,

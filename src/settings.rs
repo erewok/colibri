@@ -110,8 +110,9 @@ impl RateLimitConfig {
         self.named_rules.get(rule_name)
     }
 
-    pub fn add_named_rule(&mut self, rule_name: String, settings: RateLimitSettings) {
-        self.named_rules.insert(rule_name, settings);
+    pub fn add_named_rule(&mut self, rule: &NamedRateLimitRule) {
+        self.named_rules
+            .insert(rule.name.clone(), rule.settings.clone());
     }
 
     pub fn remove_named_rule(&mut self, rule_name: &str) -> Option<RateLimitSettings> {

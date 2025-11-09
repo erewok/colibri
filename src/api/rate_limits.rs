@@ -61,9 +61,11 @@ pub async fn list_named_rate_limit_rules(
 pub async fn get_named_rate_limit_rule(
     Path(rule_name): Path<String>,
     State(state): State<node::NodeWrapper>,
-) -> Result<axum::Json<settings::NamedRateLimitRule>> {
-    let rule = state.get_named_rule(rule_name).await?;
-    Ok(axum::Json(rule))
+) -> Result<(StatusCode, axum::Json<Option<settings::NamedRateLimitRule>>)> {
+    match state.get_named_rule(rule_name).await? {
+        None => return Ok((StatusCode::NOT_FOUND, axum::Json(None))),
+        Some(rule) => Ok((StatusCode::OK, axum::Json(Some(rule)))),
+    }
 }
 
 #[instrument(skip(state), level = "info")]

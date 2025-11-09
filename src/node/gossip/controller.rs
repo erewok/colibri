@@ -314,7 +314,7 @@ impl GossipController {
                 rule_name,
                 resp_chan,
             } => {
-                let result = self.get_named_rule_local(rule_name.clone()).await;
+                let result = self.get_named_rule_local(&rule_name).await;
                 if resp_chan.send(result).is_err() {
                     error!("[{}] Failed sending get_named_rule response", self.node_id);
                 }
@@ -653,12 +653,20 @@ impl GossipController {
         rule_name: String,
         settings: settings::RateLimitSettings,
     ) -> Result<()> {
+        // first check if already exists
+        if self.get_named_rule_local(&rule_name).await?.is_some() {
+            return Ok(());
+        }
+
         let mut config = self
             .rate_limit_config
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))?;
-
-        config.add_named_rule(rule_name.clone(), settings.clone());
+        let rule = settings::NamedRateLimitRule {
+            name: rule_name.clone(),
+            settings: settings.clone(),
+        };
+        config.add_named_rule(&rule);
 
         // Create the rate limiter for this rule
         let mut limiters = self
@@ -674,21 +682,20 @@ impl GossipController {
     /// Get a named rate limit rule locally (without gossiping)
     async fn get_named_rule_local(
         &self,
-        rule_name: String,
-    ) -> Result<settings::NamedRateLimitRule> {
-        let config = self
-            .rate_limit_config
+        rule_name: &str,
+    ) -> Result<Option<settings::NamedRateLimitRule>> {
+        self.rate_limit_config
             .lock()
-            .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))?;
-
-        if let Some(rule) = config.get_named_rule_settings(&rule_name) {
-            Ok(settings::NamedRateLimitRule {
-                name: rule_name,
-                settings: rule.clone(),
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))
+            .and_then(|rlconf| {
+                Ok(rlconf
+                    .get_named_rule_settings(&rule_name)
+                    .cloned()
+                    .map(|rl_settings| settings::NamedRateLimitRule {
+                        name: rule_name.to_string(),
+                        settings: rl_settings,
+                    }))
             })
-        } else {
-            Err(ColibriError::Api(format!("Rule '{}' not found", rule_name)))
-        }
     }
 
     /// Delete a named rate limit rule locally (without gossiping)

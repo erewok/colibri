@@ -207,7 +207,10 @@ impl Node for GossipNode {
             )))
         })
     }
-    async fn get_named_rule(&self, rule_name: String) -> Result<settings::NamedRateLimitRule> {
+    async fn get_named_rule(
+        &self,
+        rule_name: String,
+    ) -> Result<Option<settings::NamedRateLimitRule>> {
         let (tx, rx) = oneshot::channel();
         self.gossip_command_tx
             .send(GossipCommand::GetNamedRule {

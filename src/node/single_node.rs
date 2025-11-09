@@ -7,20 +7,21 @@ use tracing::info;
 use crate::error::{ColibriError, Result};
 use crate::limiters::token_bucket;
 use crate::node::{CheckCallsResponse, Node, NodeId};
-use crate::settings;
+use crate::settings::{NamedRateLimitRule, RateLimitConfig, RateLimitSettings, Settings};
 
 /// Standalone rate limiter node
 #[derive(Clone, Debug)]
 pub struct SingleNode {
+    pub node_id: NodeId,
     pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
-    pub rate_limit_config: Arc<RwLock<settings::RateLimitConfig>>,
+    pub rate_limit_config: Arc<RwLock<RateLimitConfig>>,
     pub named_rate_limiters:
         Arc<RwLock<HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>>>>,
 }
 
 #[async_trait]
 impl Node for SingleNode {
-    async fn new(node_id: NodeId, settings: settings::Settings) -> Result<Self>
+    async fn new(node_id: NodeId, settings: Settings) -> Result<Self>
     where
         Self: Sized,
     {
@@ -31,8 +32,9 @@ impl Node for SingleNode {
         );
         let rate_limiter: token_bucket::TokenBucketLimiter =
             token_bucket::TokenBucketLimiter::new(node_id, settings.rate_limit_settings());
-        let rate_limit_config = settings::RateLimitConfig::new(settings.rate_limit_settings());
+        let rate_limit_config = RateLimitConfig::new(settings.rate_limit_settings());
         Ok(Self {
+            node_id,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(RwLock::new(rate_limit_config)),
             named_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
@@ -57,21 +59,32 @@ impl Node for SingleNode {
     async fn create_named_rule(
         &self,
         rule_name: String,
-        settings: settings::RateLimitSettings,
+        settings: RateLimitSettings,
     ) -> Result<()> {
+        // check if already exists
+        {
+            let config = self.rate_limit_config.read().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            if config.get_named_rule_settings(&rule_name).is_some() {
+                return Ok(());
+            }
+        }
+
         // Add the rule to configuration
         {
             let mut config = self.rate_limit_config.write().map_err(|e| {
                 ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
             })?;
-            config.add_named_rule(rule_name.clone(), settings.clone());
+            let rule = NamedRateLimitRule {
+                name: rule_name.clone(),
+                settings: settings.clone(),
+            };
+            config.add_named_rule(&rule);
         }
 
         // Create a new rate limiter for this rule
-        let limiter = token_bucket::TokenBucketLimiter::new(
-            crate::node::node_id::NodeId::new(1), // TODO: use proper node id
-            settings,
-        );
+        let limiter = token_bucket::TokenBucketLimiter::new(self.node_id, settings);
 
         let mut limiters = self.named_rate_limiters.write().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
@@ -99,22 +112,22 @@ impl Node for SingleNode {
         Ok(())
     }
 
-    async fn get_named_rule(&self, rule_name: String) -> Result<settings::NamedRateLimitRule> {
-        let rl_settings = self
-            .rate_limit_config
+    async fn get_named_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
+        self.rate_limit_config
             .read()
             .map_err(|e| ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e)))
-            .and_then(|rlconf| match rlconf.get_named_rule_settings(&rule_name) {
-                Some(settings) => Ok(settings.clone()),
-                None => Err(ColibriError::Api(format!("Rule '{}' not found", rule_name))),
-            })?;
-        Ok(settings::NamedRateLimitRule {
-            name: rule_name,
-            settings: rl_settings,
-        })
+            .and_then(|rlconf| {
+                Ok(rlconf
+                    .get_named_rule_settings(&rule_name)
+                    .cloned()
+                    .map(|rl_settings| NamedRateLimitRule {
+                        name: rule_name,
+                        settings: rl_settings,
+                    }))
+            })
     }
 
-    async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+    async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
         let config = self.rate_limit_config.read().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
         })?;
@@ -235,7 +248,7 @@ pub async fn local_rate_limit(
 pub async fn local_rate_limit_with_settings(
     client_id: String,
     rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
-    settings: &settings::RateLimitSettings,
+    settings: &RateLimitSettings,
 ) -> Result<Option<CheckCallsResponse>> {
     match rate_limiter.lock() {
         Err(e) => {

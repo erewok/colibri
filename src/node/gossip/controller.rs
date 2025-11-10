@@ -687,14 +687,14 @@ impl GossipController {
         self.rate_limit_config
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))
-            .and_then(|rlconf| {
-                Ok(rlconf
-                    .get_named_rule_settings(&rule_name)
+            .map(|rlconf| {
+                rlconf
+                    .get_named_rule_settings(rule_name)
                     .cloned()
                     .map(|rl_settings| settings::NamedRateLimitRule {
                         name: rule_name.to_string(),
                         settings: rl_settings,
-                    }))
+                    })
             })
     }
 

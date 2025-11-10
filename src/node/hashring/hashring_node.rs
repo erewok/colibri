@@ -253,14 +253,14 @@ impl Node for HashringNode {
         self.rate_limit_config
             .read()
             .map_err(|e| ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e)))
-            .and_then(|rlconf| {
-                Ok(rlconf
+            .map(|rlconf| {
+                rlconf
                     .get_named_rule_settings(&rule_name)
                     .cloned()
                     .map(|rl_settings| settings::NamedRateLimitRule {
                         name: rule_name,
                         settings: rl_settings,
-                    }))
+                    })
             })
     }
 

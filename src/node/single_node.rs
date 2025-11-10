@@ -116,14 +116,14 @@ impl Node for SingleNode {
         self.rate_limit_config
             .read()
             .map_err(|e| ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e)))
-            .and_then(|rlconf| {
-                Ok(rlconf
+            .map(|rlconf| {
+                rlconf
                     .get_named_rule_settings(&rule_name)
                     .cloned()
                     .map(|rl_settings| NamedRateLimitRule {
                         name: rule_name,
                         settings: rl_settings,
-                    }))
+                    })
             })
     }
 
@@ -261,14 +261,10 @@ pub async fn local_rate_limit_with_settings(
             let calls_left =
                 rate_limiter.limit_calls_for_client_with_settings(client_id.to_string(), settings);
             if let Some(calls_remaining) = calls_left {
-                if calls_remaining == 0 {
-                    Ok(None)
-                } else {
-                    Ok(Some(CheckCallsResponse {
-                        client_id,
-                        calls_remaining,
-                    }))
-                }
+                Ok(Some(CheckCallsResponse {
+                    client_id,
+                    calls_remaining,
+                }))
             } else {
                 Ok(None)
             }

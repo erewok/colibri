@@ -46,7 +46,6 @@ fn create_rate_limit_rule_body(
     json!({
         "name": rule_name,
         "settings": {
-            "cluster_participant_count": 1,
             "rate_limit_max_calls_allowed": max_calls,
             "rate_limit_interval_seconds": interval_seconds
         }
@@ -198,7 +197,6 @@ mod custom_rate_limiting_behavior_tests {
         let rule_body = json!({
             "name": "strict-rule",
             "settings": {
-                "cluster_participant_count": 1,
                 "rate_limit_max_calls_allowed": 3,
                 "rate_limit_interval_seconds": 60
             }
@@ -250,17 +248,6 @@ mod custom_rate_limiting_behavior_tests {
         assert_eq!(response3.status(), StatusCode::OK);
 
         // Fourth request should be rate limited (no tokens remaining)
-        let limit_request3 = Request::builder()
-            .method(Method::POST)
-            .uri(&format!("/rl/strict-rule/{}", test_key))
-            .header("content-type", "application/json")
-            .body(Body::from("{}"))
-            .unwrap();
-
-        let response3 = app.clone().oneshot(limit_request3).await.unwrap();
-        assert_eq!(response3.status(), StatusCode::OK);
-
-        // Fourth request should be rate limited (no tokens remaining)
         let limit_request4 = Request::builder()
             .method(Method::POST)
             .uri(&format!("/rl/strict-rule/{}", test_key))
@@ -280,7 +267,6 @@ mod custom_rate_limiting_behavior_tests {
         let rule_body = json!({
             "name": "check-rule",
             "settings": {
-                "cluster_participant_count": 1,
                 "rate_limit_max_calls_allowed": 10,
                 "rate_limit_interval_seconds": 60
             }
@@ -350,7 +336,6 @@ mod custom_rate_limiting_behavior_tests {
         let permissive_rule = json!({
             "name": "permissive-rule",
             "settings": {
-                "cluster_participant_count": 1,
                 "rate_limit_max_calls_allowed": 1000,
                 "rate_limit_interval_seconds": 60
             }
@@ -369,7 +354,6 @@ mod custom_rate_limiting_behavior_tests {
         let strict_rule = json!({
             "name": "strict-rule",
             "settings": {
-                "cluster_participant_count": 1,
                 "rate_limit_max_calls_allowed": 1,
                 "rate_limit_interval_seconds": 60
             }
@@ -431,7 +415,6 @@ mod rule_isolation_tests {
         let rule1 = json!({
             "name": "rule-1",
             "settings": {
-                "cluster_participant_count": 1,
                 "rate_limit_max_calls_allowed": 5,
                 "rate_limit_interval_seconds": 60
             }
@@ -440,7 +423,6 @@ mod rule_isolation_tests {
         let rule2 = json!({
             "name": "rule-2",
             "settings": {
-                "cluster_participant_count": 1,
                 "rate_limit_max_calls_allowed": 3,
                 "rate_limit_interval_seconds": 60
             }
@@ -519,7 +501,6 @@ mod rule_isolation_tests {
         let rule_body = json!({
             "name": "isolation-rule",
             "settings": {
-                "cluster_participant_count": 1,
                 "rate_limit_max_calls_allowed": 2,
                 "rate_limit_interval_seconds": 60
             }
@@ -704,7 +685,6 @@ mod backward_compatibility_tests {
         let rule_body = json!({
             "name": "custom-rule",
             "settings": {
-                "cluster_participant_count": 1,
                 "rate_limit_max_calls_allowed": 5,
                 "rate_limit_interval_seconds": 60
             }

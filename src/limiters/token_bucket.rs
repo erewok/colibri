@@ -271,7 +271,6 @@ mod tests {
         };
 
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
         };
@@ -318,7 +317,6 @@ mod tests {
     #[test]
     fn test_token_bucket_overflow_protection() {
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
         };
@@ -338,7 +336,6 @@ mod tests {
     #[test]
     fn test_token_bucket_minimum_time_diff() {
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
         };
@@ -377,7 +374,6 @@ mod tests {
     #[test]
     fn test_token_rate_calculation() {
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
         };
@@ -395,7 +391,6 @@ mod tests {
     #[tokio::test]
     async fn test_token_refill_over_time() {
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
         };
@@ -421,7 +416,6 @@ mod tests {
 
     fn get_settings() -> settings::RateLimitSettings {
         settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
         }
@@ -554,7 +548,6 @@ mod tests {
     #[test]
     fn test_rate_limiter_with_zero_tokens() {
         let zero_settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 0,
             rate_limit_interval_seconds: 1,
         };
@@ -579,7 +572,6 @@ mod tests {
     fn test_rate_limiter_settings_impact() {
         // Test with high limits
         let high_limit = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
         };

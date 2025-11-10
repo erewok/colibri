@@ -8,7 +8,7 @@ use crate::settings;
 
 /// Rate limiter bucket interface
 pub trait Bucket {
-    fn new(node_id: NodeId) -> Self;
+    fn new(node_id: NodeId, max_calls: u32) -> Self;
     fn add_tokens_to_bucket(
         &mut self,
         rate_limit_settings: &settings::RateLimitSettings,
@@ -35,8 +35,11 @@ impl Default for TokenBucket {
 }
 
 impl Bucket for TokenBucket {
-    fn new(_node_id: NodeId) -> Self {
-        TokenBucket::default()
+    fn new(_node_id: NodeId, max_calls: u32) -> Self {
+        TokenBucket {
+            tokens: max_calls as f64,
+            last_call: Utc::now().timestamp_millis(),
+        }
     }
     /// Function for adding tokens to the bucket.
     /// Tokens are added at the rate of token_rate * time_since_last_request
@@ -104,10 +107,7 @@ impl TokenBucketLimiter {
     }
 
     pub fn new_bucket(&self) -> TokenBucket {
-        let mut bucket = TokenBucket::new(self.node_id);
-        // Start with full capacity for new buckets
-        bucket.tokens = self.settings.rate_limit_max_calls_allowed as f64;
-        bucket
+        TokenBucket::new(self.node_id, self.settings.rate_limit_max_calls_allowed)
     }
 
     // It's possible that updates happen around this object
@@ -205,7 +205,7 @@ impl TokenBucketLimiter {
             }
         } else {
             // Create new bucket - first call is always allowed
-            let mut new_bucket = TokenBucket::new(self.node_id);
+            let mut new_bucket = TokenBucket::new(self.node_id, settings.rate_limit_max_calls_allowed);
             // Set tokens to max for the provided settings
             new_bucket.tokens = f64::from(settings.rate_limit_max_calls_allowed);
             new_bucket.decrement(); // Use one token

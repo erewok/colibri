@@ -1,19 +1,32 @@
 //! Comprehensive integration tests for the configurable rate limits feature.
 //! These tests focus on behavior rather than implementation details, testing
 //! the feature from the API level down to actual rate limiting enforcement.
-
-use colibri::api;
-use colibri::node::NodeWrapper;
-use colibri::settings::{NamedRateLimitRule, RunMode, Settings};
 use std::collections::HashSet;
+use std::sync::Once;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt; // for `call`, `oneshot`, etc.
 
+use colibri::api;
+use colibri::node::NodeWrapper;
+use colibri::settings::{NamedRateLimitRule, RunMode, Settings};
+
+
+static INIT: Once = Once::new();
+
+/// Envlogger setup function
+fn setup() {
+    INIT.call_once(|| {
+        env_logger::init();
+    });
+}
+
+
 /// Helper to create test settings for a single node
 fn create_test_settings() -> Settings {
+    setup();
     Settings {
         listen_address: "127.0.0.1".to_string(),
         listen_port_api: 8410,

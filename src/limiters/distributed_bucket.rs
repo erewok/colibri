@@ -23,20 +23,11 @@ pub struct DistributedRequestCounter {
 impl DistributedRequestCounter {
     /// Create a new DistributedRequestCounter for a given node
     pub fn new(node_id: NodeId) -> Self {
-        let mut fills = PNCounter::new();
-        // start with 1: matches initial token bucket state
-        let op = fills.inc(node_id);
-        fills.apply(op);
-
-        let mut vclock = VClock::new();
-        let op = vclock.inc(node_id);
-        vclock.apply(op);
-
         Self {
             node_id,
-            refills: fills,
+            refills:  PNCounter::new(),
             requests: PNCounter::new(),
-            vclock,
+            vclock: VClock::new(),
         }
     }
     fn expire_op_steps(&mut self, op: &InternalPnCounterOp) {
@@ -68,21 +59,15 @@ impl DistributedRequestCounter {
         self.vclock.apply(op);
     }
 
-    pub fn dec_request(&mut self, node_id: NodeId) {
-        let op = self.requests.dec(node_id);
-        self.requests.apply(op);
-        let op = self.vclock.inc(node_id);
-        self.vclock.apply(op);
-    }
-
     pub fn tokens(&self) -> BigInt {
         let refills = self.refills.read();
         let requests = self.requests.read();
+        let val = &refills - &requests;
         debug!(
-            "Calculating tokens: refills={}, requests={}",
-            refills, requests
+            "Calculating tokens {}: refills={}, requests={}",
+            val, refills, requests
         );
-        refills - requests
+        val
     }
 }
 
@@ -119,6 +104,7 @@ impl CvRDT for DistributedRequestCounter {
         self.requests.merge(other.requests);
         self.vclock.merge(other.vclock);
     }
+
     fn validate_merge(&self, other: &Self) -> Result<(), Self::Validation> {
         self.refills.validate_merge(&other.refills)?;
         self.requests.validate_merge(&other.requests)?;
@@ -225,10 +211,19 @@ impl DistributedBucket {
         for (idx, entry) in self.requests.iter().enumerate() {
             if now_ms - (entry.timestamp_ms) > expiration_threshold_ms {
                 // Expire this entry
+                debug!(
+                    "Expiring entry {:?} from bucket for node {}: timestamp_ms={}, now_ms={}",
+                    entry, self.node_id, entry.timestamp_ms, now_ms
+                );
                 self.counter.expire_op_steps(&entry.op);
                 entries_to_remove.push(idx);
             }
         }
+        debug!(
+            "Expired {} entries from bucket for node {}",
+            entries_to_remove.len(),
+            self.node_id
+        );
         // Remove expired entries from the requests vector
         for &idx in entries_to_remove.iter().rev() {
             self.requests.remove(idx);
@@ -248,13 +243,15 @@ impl DistributedBucket {
 }
 
 impl Bucket for DistributedBucket {
-    fn new(node_id: NodeId) -> Self {
-        Self {
+    fn new(node_id: NodeId, max_calls: u32) -> Self {
+        let mut instance = Self {
             node_id,
             counter: DistributedRequestCounter::new(node_id),
             requests: Vec::new(),
             last_call: Utc::now().timestamp_millis(),
-        }
+        };
+        instance.counter.inc_refills(node_id, max_calls as u64);
+        instance
     }
 
     fn add_tokens_to_bucket(
@@ -272,8 +269,10 @@ impl Bucket for DistributedBucket {
         // For this algorithm we arbitrarily do not trust intervals less than 5ms,
         // so we only *add* tokens if the diff is greater than that.
         let diff_ms: i32 = diff_ms as i32;
+        debug!("Token bucket diff_ms: {}", diff_ms);
         if diff_ms < 5i32 {
             // no-op
+            debug!("Not adding tokens to bucket: diff_ms < 5ms");
             return self;
         }
         // Tokens are added at the token rate,
@@ -291,39 +290,32 @@ impl Bucket for DistributedBucket {
             vclock: self.vclock(),
         });
         self.counter.inc_refills(self.counter.node_id, steps);
+        debug!("Updated bucket after adding tokens: {:?}", self.counter);
         self.last_call = Utc::now().timestamp_millis();
         self
     }
 
     fn decrement(&mut self) -> &mut Self {
-        if !self.check_if_allowed() {
-            return self;
-        } else {
-            self.requests.push(InternalRequestEntry {
-                op: InternalPnCounterOp::Requests(1),
-                timestamp_ms: Utc::now().timestamp_millis(),
-                vclock: self.vclock(),
-            });
-            self.counter.inc_request(self.counter.node_id);
-        }
+        self.requests.push(InternalRequestEntry {
+            op: InternalPnCounterOp::Requests(1),
+            timestamp_ms: Utc::now().timestamp_millis(),
+            vclock: self.vclock(),
+        });
+        self.counter.inc_request(self.counter.node_id);
         self
     }
 
     fn check_if_allowed(&self) -> bool {
-        let tokens = self.counter.tokens();
+        let tokens = self.tokens_to_u32();
         debug!("Checking if allowed: tokens={}", tokens);
-        tokens >= 1.into()
+        tokens >= 1
     }
 
     fn tokens_to_u32(&self) -> u32 {
-        let tokens = self.counter.tokens();
-        if tokens >= BigInt::from(u32::MAX) {
-            return u32::MAX;
-        }
-        tokens
+        self.counter.tokens()
             .clamp(BigInt::from(0), BigInt::from(u32::MAX))
             .to_u32()
-            .unwrap_or(u32::MAX)
+            .unwrap_or(0)
     }
 }
 
@@ -387,18 +379,13 @@ impl DistributedBucketLimiter {
             key.clone(),
             |_counter: &DistributedBucket| {
                 let mut counter = _counter.clone();
-                counter.add_tokens_to_bucket(&self.rate_limit_settings);
-                if counter.check_if_allowed() {
-                    counter.decrement();
-                    counter
-                } else {
-                    counter
-                }
-            },
-            || {
-                let mut counter = DistributedBucket::new(self.node_id);
+                debug!("Existing bucket found for client {}", key);
                 counter.add_tokens_to_bucket(&self.rate_limit_settings);
                 counter
+            },
+            || {
+                debug!("Creating new bucket for client {}", key);
+                DistributedBucket::new(self.node_id, self.rate_limit_settings.rate_limit_max_calls_allowed)
             },
         );
         self.node_counters.pin().get(&key).and_then(|counter| {
@@ -499,18 +486,15 @@ mod tests {
         let node_id = NodeId::new(1);
         let mut counter = DistributedRequestCounter::new(node_id);
 
-        // Should start with 1 token (initial refill)
-        assert_eq!(counter.tokens(), BigInt::from(1));
+        // Should start with 0 tokens
+        assert_eq!(counter.tokens(), BigInt::from(0));
 
         // Add tokens and consume them
         counter.inc_refills(node_id, 5);
-        assert_eq!(counter.tokens(), BigInt::from(6)); // 1 + 5
+        assert_eq!(counter.tokens(), BigInt::from(5));
 
         counter.inc_request(node_id);
-        assert_eq!(counter.tokens(), BigInt::from(5)); // 6 - 1
-
-        counter.dec_request(node_id); // Undo request
-        assert_eq!(counter.tokens(), BigInt::from(6)); // 5 + 1
+        assert_eq!(counter.tokens(), BigInt::from(4)); // 5 - 1
     }
 
     #[test]
@@ -530,12 +514,12 @@ mod tests {
         counter2.inc_request(node2);
 
         // Before merge: counter1 = 3 (1+3-1), counter2 = 1 (1+2-2)
-        assert_eq!(counter1.tokens(), BigInt::from(3));
-        assert_eq!(counter2.tokens(), BigInt::from(1));
+        assert_eq!(counter1.tokens(), BigInt::from(2));
+        assert_eq!(counter2.tokens(), BigInt::from(0));
 
-        // After merge: should see combined state = 4 (3 + 1)
+        // After merge: should see combined state = 2 (2 + 0)
         counter1.merge(counter2.clone());
-        assert_eq!(counter1.tokens(), BigInt::from(4));
+        assert_eq!(counter1.tokens(), BigInt::from(2));
     }
 
     // === Bucket-Level Tests ===
@@ -543,7 +527,7 @@ mod tests {
     #[test]
     fn test_bucket_rate_limiting() {
         let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id);
+        let mut bucket = DistributedBucket::new(node_id, 1);
 
         // Start with 1 token - should be allowed
         assert!(bucket.check_if_allowed());
@@ -555,15 +539,15 @@ mod tests {
         // Should not be allowed anymore
         assert!(!bucket.check_if_allowed());
 
-        // Decrementing when not allowed should be no-op
+        // Decrementing goes below 0 (consistent with TokenBucket behavior)
         bucket.decrement();
-        assert_eq!(bucket.counter.tokens(), BigInt::from(0));
+        assert_eq!(bucket.counter.tokens(), BigInt::from(-1));
     }
 
     #[test]
     fn test_bucket_token_replenishment() {
         let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id);
+        let mut bucket = DistributedBucket::new(node_id, 1000);
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 1000,
             rate_limit_interval_seconds: 1,
@@ -583,7 +567,7 @@ mod tests {
     #[test]
     fn test_bucket_expiration() {
         let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id);
+        let mut bucket = DistributedBucket::new(node_id, 1000);
 
         // Add entries with different ages
         bucket.requests.push(InternalRequestEntry {
@@ -607,7 +591,7 @@ mod tests {
         assert_eq!(bucket.requests.len(), 1);
 
         // Empty bucket should be expirable
-        let empty_bucket = DistributedBucket::new(node_id);
+        let empty_bucket = DistributedBucket::new(node_id, 1000);
         assert!(empty_bucket.can_expire(1000));
 
         // Bucket with recent activity should not be expirable
@@ -773,7 +757,7 @@ mod tests {
     #[test]
     fn test_external_serialization() {
         let node_id = NodeId::new(1);
-        let bucket = DistributedBucket::new(node_id);
+        let bucket = DistributedBucket::new(node_id, 10);
 
         // Convert to external format (for gossip)
         let external = bucket.to_external("test_client");

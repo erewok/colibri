@@ -1,13 +1,25 @@
 //! Tests for configurable rate limits functionality across different node types.
 //! This ensures the feature works consistently for Single, Gossip, and Hashring nodes.
-
 use std::collections::HashSet;
+use std::sync::Once;
 
 use colibri::node::{GossipNode, HashringNode, Node, NodeId, NodeWrapper, SingleNode};
 use colibri::settings::{RateLimitSettings, RunMode, Settings};
 
+
+static INIT: Once = Once::new();
+
+/// Envlogger setup function
+fn setup() {
+    INIT.call_once(|| {
+        env_logger::init();
+    });
+}
+
+
 /// Helper to create settings for single node
 fn single_node_settings() -> Settings {
+    setup();
     Settings {
         listen_address: "127.0.0.1".to_string(),
         listen_port_api: 8410,
@@ -25,6 +37,7 @@ fn single_node_settings() -> Settings {
 
 /// Helper to create settings for gossip node
 fn gossip_node_settings() -> Settings {
+    setup();
     let mut topology = HashSet::new();
     topology.insert("127.0.0.1:8410".to_string());
 
@@ -45,6 +58,7 @@ fn gossip_node_settings() -> Settings {
 
 /// Helper to create settings for hashring node
 fn hashring_node_settings() -> Settings {
+    setup();
     let mut topology = HashSet::new();
     topology.insert("127.0.0.1:8410".to_string());
 
@@ -273,7 +287,7 @@ mod gossip_node_tests {
             .check_limit_custom("gossip-limit".to_string(), test_key.to_string())
             .await
             .unwrap();
-        // assert_eq!(check_result2.calls_remaining, 3);
+        assert_eq!(check_result2.calls_remaining, 3);
     }
 }
 
@@ -412,7 +426,7 @@ mod node_wrapper_tests {
             .unwrap();
         assert!(rate_result.is_some());
         // TODO: check why we fail here
-        // assert_eq!(rate_result.unwrap().calls_remaining, 14);
+        assert_eq!(rate_result.unwrap().calls_remaining, 14);
     }
 
     #[tokio::test]

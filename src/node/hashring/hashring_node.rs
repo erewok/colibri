@@ -1,8 +1,11 @@
-use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tracing::{error, info, warn};
+use std::sync::{Arc, Mutex, RwLock};
 
+use async_trait::async_trait;
+use tracing::{debug, error, info, warn};
+use url::Url;
+
+use crate::api::paths;
 use crate::error::{ColibriError, Result};
 use crate::limiters::token_bucket;
 use crate::node::{
@@ -12,21 +15,27 @@ use crate::node::{
 };
 use crate::settings;
 
+/// Replication factor for data distribution
 pub enum ReplicationFactor {
     One = 1,
     Two = 2,
     Three = 3,
 }
 
+/// Consistent hash ring distributed rate limiter node
 #[derive(Clone, Debug)]
 pub struct HashringNode {
     pub node_id: NodeId,
     bucket: u32,
     number_of_buckets: u32,
     listen_api: String,
-    pub topology: HashMap<u32, String>,
+    // Connection-pooling clients reuse TCP connections to each node
+    pub topology: HashMap<u32, (Url, reqwest::Client)>,
     // replication_factor: ReplicationFactor,
     pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
+    pub rate_limit_config: Arc<RwLock<settings::RateLimitConfig>>,
+    pub named_rate_limiters:
+        Arc<RwLock<HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>>>>,
 }
 
 #[async_trait]
@@ -36,31 +45,44 @@ impl Node for HashringNode {
         let rate_limiter: token_bucket::TokenBucketLimiter =
             token_bucket::TokenBucketLimiter::new(node_id, rl_settings);
 
-        let listen_api = format!("{}:{}", settings.listen_address, settings.listen_port_api);
+        let listen_api = if settings.listen_address.contains("http") {
+            format!("{}:{}", settings.listen_address, settings.listen_port_api)
+        } else {
+            format!(
+                "http://{}:{}",
+                settings.listen_address, settings.listen_port_api
+            )
+        };
 
-        // get the bucket count to use in consistent hashing calls (assuming self is present in topology)
         let number_of_buckets = settings.topology.len().try_into()?;
 
-        // Use consistent hashing to assign buckets to nodes
-        // Every node must use the same identifiers for other nodes.
-        // This node must be a listed member of the topology.
+        // Assign buckets using consistent hashing
         let topology = settings
             .topology
             .iter()
-            .map(|host| {
-                (
-                    consistent_hashing::jump_consistent_hash(host.as_str(), number_of_buckets),
-                    host.to_string(),
-                )
+            .filter_map(|host| {
+                let bucketnum =
+                    consistent_hashing::jump_consistent_hash(host.as_str(), number_of_buckets);
+                let host = if !host.contains("http") {
+                    format!("http://{}", host)
+                } else {
+                    host.to_string()
+                };
+                let url = Url::parse(host.as_str()).ok()?;
+                let client = reqwest::Client::builder()
+                    .pool_idle_timeout(std::time::Duration::from_secs(90))
+                    .build()
+                    .ok()?;
+                Some((bucketnum, (url, client)))
             })
-            .collect::<HashMap<u32, String>>();
+            .collect::<HashMap<u32, (Url, reqwest::Client)>>();
 
-        // find the bucket ID that consistently maps to *this* node's listen address
-        // fail early if this node's listen address is not in the topology
+        // Find this node's bucket assignment
         let bucket: u32 = topology
             .iter()
             .find_map(|(bucket, host)| {
-                if host.contains(&listen_api) {
+                debug!("Checking host {:?} against listen_api {}", host.0.as_str(), listen_api);
+                if host.0.as_str().contains(&listen_api) {
                     Some(*bucket)
                 } else {
                     None
@@ -68,7 +90,7 @@ impl Node for HashringNode {
             })
             .ok_or_else(|| {
                 error!(
-                    "[Node<{}>] Critical failure: Listen address for this node {} not found in topology! {:?}",
+                    "[Node<{}>] Critical failure: Listen address for this node '{}' not found in topology! {:?}",
                     node_id, listen_api, settings.topology
                 );
                 ColibriError::Config(format!(
@@ -81,6 +103,8 @@ impl Node for HashringNode {
             "[Node<{}>] Hashring node starting at {} with bucket {} out of {} buckets and topology {:?}",
             node_id, listen_api, bucket, number_of_buckets, topology
         );
+        let rate_limit_config = settings::RateLimitConfig::new(settings.rate_limit_settings());
+
         Ok(Self {
             node_id,
             bucket,
@@ -89,38 +113,35 @@ impl Node for HashringNode {
             topology,
             // replication_factor: ReplicationFactor,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
+            rate_limit_config: Arc::new(RwLock::new(rate_limit_config)),
+            named_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
         })
     }
+
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
         let bucket =
             consistent_hashing::jump_consistent_hash(client_id.as_str(), self.number_of_buckets);
-        if bucket == self.bucket {
-            local_check_limit(client_id, self.rate_limiter.clone()).await
-        } else {
-            info!(
-                "[bucket {}] Requesting data from bucket {} {:?}",
-                self.bucket, bucket, self.topology
-            );
-            // Use bucket to select into the topology HashMap
-            match self.topology.get(&bucket) {
-                Some(host) => {
-                    if host.contains(&self.listen_api) {
-                        // shouldn't happen, but just in case
-                        warn!("Host {} from bucket {} matches our own listen API (but not self.bucket? {}), using local check_limit", host, bucket, self.bucket);
-                        return local_check_limit(client_id, self.rate_limiter.clone()).await;
-                    }
-                    let url = format!("{}/rl-check/{}", host, client_id);
-                    reqwest::Client::new()
-                        .get(url)
-                        .send()
-                        .await?
-                        .json()
-                        .await
-                        .map_err(Into::into)
-                }
-                // fallback to self?
-                None => local_check_limit(client_id, self.rate_limiter.clone()).await,
+
+        // Use bucket to select into the topology HashMap
+        match self.get_topology_address_for_bucket(bucket) {
+            Some((host, client)) => {
+                info!(
+                    "[bucket {}] Requesting data from bucket {} at {}",
+                    self.bucket, bucket, host
+                );
+                let path = paths::drop_leading_slash(paths::default_rate_limits::CHECK)
+                    .replace("{client_id}", &client_id);
+                let url = format!("{}{}", host, path);
+                client
+                    .get(url)
+                    .send()
+                    .await?
+                    .json()
+                    .await
+                    .map_err(Into::into)
             }
+            // fallback to self?
+            None => local_check_limit(client_id, self.rate_limiter.clone()).await,
         }
     }
 
@@ -128,39 +149,31 @@ impl Node for HashringNode {
         let number_of_buckets = self.topology.len().try_into()?;
         let bucket =
             consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
-        if bucket == self.bucket {
-            local_rate_limit(client_id, self.rate_limiter.clone()).await
-        } else {
-            // Use bucket to select into the topology HashMap
-            // The problem right now is that if this is a 429, we want to send that back
-            info!("Requesting data from bucket {}", bucket);
-            match self.topology.get(&bucket) {
-                Some(host) => {
-                    if host.contains(&self.listen_api) {
-                        // shouldn't happen, but just in case
-                        warn!("Host {} from bucket {} matches our own listen API (but not self.bucket? {}), using local check_limit", host, bucket, self.bucket);
-                        return local_rate_limit(client_id, self.rate_limiter.clone()).await;
-                    }
-                    let url = format!("{}/rl/{}", host, client_id);
-                    info!("Sending request to {}", url);
-                    let resp = reqwest::Client::new()
-                        .post(url)
-                        .header("content-type", "application/json")
-                        .body("{}")
-                        .send()
-                        .await?;
-
-                    let status = resp.status().as_u16();
-                    info!("Received status code {}", status);
-                    if status == 429 {
-                        Ok(None)
-                    } else {
-                        resp.json().await.map_err(Into::into)
-                    }
+        match self.get_topology_address_for_bucket(bucket) {
+            Some((host, client)) => {
+                let path = paths::drop_leading_slash(paths::default_rate_limits::LIMIT)
+                    .replace("{client_id}", &client_id);
+                let url = format!("{}{}", host, path);
+                info!(
+                    "[bucket {}] Requesting data from bucket {} at {}",
+                    self.bucket, bucket, url
+                );
+                let resp = client
+                    .post(url)
+                    .header("content-type", "application/json")
+                    .body("{}")
+                    .send()
+                    .await?;
+                let status = resp.status().as_u16();
+                info!("Received status code {}", status);
+                if status == 429 {
+                    Ok(None)
+                } else {
+                    resp.json().await.map_err(Into::into)
                 }
-                // fallback to self?
-                None => local_rate_limit(client_id, self.rate_limiter.clone()).await,
             }
+            // fallback to self
+            None => local_rate_limit(client_id, self.rate_limiter.clone()).await,
         }
     }
 
@@ -170,6 +183,281 @@ impl Node for HashringNode {
         })?;
         rate_limiter.expire_keys();
         Ok(())
+    }
+
+    async fn create_named_rule(
+        &self,
+        rule_name: String,
+        settings: settings::RateLimitSettings,
+    ) -> Result<()> {
+        // check if already exists
+        {
+            let config = self.rate_limit_config.read().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            if config.get_named_rule_settings(&rule_name).is_some() {
+                return Ok(());
+            }
+        }
+
+        // Add the rule to our local configuration
+        {
+            let mut config = self.rate_limit_config.write().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            let rule = settings::NamedRateLimitRule {
+                name: rule_name.clone(),
+                settings: settings.clone(),
+            };
+            config.add_named_rule(&rule);
+        }
+
+        // Create a new rate limiter for this rule
+        let rate_limiter = token_bucket::TokenBucketLimiter::new(self.node_id, settings.clone());
+        {
+            let mut limiters = self.named_rate_limiters.write().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            limiters.insert(rule_name.clone(), Arc::new(Mutex::new(rate_limiter)));
+        }
+
+        // Propagate rule to other nodes
+        for (node_address, _client) in self.topology.values() {
+            if !self.topology_address_is_self(node_address) {
+                let path = paths::drop_leading_slash(paths::custom::RULE_CONFIG)
+                    .replace("{rule_name}", &rule_name);
+                let url = format!("{}{}", node_address, path);
+                let client = reqwest::Client::new();
+                let response = client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .json(&settings)
+                    .send()
+                    .await;
+
+                if let Err(e) = response {
+                    warn!(
+                        "Failed to sync rule {} to node {}: {}",
+                        rule_name, node_address, e
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_named_rule(
+        &self,
+        rule_name: String,
+    ) -> Result<Option<settings::NamedRateLimitRule>> {
+        self.rate_limit_config
+            .read()
+            .map_err(|e| ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e)))
+            .map(|rlconf| {
+                rlconf
+                    .get_named_rule_settings(&rule_name)
+                    .cloned()
+                    .map(|rl_settings| settings::NamedRateLimitRule {
+                        name: rule_name,
+                        settings: rl_settings,
+                    })
+            })
+    }
+
+    async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
+        // Remove from local configuration
+        {
+            let mut config = self.rate_limit_config.write().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            config.remove_named_rule(&rule_name);
+        }
+
+        // Remove the rate limiter
+        {
+            let mut limiters = self.named_rate_limiters.write().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            limiters.remove(&rule_name);
+        }
+
+        // Propagate the deletion to all other nodes in the topology
+        for (node_address, client) in self.topology.values() {
+            if !self.topology_address_is_self(node_address) {
+                // Delete rule from remote node
+                let path = paths::drop_leading_slash(paths::custom::RULE_CONFIG)
+                    .replace("{rule_name}", &rule_name);
+                let url = format!("{}{}", node_address, path);
+                let response = client.delete(&url).send().await;
+
+                if let Err(e) = response {
+                    warn!(
+                        "Failed to delete rule {} from node {}: {}",
+                        rule_name, node_address, e
+                    );
+                    // Continue with other nodes rather than failing completely
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+        let config = self.rate_limit_config.read().map_err(|e| {
+            ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+        })?;
+        Ok(config.list_named_rules())
+    }
+
+    async fn rate_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
+        // Use consistent hashing to determine which node should handle this key
+        let bucket = consistent_hashing::jump_consistent_hash(&key, self.number_of_buckets);
+        match self.get_topology_address_for_bucket(bucket) {
+            Some((host, client)) => {
+                let path = paths::drop_leading_slash(paths::custom::LIMIT)
+                    .replace("{rule_name}", &rule_name)
+                    .replace("{key}", &key);
+                let url = format!("{}{}", host, path);
+                let response = client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .body("{}")
+                    .send()
+                    .await?;
+                let status = response.status().as_u16();
+                if status == 429 {
+                    Ok(None)
+                } else if status == 200 {
+                    let resp: CheckCallsResponse = response.json().await?;
+                    Ok(Some(resp))
+                } else {
+                    Err(ColibriError::Api(format!(
+                        "Remote node returned status {}",
+                        status
+                    )))
+                }
+            }
+            None => {
+                // Fallback to local handling
+                warn!("No node found for bucket {}, handling locally", bucket);
+                self.local_rate_limit_custom(rule_name, key).await
+            }
+        }
+    }
+
+    async fn check_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<CheckCallsResponse> {
+        // Use consistent hashing to determine which node should handle this key
+        let bucket = consistent_hashing::jump_consistent_hash(&key, self.number_of_buckets);
+        match self.get_topology_address_for_bucket(bucket) {
+            Some((host, client)) => {
+                let path = paths::drop_leading_slash(paths::custom::CHECK)
+                    .replace("{rule_name}", &rule_name)
+                    .replace("{key}", &key);
+                let url = format!("{}{}", host, path);
+                let response = client.get(&url).send().await?;
+                let resp: CheckCallsResponse = response.json().await?;
+                Ok(resp)
+            }
+            None => {
+                // Handle locally
+                self.local_check_limit_custom(rule_name, key).await
+            }
+        }
+    }
+}
+
+impl HashringNode {
+    fn topology_address_is_self(&self, address: &Url) -> bool {
+        // confirm that the address matches our own listen_api: we DO NOT WANT TO SEND REQUESTS TO SELF!
+        address.as_str().contains(&self.listen_api)
+    }
+
+    fn get_topology_address_for_bucket(&self, bucket: u32) -> Option<(&Url, &reqwest::Client)> {
+        // Pull the address for the given bucket from the topology
+        // If None -> local handling!
+        if bucket == self.bucket {
+            // Handle locally
+            return None;
+        }
+        match self.topology.get(&bucket) {
+            Some((node_address, client)) => {
+                if !self.topology_address_is_self(node_address) {
+                    Some((node_address, client))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    }
+
+    async fn local_rate_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
+        // Get the settings for this rule
+        let settings = {
+            let config = self.rate_limit_config.read().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            match config.get_named_rule_settings(&rule_name) {
+                Some(settings) => settings.clone(),
+                None => return Err(ColibriError::Api(format!("Rule '{}' not found", rule_name))),
+            }
+        };
+
+        // Get the limiter for this rule
+        let rate_limiter = {
+            let limiters = self.named_rate_limiters.read().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            match limiters.get(&rule_name) {
+                Some(limiter) => limiter.clone(),
+                None => {
+                    return Err(ColibriError::Api(format!(
+                        "Limiter for rule '{}' not found",
+                        rule_name
+                    )))
+                }
+            }
+        };
+
+        // Use the custom limiter with custom settings
+        crate::node::single_node::local_rate_limit_with_settings(key, rate_limiter, &settings).await
+    }
+
+    async fn local_check_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<CheckCallsResponse> {
+        // Get the limiter for this rule
+        let rate_limiter = {
+            let limiters = self.named_rate_limiters.read().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            match limiters.get(&rule_name) {
+                Some(limiter) => limiter.clone(),
+                None => {
+                    return Err(ColibriError::Api(format!(
+                        "Limiter for rule '{}' not found",
+                        rule_name
+                    )))
+                }
+            }
+        };
+
+        // Check limit without consuming tokens
+        local_check_limit(key, rate_limiter).await
     }
 }
 
@@ -252,7 +540,7 @@ mod tests {
         assert!(node
             .topology
             .values()
-            .any(|host| host.contains("127.0.0.1:8410")));
+            .any(|host| node.topology_address_is_self(&host.0)));
     }
     #[tokio::test]
     async fn test_hashring_node_local_rate_limiting() {
@@ -310,7 +598,7 @@ mod tests {
 
         // Verify the topology mapping is correct
         let our_host = node.topology.get(&node.bucket).unwrap();
-        assert!(our_host.contains("127.0.0.1:8410"));
+        assert!(node.topology_address_is_self(&our_host.0));
     }
 
     #[tokio::test]

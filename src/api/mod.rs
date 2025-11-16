@@ -10,6 +10,8 @@ use tokio::time::Duration;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 
+pub mod paths;
+
 use crate::error::Result;
 use crate::node;
 
@@ -19,15 +21,48 @@ pub async fn api(rl_node: node::NodeWrapper) -> Result<Router> {
 
     // Endpoints
     let api = Router::new()
-        .route("/", routing::get(base::root))
-        .route("/health", routing::get(base::health))
-        .route("/about", routing::get(base::about))
-        .route("/rl/{client_id}", routing::post(rate_limits::rate_limit))
+        .route(paths::base::ROOT, routing::get(base::root))
+        .route(paths::base::HEALTH, routing::get(base::health))
+        .route(paths::base::ABOUT, routing::get(base::about))
+        .route(paths::EXPIRE_KEYS, routing::post(rate_limits::expire_keys))
+        // Default rate limiting (existing behavior)
         .route(
-            "/rl-check/{client_id}",
+            paths::default_rate_limits::CHECK,
             routing::get(rate_limits::check_limit),
         )
-        .route("/expire-keys", routing::post(rate_limits::expire_keys))
+        .route(
+            paths::default_rate_limits::LIMIT,
+            routing::post(rate_limits::rate_limit),
+        )
+        // Configuration management
+        // List endpoints
+        .route(
+            paths::custom::RULE_CONFIG,
+            routing::get(rate_limits::list_named_rate_limit_rules),
+        )
+        .route(
+            paths::custom::RULE_CONFIG,
+            routing::post(rate_limits::create_named_rate_limit_rule),
+        )
+        // Detail endpoints
+        .route(
+            paths::custom::RULE,
+            routing::get(rate_limits::get_named_rate_limit_rule),
+        )
+        .route(
+            paths::custom::RULE,
+            routing::delete(rate_limits::delete_named_rate_limit_rule),
+        )
+        // Custom rate limiting
+        .route(
+            paths::custom::CHECK,
+            routing::get(rate_limits::check_limit_custom),
+        )
+        .route(
+            paths::custom::LIMIT,
+            routing::post(rate_limits::rate_limit_custom),
+        )
+        // Middleware
         .layer(
             ServiceBuilder::new()
                 // Handle errors from middleware

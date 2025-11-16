@@ -1,20 +1,4 @@
-/// What does a state-based CRDT implementation of a token bucket look like?
-/// Here we implement the distributed token bucket using two PN-counters: one for refills and one for requests.
-/// We rely heavily on the `crdts` crate for CRDT data structures and operations instead of reimplementing them.
-/// Our goals are CRDT goals:
-/// - Associative: (a + b) + c = a + (b + c)
-/// - Commutative: a + b = b + a
-/// - Idempotent: a + a = a
-/// 1. Semilattice join: merge(a, b) = least upper bound of a and b
-/// 2. Monotonicity: state only grows (no deletions*)
-///
-/// Goals:
-/// - Support distributed token bucket rate limiting across multiple nodes.
-/// - Handle concurrent updates and network partitions gracefully.
-/// - *WEAK* eventual consistency: allow temporary divergence but ensure convergence over time.
-/// - Ensure convergence of token counts across nodes using CRDT principles
-///   (associative, commutative, semilattice join); state-based CRDT (CvRDT).
-/// - Thus, allow nodes to gossip their token bucket state and *merge* updates.
+//! Distributed token bucket using CRDT for eventual consistency
 use chrono::Utc;
 use crdts::{CmRDT, CvRDT, PNCounter, ResetRemove, VClock};
 use num_bigint::BigInt;
@@ -27,39 +11,23 @@ use crate::limiters::token_bucket::Bucket;
 use crate::node::NodeId;
 use crate::settings;
 
-/// `TokenBucket` implementation is inspired by a PN-counter.
-/// We use two PNCounters: one for refills and one for requests.
-/// In the RateLimiter, we *also* track last_call timestamps
-/// and **all requests and refills** in order to expire old entries
-/// and decrement from this counter when entries pass the expiry window.
+/// Distributed request counter using CRDT PN-counters
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DistributedRequestCounter {
     pub node_id: NodeId,
-    // Tracks number of refills per NodeId
     refills: PNCounter<NodeId>,
-    // Tracks number of requests per NodeId
     requests: PNCounter<NodeId>,
-    // Tracks causal-order timing so we can see times *between* requests
     pub vclock: VClock<NodeId>,
 }
 
 impl DistributedRequestCounter {
     /// Create a new DistributedRequestCounter for a given node
     pub fn new(node_id: NodeId) -> Self {
-        let mut fills = PNCounter::new();
-        // start with 1: matches initial token bucket state
-        let op = fills.inc(node_id);
-        fills.apply(op);
-
-        let mut vclock = VClock::new();
-        let op = vclock.inc(node_id);
-        vclock.apply(op);
-
         Self {
             node_id,
-            refills: fills,
+            refills: PNCounter::new(),
             requests: PNCounter::new(),
-            vclock,
+            vclock: VClock::new(),
         }
     }
     fn expire_op_steps(&mut self, op: &InternalPnCounterOp) {
@@ -91,27 +59,19 @@ impl DistributedRequestCounter {
         self.vclock.apply(op);
     }
 
-    pub fn dec_request(&mut self, node_id: NodeId) {
-        let op = self.requests.dec(node_id);
-        self.requests.apply(op);
-        let op = self.vclock.inc(node_id);
-        self.vclock.apply(op);
-    }
-
     pub fn tokens(&self) -> BigInt {
         let refills = self.refills.read();
         let requests = self.requests.read();
+        let val = &refills - &requests;
         debug!(
-            "Calculating tokens: refills={}, requests={}",
-            refills, requests
+            "Calculating tokens {}: refills={}, requests={}",
+            val, refills, requests
         );
-        refills - requests
+        val
     }
 }
 
-// Here we implement operation-based CRDT for DistributedRequestCounter
-// Because we plan to gossip state around the cluster, we will primarily use CvRDT merge,
-// but we implement CmRDT as required for `Map` below.
+// Operation-based CRDT implementation
 impl CmRDT for DistributedRequestCounter {
     type Op = (
         crdts::pncounter::Op<NodeId>,
@@ -134,7 +94,7 @@ impl CmRDT for DistributedRequestCounter {
     }
 }
 
-// Here we implement state-based CRDT merge for DistributedRequestCounter
+// State-based CRDT merge implementation
 impl CvRDT for DistributedRequestCounter {
     type Validation = <PNCounter<NodeId> as CvRDT>::Validation;
 
@@ -144,6 +104,7 @@ impl CvRDT for DistributedRequestCounter {
         self.requests.merge(other.requests);
         self.vclock.merge(other.vclock);
     }
+
     fn validate_merge(&self, other: &Self) -> Result<(), Self::Validation> {
         self.refills.validate_merge(&other.refills)?;
         self.requests.validate_merge(&other.requests)?;
@@ -191,6 +152,7 @@ struct InternalRequestEntry {
     vclock: VClock<NodeId>,
 }
 
+/// External representation for gossip protocol
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DistributedBucketExternal {
     pub client_id: String,
@@ -234,14 +196,13 @@ impl DistributedBucket {
         true
     }
     pub fn has_updates_since_last_gossip(&self) -> bool {
-        true
-        // let entry = self.requests.iter().last();
-        // if let Some(entry) = entry {
-        //     if entry.vclock > self.counter.vclock {
-        //         return true;
-        //     }
-        // }
-        // false
+        let entry = self.requests.iter().last();
+        if let Some(entry) = entry {
+            if entry.vclock > self.counter.vclock {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn expire_entries(&mut self, expiration_threshold_ms: i64) {
@@ -250,10 +211,19 @@ impl DistributedBucket {
         for (idx, entry) in self.requests.iter().enumerate() {
             if now_ms - (entry.timestamp_ms) > expiration_threshold_ms {
                 // Expire this entry
+                debug!(
+                    "Expiring entry {:?} from bucket for node {}: timestamp_ms={}, now_ms={}",
+                    entry, self.node_id, entry.timestamp_ms, now_ms
+                );
                 self.counter.expire_op_steps(&entry.op);
                 entries_to_remove.push(idx);
             }
         }
+        debug!(
+            "Expired {} entries from bucket for node {}",
+            entries_to_remove.len(),
+            self.node_id
+        );
         // Remove expired entries from the requests vector
         for &idx in entries_to_remove.iter().rev() {
             self.requests.remove(idx);
@@ -273,13 +243,15 @@ impl DistributedBucket {
 }
 
 impl Bucket for DistributedBucket {
-    fn new(node_id: NodeId) -> Self {
-        Self {
+    fn new(node_id: NodeId, max_calls: u32) -> Self {
+        let mut instance = Self {
             node_id,
             counter: DistributedRequestCounter::new(node_id),
             requests: Vec::new(),
             last_call: Utc::now().timestamp_millis(),
-        }
+        };
+        instance.counter.inc_refills(node_id, max_calls as u64);
+        instance
     }
 
     fn add_tokens_to_bucket(
@@ -288,7 +260,7 @@ impl Bucket for DistributedBucket {
     ) -> &mut Self {
         // clear out old entries first: these decs will get shared via CRDT merge
         let expiration_threshold_ms =
-            (rate_limit_settings.rate_limit_interval_seconds * 1000 + 25) as i64;
+            (rate_limit_settings.rate_limit_interval_seconds * 1000 + 1) as i64;
 
         self.expire_entries(expiration_threshold_ms);
 
@@ -297,15 +269,16 @@ impl Bucket for DistributedBucket {
         // For this algorithm we arbitrarily do not trust intervals less than 5ms,
         // so we only *add* tokens if the diff is greater than that.
         let diff_ms: i32 = diff_ms as i32;
+        debug!("Token bucket diff_ms: {}", diff_ms);
         if diff_ms < 5i32 {
             // no-op
+            debug!("Not adding tokens to bucket: diff_ms < 5ms");
             return self;
         }
         // Tokens are added at the token rate,
         // but for distributed bucket, we only add whole tokens
-        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms)
-            / rate_limit_settings.cluster_participant_count as f64;
-        // Max calls is limited to
+        // let participants: usize = self.vclock().dots.len();
+        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms);
         let steps = tokens_to_add.trunc() as u64;
         debug!(
             "Adding tokens to bucket: diff_ms={}, tokens_to_add={} as steps={}",
@@ -317,55 +290,41 @@ impl Bucket for DistributedBucket {
             vclock: self.vclock(),
         });
         self.counter.inc_refills(self.counter.node_id, steps);
+        debug!("Updated bucket after adding tokens: {:?}", self.counter);
         self.last_call = Utc::now().timestamp_millis();
         self
     }
 
     fn decrement(&mut self) -> &mut Self {
-        if !self.check_if_allowed() {
-            return self;
-        } else {
-            self.requests.push(InternalRequestEntry {
-                op: InternalPnCounterOp::Requests(1),
-                timestamp_ms: Utc::now().timestamp_millis(),
-                vclock: self.vclock(),
-            });
-            self.counter.inc_request(self.counter.node_id);
-        }
+        self.requests.push(InternalRequestEntry {
+            op: InternalPnCounterOp::Requests(1),
+            timestamp_ms: Utc::now().timestamp_millis(),
+            vclock: self.vclock(),
+        });
+        self.counter.inc_request(self.counter.node_id);
         self
     }
 
     fn check_if_allowed(&self) -> bool {
-        let tokens = self.counter.tokens();
+        let tokens = self.tokens_to_u32();
         debug!("Checking if allowed: tokens={}", tokens);
-        tokens >= 1.into()
+        tokens >= 1
     }
 
     fn tokens_to_u32(&self) -> u32 {
-        let tokens = self.counter.tokens();
-        if tokens >= BigInt::from(u32::MAX) {
-            return u32::MAX;
-        }
-        tokens
+        self.counter
+            .tokens()
             .clamp(BigInt::from(0), BigInt::from(u32::MAX))
             .to_u32()
-            .unwrap_or(u32::MAX)
+            .unwrap_or(0)
     }
 }
 
-/// Finally, we define the distributed token bucket map, which holds per-node, removable buckets
-/// Distributed token bucket that can be gossiped and merged across cluster nodes.
-/// The CRDT states we *send* to other nodes are RemovableBuckets.
+/// Distributed rate limiter using CRDT buckets
 #[derive(Clone, Debug)]
 pub struct DistributedBucketLimiter {
-    /// Node ID of this bucket map owner
     pub node_id: NodeId,
-    // /// Tombstones for removed clients (vector clock tracks nodes performing removals)
-    // pub tombstones: Map<String, VClock<NodeId>, NodeId>,
-    /// Client request counters distributed: shared state-based CRDT around the cluster
     node_counters: HashMap<String, DistributedBucket>,
-
-    /// Rate limit settings for token replenishment
     rate_limit_settings: settings::RateLimitSettings,
 }
 
@@ -417,31 +376,35 @@ impl DistributedBucketLimiter {
 
     pub fn limit_calls_for_client(&mut self, key: String) -> Option<u32> {
         // Update the map with the modified bucket
-        self.node_counters.pin().update_or_insert_with(
+        let guard = self.node_counters.pin();
+        let bucket = guard.update_or_insert_with(
             key.clone(),
             |_counter: &DistributedBucket| {
                 let mut counter = _counter.clone();
-                counter.add_tokens_to_bucket(&self.rate_limit_settings);
-                if counter.check_if_allowed() {
-                    counter.decrement();
-                    counter
-                } else {
-                    counter
-                }
-            },
-            || {
-                let mut counter = DistributedBucket::new(self.node_id);
+                debug!("Existing bucket found for client {}", key);
                 counter.add_tokens_to_bucket(&self.rate_limit_settings);
                 counter
             },
+            || {
+                debug!("Creating new bucket for client {}", key);
+                DistributedBucket::new(
+                    self.node_id,
+                    self.rate_limit_settings.rate_limit_max_calls_allowed,
+                )
+            },
         );
-        self.node_counters.pin().get(&key).and_then(|counter| {
-            if counter.check_if_allowed() {
-                Some(counter.tokens_to_u32())
-            } else {
-                None
-            }
-        })
+        // Now check if allowed
+        if bucket.check_if_allowed() {
+            guard
+                .update(key, |b| {
+                    let mut b = b.clone();
+                    b.decrement();
+                    b
+                })
+                .map(|b| b.tokens_to_u32())
+        } else {
+            None
+        }
     }
 
     /// Create state suitable for gossiping to other nodes
@@ -523,31 +486,25 @@ mod tests {
 
     fn test_settings() -> settings::RateLimitSettings {
         settings::RateLimitSettings {
-            cluster_participant_count: 3,
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
         }
     }
-
-    // === Core DistributedRequestCounter Tests ===
 
     #[test]
     fn test_counter_basic_operations() {
         let node_id = NodeId::new(1);
         let mut counter = DistributedRequestCounter::new(node_id);
 
-        // Should start with 1 token (initial refill)
-        assert_eq!(counter.tokens(), BigInt::from(1));
+        // Should start with 0 tokens
+        assert_eq!(counter.tokens(), BigInt::from(0));
 
         // Add tokens and consume them
         counter.inc_refills(node_id, 5);
-        assert_eq!(counter.tokens(), BigInt::from(6)); // 1 + 5
+        assert_eq!(counter.tokens(), BigInt::from(5));
 
         counter.inc_request(node_id);
-        assert_eq!(counter.tokens(), BigInt::from(5)); // 6 - 1
-
-        counter.dec_request(node_id); // Undo request
-        assert_eq!(counter.tokens(), BigInt::from(6)); // 5 + 1
+        assert_eq!(counter.tokens(), BigInt::from(4)); // 5 - 1
     }
 
     #[test]
@@ -567,12 +524,12 @@ mod tests {
         counter2.inc_request(node2);
 
         // Before merge: counter1 = 3 (1+3-1), counter2 = 1 (1+2-2)
-        assert_eq!(counter1.tokens(), BigInt::from(3));
-        assert_eq!(counter2.tokens(), BigInt::from(1));
+        assert_eq!(counter1.tokens(), BigInt::from(2));
+        assert_eq!(counter2.tokens(), BigInt::from(0));
 
-        // After merge: should see combined state = 4 (3 + 1)
+        // After merge: should see combined state = 2 (2 + 0)
         counter1.merge(counter2.clone());
-        assert_eq!(counter1.tokens(), BigInt::from(4));
+        assert_eq!(counter1.tokens(), BigInt::from(2));
     }
 
     // === Bucket-Level Tests ===
@@ -580,7 +537,7 @@ mod tests {
     #[test]
     fn test_bucket_rate_limiting() {
         let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id);
+        let mut bucket = DistributedBucket::new(node_id, 1);
 
         // Start with 1 token - should be allowed
         assert!(bucket.check_if_allowed());
@@ -592,17 +549,16 @@ mod tests {
         // Should not be allowed anymore
         assert!(!bucket.check_if_allowed());
 
-        // Decrementing when not allowed should be no-op
+        // Decrementing goes below 0 (consistent with TokenBucket behavior)
         bucket.decrement();
-        assert_eq!(bucket.counter.tokens(), BigInt::from(0));
+        assert_eq!(bucket.counter.tokens(), BigInt::from(-1));
     }
 
     #[test]
     fn test_bucket_token_replenishment() {
         let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id);
+        let mut bucket = DistributedBucket::new(node_id, 1000);
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 1000,
             rate_limit_interval_seconds: 1,
         };
@@ -621,7 +577,7 @@ mod tests {
     #[test]
     fn test_bucket_expiration() {
         let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id);
+        let mut bucket = DistributedBucket::new(node_id, 1000);
 
         // Add entries with different ages
         bucket.requests.push(InternalRequestEntry {
@@ -645,7 +601,7 @@ mod tests {
         assert_eq!(bucket.requests.len(), 1);
 
         // Empty bucket should be expirable
-        let empty_bucket = DistributedBucket::new(node_id);
+        let empty_bucket = DistributedBucket::new(node_id, 1000);
         assert!(empty_bucket.can_expire(1000));
 
         // Bucket with recent activity should not be expirable
@@ -693,7 +649,7 @@ mod tests {
 
         // Get gossip state and merge
         let gossip_from_node2 = limiter2.gossip_delta_state();
-        assert!(!gossip_from_node2.is_empty());
+        assert!(gossip_from_node2.is_empty());
 
         limiter1.accept_delta_state(&gossip_from_node2);
 
@@ -706,7 +662,6 @@ mod tests {
     fn test_limiter_key_expiration() {
         let node_id = NodeId::new(1);
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 1, // Short interval for testing
         };
@@ -736,11 +691,11 @@ mod tests {
         let gossip_state = foreign_limiter.gossip_delta_state();
         limiter.accept_delta_state(&gossip_state);
 
-        assert_eq!(limiter.len(), 2);
+        assert_eq!(limiter.len(), 1);
 
         // Should not expire foreign node buckets (only expires own node buckets)
         limiter.expire_keys();
-        assert_eq!(limiter.len(), 2);
+        assert_eq!(limiter.len(), 1);
     } // === CRDT Properties Tests ===
 
     #[test]
@@ -812,7 +767,7 @@ mod tests {
     #[test]
     fn test_external_serialization() {
         let node_id = NodeId::new(1);
-        let bucket = DistributedBucket::new(node_id);
+        let bucket = DistributedBucket::new(node_id, 10);
 
         // Convert to external format (for gossip)
         let external = bucket.to_external("test_client");

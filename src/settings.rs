@@ -1,5 +1,5 @@
 //! Colibri application settings
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use serde::{Deserialize, Serialize};
@@ -18,9 +18,20 @@ pub const DEFAULT_PORT_UDP: &str = "8412";
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Hash)]
 pub struct RateLimitSettings {
-    pub cluster_participant_count: usize,
     pub rate_limit_max_calls_allowed: u32,
     pub rate_limit_interval_seconds: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct NamedRateLimitRule {
+    pub name: String,
+    pub settings: RateLimitSettings,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct RateLimitConfig {
+    pub default_settings: RateLimitSettings,
+    pub named_rules: HashMap<String, RateLimitSettings>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +74,6 @@ impl std::str::FromStr for RunMode {
 impl Default for RateLimitSettings {
     fn default() -> Self {
         Self {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 1000,
             rate_limit_interval_seconds: 60,
         }
@@ -79,6 +89,42 @@ impl RateLimitSettings {
 
     pub fn token_rate_milliseconds(&self) -> f64 {
         self.token_rate_seconds() / 1000.0
+    }
+}
+
+impl RateLimitConfig {
+    pub fn new(default_settings: RateLimitSettings) -> Self {
+        Self {
+            default_settings,
+            named_rules: HashMap::new(),
+        }
+    }
+
+    pub fn get_default_settings(&self) -> &RateLimitSettings {
+        &self.default_settings
+    }
+
+    pub fn get_named_rule_settings(&self, rule_name: &str) -> Option<&RateLimitSettings> {
+        self.named_rules.get(rule_name)
+    }
+
+    pub fn add_named_rule(&mut self, rule: &NamedRateLimitRule) {
+        self.named_rules
+            .insert(rule.name.clone(), rule.settings.clone());
+    }
+
+    pub fn remove_named_rule(&mut self, rule_name: &str) -> Option<RateLimitSettings> {
+        self.named_rules.remove(rule_name)
+    }
+
+    pub fn list_named_rules(&self) -> Vec<NamedRateLimitRule> {
+        self.named_rules
+            .iter()
+            .map(|(name, settings)| NamedRateLimitRule {
+                name: name.clone(),
+                settings: settings.clone(),
+            })
+            .collect()
     }
 }
 
@@ -146,7 +192,6 @@ impl Settings {
 
     pub fn rate_limit_settings(&self) -> RateLimitSettings {
         RateLimitSettings {
-            cluster_participant_count: self.topology.len(),
             rate_limit_max_calls_allowed: self.rate_limit_max_calls_allowed,
             rate_limit_interval_seconds: self.rate_limit_interval_seconds,
         }

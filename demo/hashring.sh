@@ -4,7 +4,7 @@ echo "Starting 3-node ${mode} cluster..."
 echo "Node 1 on port 8001, Node 2 on port 8002, Node 3 on port 8003"
 echo "Press Ctrl+C to stop all nodes"
 
-export RUST_LOG=info
+export RUST_LOG=debug
 
 # Start node 1 (knows about nodes 2 and 3)
 cargo run -- \

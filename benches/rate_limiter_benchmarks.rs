@@ -5,7 +5,6 @@ use std::hint::black_box;
 
 fn benchmark_rate_limiter_sequential(c: &mut Criterion) {
     let settings = RateLimitSettings {
-        cluster_participant_count: 1,
         rate_limit_max_calls_allowed: 1000000, // High limit to avoid blocking
         rate_limit_interval_seconds: 3600,
     };
@@ -24,7 +23,6 @@ fn benchmark_rate_limiter_sequential(c: &mut Criterion) {
 
 fn benchmark_rate_limiter_check_remaining(c: &mut Criterion) {
     let settings = RateLimitSettings {
-        cluster_participant_count: 1,
         rate_limit_max_calls_allowed: 1000000,
         rate_limit_interval_seconds: 3600,
     };

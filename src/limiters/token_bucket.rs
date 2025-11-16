@@ -1,5 +1,4 @@
-//! This module includes the "Token Bucket" rate-limiting algorithm.
-//! For inspiration see: https://en.wikipedia.org/wiki/Token_bucket
+//! Token bucket rate limiting algorithm
 use bincode::{Decode, Encode};
 use chrono::Utc;
 use papaya::HashMap;
@@ -7,8 +6,9 @@ use papaya::HashMap;
 use crate::node::NodeId;
 use crate::settings;
 
+/// Rate limiter bucket interface
 pub trait Bucket {
-    fn new(node_id: NodeId) -> Self;
+    fn new(node_id: NodeId, max_calls: u32) -> Self;
     fn add_tokens_to_bucket(
         &mut self,
         rate_limit_settings: &settings::RateLimitSettings,
@@ -18,20 +18,16 @@ pub trait Bucket {
     fn tokens_to_u32(&self) -> u32;
 }
 
-/// Each rate-limited item will be stored in here.
-/// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
+/// Token bucket for rate limiting
 #[derive(Clone, Debug, Decode, Encode)]
 pub struct TokenBucket {
-    // Count of tokens; including partial tokens from refills
     pub tokens: f64,
-    // timestamp in unix milliseconds
     pub last_call: i64,
 }
 
 impl Default for TokenBucket {
     fn default() -> Self {
         Self {
-            // greater than zero, probably fewer than whatever max will be for this app
             tokens: 1f64,
             last_call: Utc::now().timestamp_millis(),
         }
@@ -39,9 +35,11 @@ impl Default for TokenBucket {
 }
 
 impl Bucket for TokenBucket {
-    /// Create a new TokenBucket with full capacity
-    fn new(_node_id: NodeId) -> Self {
-        TokenBucket::default()
+    fn new(_node_id: NodeId, max_calls: u32) -> Self {
+        TokenBucket {
+            tokens: max_calls as f64,
+            last_call: Utc::now().timestamp_millis(),
+        }
     }
     /// Function for adding tokens to the bucket.
     /// Tokens are added at the rate of token_rate * time_since_last_request
@@ -57,9 +55,7 @@ impl Bucket for TokenBucket {
         if diff_ms < 5i32 {
             return self;
         }
-        // Tokens are added at the token rate
         let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms);
-        // Max calls is limited to: rate_limit_settings.rate_limit_max_calls_allowed
         self.tokens = (self.tokens + tokens_to_add).clamp(
             0.0,
             f64::from(rate_limit_settings.rate_limit_max_calls_allowed),
@@ -87,16 +83,11 @@ impl Bucket for TokenBucket {
 
 /// Each rate-limited item will be stored in here.
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
-/// This data structure offers a garbage collection
-/// method for expired items. Otherwise, it will store
-/// and offer access to TokenBucket instances.
-/// Access to this *whole* data structure requires mutability
-/// so it should happen inside something like a RwLock.
+/// Rate limiter managing multiple token buckets
 #[derive(Clone, Debug)]
 pub struct TokenBucketLimiter {
     node_id: NodeId,
     settings: settings::RateLimitSettings,
-    /// Cache defines a Lazy-TTL based HashMap.
     cache: HashMap<String, TokenBucket>,
 }
 
@@ -116,10 +107,7 @@ impl TokenBucketLimiter {
     }
 
     pub fn new_bucket(&self) -> TokenBucket {
-        let mut bucket = TokenBucket::new(self.node_id);
-        // Start with full capacity for new buckets
-        bucket.tokens = self.settings.rate_limit_max_calls_allowed as f64;
-        bucket
+        TokenBucket::new(self.node_id, self.settings.rate_limit_max_calls_allowed)
     }
 
     // It's possible that updates happen around this object
@@ -191,6 +179,47 @@ impl TokenBucketLimiter {
             }
         }
     }
+
+    /// Check rate limit and decrement if call is allowed using provided settings
+    /// Returns Some(remaining_tokens) if allowed, None if rate limited
+    pub fn limit_calls_for_client_with_settings(
+        &mut self,
+        key: String,
+        settings: &settings::RateLimitSettings,
+    ) -> Option<u32> {
+        if let Some(bucket) = self.cache.pin().get(&key) {
+            // Update existing bucket with provided settings
+            let mut updated_bucket = bucket.clone();
+            updated_bucket.add_tokens_to_bucket(settings);
+
+            if updated_bucket.check_if_allowed() {
+                // Call is allowed - decrement and update
+                updated_bucket.decrement();
+                let remaining = updated_bucket.tokens_to_u32();
+                self.cache.pin().insert(key, updated_bucket);
+                Some(remaining)
+            } else {
+                // Call not allowed - update bucket state but don't decrement
+                self.cache.pin().insert(key, updated_bucket);
+                None
+            }
+        } else {
+            // Create new bucket - first call is always allowed
+            let mut new_bucket =
+                TokenBucket::new(self.node_id, settings.rate_limit_max_calls_allowed);
+            // Set tokens to max for the provided settings
+            new_bucket.tokens = f64::from(settings.rate_limit_max_calls_allowed);
+            new_bucket.decrement(); // Use one token
+            let is_allowed = new_bucket.check_if_allowed();
+            let remaining = Some(new_bucket.tokens_to_u32());
+            self.cache.pin().insert(key, new_bucket);
+            if is_allowed {
+                remaining
+            } else {
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -243,7 +272,6 @@ mod tests {
         };
 
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
         };
@@ -290,7 +318,6 @@ mod tests {
     #[test]
     fn test_token_bucket_overflow_protection() {
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
         };
@@ -310,7 +337,6 @@ mod tests {
     #[test]
     fn test_token_bucket_minimum_time_diff() {
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
         };
@@ -349,7 +375,6 @@ mod tests {
     #[test]
     fn test_token_rate_calculation() {
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
         };
@@ -367,7 +392,6 @@ mod tests {
     #[tokio::test]
     async fn test_token_refill_over_time() {
         let settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 10,
             rate_limit_interval_seconds: 1,
         };
@@ -393,7 +417,6 @@ mod tests {
 
     fn get_settings() -> settings::RateLimitSettings {
         settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 5,
             rate_limit_interval_seconds: 1,
         }
@@ -526,7 +549,6 @@ mod tests {
     #[test]
     fn test_rate_limiter_with_zero_tokens() {
         let zero_settings = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 0,
             rate_limit_interval_seconds: 1,
         };
@@ -551,7 +573,6 @@ mod tests {
     fn test_rate_limiter_settings_impact() {
         // Test with high limits
         let high_limit = settings::RateLimitSettings {
-            cluster_participant_count: 1,
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
         };

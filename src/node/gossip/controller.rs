@@ -741,12 +741,14 @@ impl GossipController {
 
         if let Some(rate_limiter) = limiters.get_mut(&rule_name) {
             let calls_left = rate_limiter.limit_calls_for_client(key.clone());
-            calls_left.map(|calls_remaining| {
-                Ok(Some(CheckCallsResponse {
-                    client_id: key,
-                    calls_remaining,
-                }))
-            }).unwrap_or_else(|| Ok(None))
+            calls_left
+                .map(|calls_remaining| {
+                    Ok(Some(CheckCallsResponse {
+                        client_id: key,
+                        calls_remaining,
+                    }))
+                })
+                .unwrap_or_else(|| Ok(None))
         } else {
             Err(ColibriError::Api(format!(
                 "Rate limit rule '{}' not found",

@@ -13,7 +13,6 @@ use colibri::api;
 use colibri::node::NodeWrapper;
 use colibri::settings::{NamedRateLimitRule, RunMode, Settings};
 
-
 static INIT: Once = Once::new();
 
 /// Envlogger setup function
@@ -22,7 +21,6 @@ fn setup() {
         env_logger::init();
     });
 }
-
 
 /// Helper to create test settings for a single node
 fn create_test_settings() -> Settings {

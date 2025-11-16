@@ -25,7 +25,7 @@ impl DistributedRequestCounter {
     pub fn new(node_id: NodeId) -> Self {
         Self {
             node_id,
-            refills:  PNCounter::new(),
+            refills: PNCounter::new(),
             requests: PNCounter::new(),
             vclock: VClock::new(),
         }
@@ -312,7 +312,8 @@ impl Bucket for DistributedBucket {
     }
 
     fn tokens_to_u32(&self) -> u32 {
-        self.counter.tokens()
+        self.counter
+            .tokens()
             .clamp(BigInt::from(0), BigInt::from(u32::MAX))
             .to_u32()
             .unwrap_or(0)
@@ -386,16 +387,21 @@ impl DistributedBucketLimiter {
             },
             || {
                 debug!("Creating new bucket for client {}", key);
-                DistributedBucket::new(self.node_id, self.rate_limit_settings.rate_limit_max_calls_allowed)
+                DistributedBucket::new(
+                    self.node_id,
+                    self.rate_limit_settings.rate_limit_max_calls_allowed,
+                )
             },
         );
         // Now check if allowed
         if bucket.check_if_allowed() {
-            guard.update(key, |b| {
-                let mut b = b.clone();
-                b.decrement();
-                b
-            }).map(|b| b.tokens_to_u32())
+            guard
+                .update(key, |b| {
+                    let mut b = b.clone();
+                    b.decrement();
+                    b
+                })
+                .map(|b| b.tokens_to_u32())
         } else {
             None
         }

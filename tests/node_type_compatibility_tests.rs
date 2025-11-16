@@ -6,7 +6,6 @@ use std::sync::Once;
 use colibri::node::{GossipNode, HashringNode, Node, NodeId, NodeWrapper, SingleNode};
 use colibri::settings::{RateLimitSettings, RunMode, Settings};
 
-
 static INIT: Once = Once::new();
 
 /// Envlogger setup function
@@ -15,7 +14,6 @@ fn setup() {
         env_logger::init();
     });
 }
-
 
 /// Helper to create settings for single node
 fn single_node_settings() -> Settings {

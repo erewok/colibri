@@ -205,7 +205,8 @@ impl TokenBucketLimiter {
             }
         } else {
             // Create new bucket - first call is always allowed
-            let mut new_bucket = TokenBucket::new(self.node_id, settings.rate_limit_max_calls_allowed);
+            let mut new_bucket =
+                TokenBucket::new(self.node_id, settings.rate_limit_max_calls_allowed);
             // Set tokens to max for the provided settings
             new_bucket.tokens = f64::from(settings.rate_limit_max_calls_allowed);
             new_bucket.decrement(); // Use one token

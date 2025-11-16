@@ -8,9 +8,8 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use colibri::error::Result;
-use colibri::node::gossip::{GossipController, GossipCommand};
-use colibri::settings::{Settings, RateLimitSettings, RunMode};
-
+use colibri::node::gossip::{GossipCommand, GossipController};
+use colibri::settings::{RateLimitSettings, RunMode, Settings};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -94,8 +93,10 @@ async fn test_rate_limiting(controller: &GossipController) -> Result<()> {
     if let Ok(response) = rx.await {
         match response {
             Ok(check_response) => {
-                info!("✓ CheckLimit response: client '{}' has {} calls remaining",
-                      check_response.client_id, check_response.calls_remaining);
+                info!(
+                    "✓ CheckLimit response: client '{}' has {} calls remaining",
+                    check_response.client_id, check_response.calls_remaining
+                );
             }
             Err(e) => {
                 error!("CheckLimit failed: {}", e);
@@ -118,8 +119,10 @@ async fn test_rate_limiting(controller: &GossipController) -> Result<()> {
     if let Ok(response) = rx.await {
         match response {
             Ok(Some(rate_response)) => {
-                info!("✓ RateLimit consumed token: client '{}' has {} calls remaining",
-                      rate_response.client_id, rate_response.calls_remaining);
+                info!(
+                    "✓ RateLimit consumed token: client '{}' has {} calls remaining",
+                    rate_response.client_id, rate_response.calls_remaining
+                );
             }
             Ok(None) => {
                 warn!("RateLimit returned None - rate limit may be exceeded");
@@ -145,8 +148,10 @@ async fn test_rate_limiting(controller: &GossipController) -> Result<()> {
     if let Ok(response) = rx.await {
         match response {
             Ok(check_response) => {
-                info!("✓ CheckLimit after consumption: client '{}' has {} calls remaining",
-                      check_response.client_id, check_response.calls_remaining);
+                info!(
+                    "✓ CheckLimit after consumption: client '{}' has {} calls remaining",
+                    check_response.client_id, check_response.calls_remaining
+                );
             }
             Err(e) => {
                 error!("Second CheckLimit failed: {}", e);
@@ -200,10 +205,12 @@ async fn test_named_rules(controller: &GossipController) -> Result<()> {
             Ok(rules) => {
                 info!("✓ Listed {} named rules:", rules.len());
                 for rule in &rules {
-                    info!("  - Rule '{}': {} calls per {} seconds",
-                          rule.name,
-                          rule.settings.rate_limit_max_calls_allowed,
-                          rule.settings.rate_limit_interval_seconds);
+                    info!(
+                        "  - Rule '{}': {} calls per {} seconds",
+                        rule.name,
+                        rule.settings.rate_limit_max_calls_allowed,
+                        rule.settings.rate_limit_interval_seconds
+                    );
                 }
             }
             Err(e) => {
@@ -225,10 +232,12 @@ async fn test_named_rules(controller: &GossipController) -> Result<()> {
     if let Ok(response) = rx.await {
         match response {
             Ok(Some(rule)) => {
-                info!("✓ Retrieved named rule '{}': {} calls per {} seconds",
-                      rule.name,
-                      rule.settings.rate_limit_max_calls_allowed,
-                      rule.settings.rate_limit_interval_seconds);
+                info!(
+                    "✓ Retrieved named rule '{}': {} calls per {} seconds",
+                    rule.name,
+                    rule.settings.rate_limit_max_calls_allowed,
+                    rule.settings.rate_limit_interval_seconds
+                );
             }
             Ok(None) => {
                 warn!("Named rule '{}' not found", rule_name);
@@ -298,8 +307,10 @@ async fn test_custom_rate_limiting(controller: &GossipController) -> Result<()> 
     if let Ok(response) = rx.await {
         match response {
             Ok(check_response) => {
-                info!("✓ CheckLimitCustom for key '{}' with rule '{}': {} calls remaining",
-                      key, rule_name, check_response.calls_remaining);
+                info!(
+                    "✓ CheckLimitCustom for key '{}' with rule '{}': {} calls remaining",
+                    key, rule_name, check_response.calls_remaining
+                );
             }
             Err(e) => {
                 error!("CheckLimitCustom failed: {}", e);
@@ -321,8 +332,10 @@ async fn test_custom_rate_limiting(controller: &GossipController) -> Result<()> 
     if let Ok(response) = rx.await {
         match response {
             Ok(Some(rate_response)) => {
-                info!("✓ RateLimitCustom consumed token for key '{}': {} calls remaining",
-                      key, rate_response.calls_remaining);
+                info!(
+                    "✓ RateLimitCustom consumed token for key '{}': {} calls remaining",
+                    key, rate_response.calls_remaining
+                );
             }
             Ok(None) => {
                 warn!("RateLimitCustom returned None - rate limit may be exceeded");

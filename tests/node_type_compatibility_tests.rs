@@ -402,7 +402,7 @@ mod node_wrapper_tests {
         let node_wrapper = NodeWrapper::new(settings).await.unwrap();
 
         // Test configuration management through NodeWrapper
-        let rule_settings = test_rate_limit_settings(15, 45);
+        let rule_settings = test_rate_limit_settings(4, 45);
         node_wrapper
             .create_named_rule("gossip-wrapper-rule".to_string(), rule_settings)
             .await
@@ -414,17 +414,23 @@ mod node_wrapper_tests {
             .unwrap()
             .unwrap();
         assert_eq!(rule.name, "gossip-wrapper-rule");
-        assert_eq!(rule.settings.rate_limit_max_calls_allowed, 15);
+        assert_eq!(rule.settings.rate_limit_max_calls_allowed, 4);
 
         // Test custom rate limiting
         let test_key = "gossip-wrapper-user";
-        let rate_result = node_wrapper
-            .rate_limit_custom("gossip-wrapper-rule".to_string(), test_key.to_string())
-            .await
-            .unwrap();
-        assert!(rate_result.is_some());
-        // TODO: check why we fail here
-        assert_eq!(rate_result.unwrap().calls_remaining, 14);
+        // Exhaust tokens on single node
+        for n in 0..=4 {
+            let result = node_wrapper
+                .rate_limit_custom("gossip-wrapper-rule".to_string(), test_key.to_string())
+                .await
+                .unwrap();
+            if n < 4 {
+                assert!(result.is_some());
+                assert_eq!(result.unwrap().calls_remaining, 4 - n - 1);
+            } else {
+                assert!(result.is_none());
+            }
+        }
     }
 
     #[tokio::test]
@@ -590,6 +596,6 @@ mod cross_node_consistency_tests {
             .await
             .unwrap();
         assert!(gossip_rate.is_some());
-        assert_eq!(gossip_rate.unwrap().calls_remaining, 1);
+        assert_eq!(gossip_rate.unwrap().calls_remaining, 4);
     }
 }

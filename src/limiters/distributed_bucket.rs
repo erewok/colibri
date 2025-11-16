@@ -375,7 +375,8 @@ impl DistributedBucketLimiter {
 
     pub fn limit_calls_for_client(&mut self, key: String) -> Option<u32> {
         // Update the map with the modified bucket
-        self.node_counters.pin().update_or_insert_with(
+        let guard = self.node_counters.pin();
+        let bucket = guard.update_or_insert_with(
             key.clone(),
             |_counter: &DistributedBucket| {
                 let mut counter = _counter.clone();
@@ -388,13 +389,16 @@ impl DistributedBucketLimiter {
                 DistributedBucket::new(self.node_id, self.rate_limit_settings.rate_limit_max_calls_allowed)
             },
         );
-        self.node_counters.pin().get(&key).and_then(|counter| {
-            if counter.check_if_allowed() {
-                Some(counter.tokens_to_u32())
-            } else {
-                None
-            }
-        })
+        // Now check if allowed
+        if bucket.check_if_allowed() {
+            guard.update(key, |b| {
+                let mut b = b.clone();
+                b.decrement();
+                b
+            }).map(|b| b.tokens_to_u32())
+        } else {
+            None
+        }
     }
 
     /// Create state suitable for gossiping to other nodes

@@ -72,5 +72,5 @@ test *args:
 bench:
     cargo bench
 
-transport_demo:
-    cargo run --example transport_demo
+example name="gossip":
+    cargo run --example {{name}}

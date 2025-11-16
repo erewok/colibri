@@ -145,7 +145,7 @@ impl GossipController {
         }
     }
 
-    async fn handle_gossip_tick(&self) -> Result<()> {
+    pub async fn handle_gossip_tick(&self) -> Result<()> {
         // Send delta updates for buckets that have changed
         let updates = self.collect_gossip_updates().await?;
         if !updates.is_empty() {
@@ -182,14 +182,14 @@ impl GossipController {
     }
 
     /// Collect buckets that have been updated and should be gossiped
-    async fn collect_gossip_updates(&self) -> Result<Vec<DistributedBucketExternal>> {
+    pub async fn collect_gossip_updates(&self) -> Result<Vec<DistributedBucketExternal>> {
         self.rate_limiter
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))
             .map(|rl| rl.gossip_delta_state())
     }
     /// Handle incoming gossip cmd from our channel
-    async fn handle_command(&self, cmd: GossipCommand) -> Result<()> {
+    pub async fn handle_command(&self, cmd: GossipCommand) -> Result<()> {
         match cmd {
             GossipCommand::ExpireKeys => {
                 self.rate_limiter
@@ -394,7 +394,7 @@ impl GossipController {
         }
     }
     /// Process an incoming gossip packet
-    async fn process_gossip_packet(&self, data: Bytes, peer_addr: SocketAddr) -> Result<()> {
+    pub async fn process_gossip_packet(&self, data: Bytes, peer_addr: SocketAddr) -> Result<()> {
         match GossipPacket::deserialize(&data) {
             Ok(packet) => {
                 match packet.message {
@@ -601,7 +601,7 @@ impl GossipController {
     }
 
     /// Send a gossip packet to a random peer
-    async fn send_gossip_packet(&self, packet: GossipPacket) -> Result<()> {
+    pub async fn send_gossip_packet(&self, packet: GossipPacket) -> Result<()> {
         if self.transport.is_none() {
             debug!(
                 "[{}] Gossip transport not configured, skipping packet send",
@@ -648,7 +648,7 @@ impl GossipController {
     }
 
     /// Create a named rate limit rule locally (without gossiping)
-    async fn create_named_rule_local(
+    pub async fn create_named_rule_local(
         &self,
         rule_name: String,
         settings: settings::RateLimitSettings,
@@ -680,7 +680,7 @@ impl GossipController {
         Ok(())
     }
     /// Get a named rate limit rule locally (without gossiping)
-    async fn get_named_rule_local(
+    pub async fn get_named_rule_local(
         &self,
         rule_name: &str,
     ) -> Result<Option<settings::NamedRateLimitRule>> {
@@ -699,7 +699,7 @@ impl GossipController {
     }
 
     /// Delete a named rate limit rule locally (without gossiping)
-    async fn delete_named_rule_local(&self, rule_name: String) -> Result<()> {
+    pub async fn delete_named_rule_local(&self, rule_name: String) -> Result<()> {
         let mut config = self
             .rate_limit_config
             .lock()
@@ -719,7 +719,7 @@ impl GossipController {
     }
 
     /// List all named rate limit rules locally
-    async fn list_named_rules_local(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+    pub async fn list_named_rules_local(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
         let config = self
             .rate_limit_config
             .lock()
@@ -729,7 +729,7 @@ impl GossipController {
     }
 
     /// Apply rate limiting using a custom named rule locally
-    async fn rate_limit_custom_local(
+    pub async fn rate_limit_custom_local(
         &self,
         rule_name: String,
         key: String,
@@ -756,7 +756,7 @@ impl GossipController {
     }
 
     /// Check remaining calls using a custom named rule locally
-    async fn check_limit_custom_local(
+    pub async fn check_limit_custom_local(
         &self,
         rule_name: String,
         key: String,

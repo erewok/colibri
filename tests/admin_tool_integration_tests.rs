@@ -20,7 +20,7 @@ async fn test_admin_tool_expected_responses() {
         serde_json::from_str(&json).expect("Admin tool expects parseable status");
 
     assert_eq!(parsed.operational_state, "normal");
-    assert_eq!(parsed.data_consistency_ok, true);
+    assert!(parsed.data_consistency_ok);
 }
 
 #[tokio::test]

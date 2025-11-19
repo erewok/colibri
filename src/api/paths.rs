@@ -28,6 +28,15 @@ pub mod cluster {
     pub const COMMIT_CHANGE: &str = "/cluster/commit-change";
     pub const ABORT_CHANGE: &str = "/cluster/abort-change";
     pub const STATUS: &str = "/cluster/status";
+
+    pub fn export_bucket_path(bucket_id: u32) -> String {
+        let path = EXPORT_BUCKET.replace("{bucket_id}", &bucket_id.to_string());
+        super::drop_leading_slash(&path).to_string()
+    }
+    pub fn import_bucket_path(bucket_id: u32) -> String {
+        let path = IMPORT_BUCKET.replace("{bucket_id}", &bucket_id.to_string());
+        super::drop_leading_slash(&path).to_string()
+    }
 }
 
 pub fn drop_leading_slash(path: &str) -> &str {

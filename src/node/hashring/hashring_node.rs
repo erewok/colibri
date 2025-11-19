@@ -498,7 +498,7 @@ impl HashringNode {
         match self.topology.get(&bucket) {
             Some((host, client)) if !self.topology_address_is_self(host) => {
                 // Use the cluster API to export bucket data from the primary node
-                let export_url = format!("{}/cluster/export/{}", host, bucket);
+                let export_url = format!("{}{}", host, paths::cluster::export_bucket_path(bucket));
                 debug!("Syncing bucket {} from primary at {}", bucket, export_url);
 
                 match client.get(&export_url).send().await {

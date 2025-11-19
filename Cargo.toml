@@ -8,6 +8,18 @@ repository = "https://github.com/erewok/colibri"
 edition = "2021"
 license = "MPL-2.0"
 
+
+default-run = "colibri-server"
+
+
+[[bin]]
+name = "colibri-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "colibri-admin"
+path = "src/bin/colibri-admin.rs"
+
 [dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1.89"

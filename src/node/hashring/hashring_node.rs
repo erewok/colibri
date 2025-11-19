@@ -18,9 +18,10 @@ use crate::node::{
 use crate::settings;
 
 /// Replication factor for data distribution
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReplicationFactor {
-    One = 1,
+    None,
+    #[default]
     Two = 2,
     Three = 3,
 }
@@ -106,7 +107,18 @@ impl Node for HashringNode {
             })?;
 
         // Set up replication - for now, default to RF=2
-        let replication_factor = ReplicationFactor::Two;
+        let replication_factor = match settings.hash_replication_factor {
+            0 | 1 => ReplicationFactor::None,
+            2 => ReplicationFactor::Two,
+            3 => ReplicationFactor::Three,
+            other => {
+                warn!(
+                    "Unsupported replication factor {}, defaulting to 2",
+                    other
+                );
+                ReplicationFactor::default()
+            }
+        };
         let replica_buckets =
             Self::calculate_replica_buckets(bucket, number_of_buckets, &replication_factor);
 
@@ -433,8 +445,11 @@ impl HashringNode {
         number_of_buckets: u32,
         replication_factor: &ReplicationFactor,
     ) -> Vec<u32> {
+        if replication_factor == &ReplicationFactor::None {
+            return Vec::new();
+        }
         let rf = *replication_factor as usize;
-        let mut replicas = Vec::with_capacity(rf - 1);
+        let mut replicas = Vec::with_capacity(rf.saturating_sub(1));
 
         // For RF=2, replicate next bucket. For RF=3, replicate next 2 buckets
         for i in 1..rf {
@@ -488,7 +503,10 @@ impl HashringNode {
                             sync_state.insert(bucket, Instant::now());
                         }
                         Err(e) => {
-                            warn!("Failed to acquire write lock on sync_state for bucket {}: {}", bucket, e);
+                            warn!(
+                                "Failed to acquire write lock on sync_state for bucket {}: {}",
+                                bucket, e
+                            );
                         }
                     }
                 }
@@ -641,9 +659,9 @@ impl HashringNode {
         }
 
         // All replicas failed, check if this node owns or replicates the bucket
-        let is_owner = self.owns_bucket(bucket);
+        let my_bucket = self.get_owned_bucket();
+        let is_owner = my_bucket == bucket;
         let is_replica = {
-            let my_bucket = self.get_own_bucket();
             let replicas = Self::calculate_replica_buckets(
                 my_bucket,
                 self.number_of_buckets,
@@ -662,7 +680,7 @@ impl HashringNode {
                 "All replicas failed for bucket {}, and this node is neither owner nor replica. Refusing to serve potentially stale data.",
                 bucket
             );
-            Err(ColibriError::Unavailable(format!(
+            Err(ColibriError::Transport(format!(
                 "All replicas failed for bucket {}, and this node is neither owner nor replica. Cannot serve request.",
                 bucket
             )))
@@ -826,6 +844,7 @@ mod tests {
             gossip_fanout: 3,
             topology,
             failure_timeout_secs: 30,
+            hash_replication_factor: 1,
         }
     }
 
@@ -847,6 +866,7 @@ mod tests {
             gossip_fanout: 3,
             topology,
             failure_timeout_secs: 30,
+            hash_replication_factor: 2,
         }
     }
 

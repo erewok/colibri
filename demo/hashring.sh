@@ -41,6 +41,7 @@ NODE3_PID=$!
 
 sleep 7
 
+
 echo -e "All ${mode} nodes started. PIDs: $NODE1_PID, $NODE2_PID, $NODE3_PID \e"
 echo -e "Test with: curl -X POST http://localhost:8001/rl/test-client \n"
 
@@ -55,6 +56,12 @@ echo -e "\nResponse: $res2\n"
 
 res3=$(curl -iX POST http://localhost:8003/rl/test-client)
 echo -e "\nResponse: $res3... sleeping to reset rate limit interval\n"
+
+for port in 8001 8002 8003; do
+    echo -e "\nChecking quickly on port ${port}..."
+    curl -X POST http://localhost:${port}/rl/test-client &
+done
+
 sleep 4 # Wait for rate limit interval to reset
 
 res4=$(curl -iX POST http://localhost:8002/rl/test-client)

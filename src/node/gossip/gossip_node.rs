@@ -298,6 +298,7 @@ mod tests {
             gossip_fanout: 3,
             topology: HashSet::new(), // Empty topology for simple tests
             failure_timeout_secs: 30,
+            hash_replication_factor: 1,
         }
     }
 
@@ -393,6 +394,7 @@ mod tests {
             gossip_fanout: 4,
             topology: HashSet::new(),
             failure_timeout_secs: 30,
+            hash_replication_factor: 1,
         }
     }
 

@@ -159,6 +159,8 @@ pub struct Settings {
     pub topology: HashSet<String>,
     // Cluster Configuration
     pub failure_timeout_secs: u64, // Node failure detection timeout (default: 30)
+    // Hashring replication factor
+    pub hash_replication_factor: usize,
 }
 
 impl Settings {

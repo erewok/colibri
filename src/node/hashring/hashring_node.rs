@@ -112,10 +112,7 @@ impl Node for HashringNode {
             2 => ReplicationFactor::Two,
             3 => ReplicationFactor::Three,
             other => {
-                warn!(
-                    "Unsupported replication factor {}, defaulting to 2",
-                    other
-                );
+                warn!("Unsupported replication factor {}, defaulting to 2", other);
                 ReplicationFactor::default()
             }
         };

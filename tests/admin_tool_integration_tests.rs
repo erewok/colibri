@@ -76,7 +76,7 @@ async fn test_admin_tool_prepare_change_workflow() {
     let parsed_response: PrepareChangeResponse =
         serde_json::from_str(&response_json).expect("Admin tool should parse response");
 
-    assert_eq!(parsed_response.ready, true);
+    assert!(parsed_response.ready);
     assert_eq!(parsed_response.error, None);
 
     // Test error response handling

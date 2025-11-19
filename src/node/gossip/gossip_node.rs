@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
@@ -20,10 +20,10 @@ pub struct GossipNode {
     pub gossip_command_tx: Arc<mpsc::Sender<GossipCommand>>,
 
     /// Controller handle
-    pub controller_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    pub controller_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 
     /// Receiver handler
-    pub receiver_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl GossipNode {
@@ -50,7 +50,54 @@ impl GossipNode {
             }
         }
     }
+
+    /// Stop the gossip controller task
+    pub fn stop_controller(&self) {
+        if let Ok(mut handle) = self.controller_handle.lock() {
+            if let Some(join_handle) = handle.take() {
+                join_handle.abort();
+                info!("Gossip controller task stopped");
+            }
+        } else {
+            error!("Failed to acquire lock on controller_handle during shutdown");
+        }
+    }
+
+    /// Stop the gossip receiver task
+    pub fn stop_receiver(&self) {
+        if let Ok(mut handle) = self.receiver_handle.lock() {
+            if let Some(join_handle) = handle.take() {
+                join_handle.abort();
+                info!("Gossip receiver task stopped");
+            }
+        } else {
+            error!("Failed to acquire lock on receiver_handle during shutdown");
+        }
+    }
+
+    /// Stop all background tasks
+    pub fn stop_all_tasks(&self) {
+        self.stop_controller();
+        self.stop_receiver();
+    }
 }
+
+impl Drop for GossipNode {
+    fn drop(&mut self) {
+        // Clean up tasks when the node is dropped
+        if let Ok(mut controller_handle) = self.controller_handle.lock() {
+            if let Some(handle) = controller_handle.take() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
+            if let Some(handle) = receiver_handle.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for GossipNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GossipNode")
@@ -97,8 +144,8 @@ impl Node for GossipNode {
         Ok(Self {
             node_id,
             gossip_command_tx,
-            controller_handle: Some(Arc::new(controller_handle)),
-            receiver_handle: Some(Arc::new(receiver_handle)),
+            controller_handle: Arc::new(Mutex::new(Some(controller_handle))),
+            receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })
     }
 
@@ -312,8 +359,8 @@ mod tests {
 
         assert_eq!(node.node_id, node_id);
         assert!(node.gossip_command_tx.is_closed() == false);
-        assert!(node.controller_handle.is_some());
-        assert!(node.receiver_handle.is_some());
+        assert!(node.controller_handle.lock().unwrap().is_some());
+        assert!(node.receiver_handle.lock().unwrap().is_some());
     }
 
     #[tokio::test]
@@ -377,6 +424,31 @@ mod tests {
 
         // After rate limiting, remaining calls should be less than initial
         assert!(check2.calls_remaining < check1.calls_remaining);
+    }
+
+    #[tokio::test]
+    async fn test_gossip_node_cleanup() {
+        let node_id = NodeId::new(1);
+        let settings = test_settings();
+        let node = GossipNode::new(node_id, settings).await.unwrap();
+
+        // Verify handles are initially present
+        assert!(node.controller_handle.lock().unwrap().is_some());
+        assert!(node.receiver_handle.lock().unwrap().is_some());
+
+        // Test individual cleanup methods
+        node.stop_controller();
+        assert!(node.controller_handle.lock().unwrap().is_none());
+        assert!(node.receiver_handle.lock().unwrap().is_some());
+
+        node.stop_receiver();
+        assert!(node.receiver_handle.lock().unwrap().is_none());
+
+        // Test stop_all_tasks method with a fresh node
+        let node2 = GossipNode::new(node_id, test_settings()).await.unwrap();
+        node2.stop_all_tasks();
+        assert!(node2.controller_handle.lock().unwrap().is_none());
+        assert!(node2.receiver_handle.lock().unwrap().is_none());
     }
 
     // Helper functions (keeping for compatibility but marked as used)

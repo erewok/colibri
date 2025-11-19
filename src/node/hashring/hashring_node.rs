@@ -20,7 +20,7 @@ use crate::settings;
 /// Replication factor for data distribution
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReplicationFactor {
-    None,
+    Zero = 1,
     #[default]
     Two = 2,
     Three = 3,
@@ -37,6 +37,7 @@ pub struct HashringNode {
     pub topology: HashMap<u32, (Url, reqwest::Client)>,
     replication_factor: ReplicationFactor,
     replica_buckets: Vec<u32>,
+    replication_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     // Replication sync state: track last sync time per bucket we replicate
     sync_state: Arc<RwLock<HashMap<u32, Instant>>>,
     pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
@@ -106,9 +107,9 @@ impl Node for HashringNode {
                 ))
             })?;
 
-        // Set up replication - for now, default to RF=2
+        // Set up replication. For unsupported values, default to ReplicationFactor::default() (currently RF=2).
         let replication_factor = match settings.hash_replication_factor {
-            0 | 1 => ReplicationFactor::None,
+            0 | 1 => ReplicationFactor::Zero,
             2 => ReplicationFactor::Two,
             3 => ReplicationFactor::Three,
             other => {
@@ -133,6 +134,7 @@ impl Node for HashringNode {
             topology,
             replication_factor,
             replica_buckets,
+            replication_task_handle: Arc::new(Mutex::new(None)),
             sync_state: Arc::new(RwLock::new(HashMap::new())),
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(RwLock::new(rate_limit_config)),
@@ -425,6 +427,17 @@ impl Node for HashringNode {
     }
 }
 
+impl Drop for HashringNode {
+    fn drop(&mut self) {
+        // Clean up the replication task when the node is dropped
+        if let Ok(mut task_handle) = self.replication_task_handle.lock() {
+            if let Some(handle) = task_handle.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 impl HashringNode {
     /// Get the bucket ID that this node owns
     pub fn get_owned_bucket(&self) -> u32 {
@@ -442,12 +455,12 @@ impl HashringNode {
         number_of_buckets: u32,
         replication_factor: &ReplicationFactor,
     ) -> Vec<u32> {
-        if replication_factor == &ReplicationFactor::None {
-            return Vec::new();
-        }
-        let rf = *replication_factor as usize;
-        let mut replicas = Vec::with_capacity(rf.saturating_sub(1));
-
+        let rf = match replication_factor {
+            ReplicationFactor::Zero => return Vec::new(),
+            ReplicationFactor::Two => 2,
+            ReplicationFactor::Three => 3,
+        };
+        let mut replicas = Vec::with_capacity(rf);
         // For RF=2, replicate next bucket. For RF=3, replicate next 2 buckets
         for i in 1..rf {
             let replica_bucket = (bucket + i as u32) % number_of_buckets;
@@ -460,7 +473,7 @@ impl HashringNode {
     /// Start background replication sync task
     pub fn start_replication_sync(self: Arc<Self>) {
         let node = Arc::clone(&self);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut sync_interval = interval(Duration::from_secs(5)); // Base sync interval
             loop {
                 sync_interval.tick().await;
@@ -469,6 +482,25 @@ impl HashringNode {
                 }
             }
         });
+
+        // Store the handle for proper cleanup
+        if let Ok(mut task_handle) = self.replication_task_handle.lock() {
+            *task_handle = Some(handle);
+        } else {
+            warn!("Failed to acquire lock on replication_task_handle");
+        }
+    }
+
+    /// Stop the background replication sync task
+    pub fn stop_replication_sync(&self) {
+        if let Ok(mut task_handle) = self.replication_task_handle.lock() {
+            if let Some(handle) = task_handle.take() {
+                handle.abort();
+                info!("Replication sync task stopped");
+            }
+        } else {
+            warn!("Failed to acquire lock on replication_task_handle during shutdown");
+        }
     }
 
     /// Sync data from primary owners for buckets we replicate

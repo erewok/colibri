@@ -57,13 +57,11 @@ async fn test_token_bucket_export_import() {
 fn test_bucket_export_serialization() {
     let export = BucketExport {
         bucket_id: 42,
-        client_data: vec![
-            ClientBucketData {
-                client_id: "test-client".to_string(),
-                tokens: 95.5,
-                last_call: 1234567890,
-            }
-        ],
+        client_data: vec![ClientBucketData {
+            client_id: "test-client".to_string(),
+            tokens: 95.5,
+            last_call: 1234567890,
+        }],
         export_timestamp: 1234567890,
     };
 
@@ -86,22 +84,28 @@ async fn test_import_with_conflict_resolution() {
         rate_limit_interval_seconds: 60,
     };
 
-    let mut limiter = TokenBucketLimiter::new(node_id, rate_limit_settings);
+    let limiter = TokenBucketLimiter::new(node_id, rate_limit_settings);
 
     // Create initial data with older timestamp
     let mut initial_data = HashMap::new();
-    initial_data.insert("client1".to_string(), TokenBucket {
-        tokens: 50.0,
-        last_call: 1000, // Older timestamp
-    });
+    initial_data.insert(
+        "client1".to_string(),
+        TokenBucket {
+            tokens: 50.0,
+            last_call: 1000, // Older timestamp
+        },
+    );
     limiter.import_buckets(initial_data);
 
     // Try to import newer data for the same client
     let mut newer_data = HashMap::new();
-    newer_data.insert("client1".to_string(), TokenBucket {
-        tokens: 75.0,
-        last_call: 2000, // Newer timestamp
-    });
+    newer_data.insert(
+        "client1".to_string(),
+        TokenBucket {
+            tokens: 75.0,
+            last_call: 2000, // Newer timestamp
+        },
+    );
     limiter.import_buckets(newer_data);
 
     // Verify the newer data won (conflict resolution)
@@ -112,10 +116,13 @@ async fn test_import_with_conflict_resolution() {
 
     // Try to import older data - should be ignored
     let mut older_data = HashMap::new();
-    older_data.insert("client1".to_string(), TokenBucket {
-        tokens: 25.0,
-        last_call: 500, // Much older timestamp
-    });
+    older_data.insert(
+        "client1".to_string(),
+        TokenBucket {
+            tokens: 25.0,
+            last_call: 500, // Much older timestamp
+        },
+    );
     limiter.import_buckets(older_data);
 
     // Verify the data didn't change

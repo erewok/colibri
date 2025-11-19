@@ -49,10 +49,13 @@ fn test_manual_bucket_import() {
 
     // Manually create some token buckets
     let mut buckets = HashMap::new();
-    buckets.insert("test_client".to_string(), TokenBucket {
-        tokens: 95.0,
-        last_call: 1234567890,
-    });
+    buckets.insert(
+        "test_client".to_string(),
+        TokenBucket {
+            tokens: 95.0,
+            last_call: 1234567890,
+        },
+    );
 
     // Import them
     limiter.import_buckets(buckets);

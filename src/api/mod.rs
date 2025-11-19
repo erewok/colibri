@@ -76,6 +76,26 @@ pub async fn api(rl_node: node::NodeWrapper) -> Result<Router> {
             paths::cluster::IMPORT_BUCKET,
             routing::post(cluster::import_bucket),
         )
+        .route(
+            paths::cluster::TOPOLOGY,
+            routing::get(cluster::get_topology),
+        )
+        .route(
+            paths::cluster::PREPARE_CHANGE,
+            routing::post(cluster::prepare_topology_change),
+        )
+        .route(
+            paths::cluster::COMMIT_CHANGE,
+            routing::post(cluster::commit_topology_change),
+        )
+        .route(
+            paths::cluster::ABORT_CHANGE,
+            routing::post(cluster::abort_topology_change),
+        )
+        .route(
+            paths::cluster::STATUS,
+            routing::get(cluster::get_cluster_status),
+        )
         // Middleware
         .layer(
             ServiceBuilder::new()

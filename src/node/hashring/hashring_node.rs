@@ -107,7 +107,8 @@ impl Node for HashringNode {
 
         // Set up replication - for now, default to RF=2
         let replication_factor = ReplicationFactor::Two;
-        let replica_buckets = Self::calculate_replica_buckets(bucket, number_of_buckets, &replication_factor);
+        let replica_buckets =
+            Self::calculate_replica_buckets(bucket, number_of_buckets, &replication_factor);
 
         info!(
             "[Node<{}>] Hashring node starting at {} with bucket {} out of {} buckets, replicas {:?}, and topology {:?}",
@@ -148,7 +149,10 @@ impl Node for HashringNode {
                 match client.get(&url).send().await {
                     Ok(response) => response.json().await.map_err(Into::into),
                     Err(e) => {
-                        warn!("Primary owner failed for bucket {}: {}. Trying replicas...", bucket, e);
+                        warn!(
+                            "Primary owner failed for bucket {}: {}. Trying replicas...",
+                            bucket, e
+                        );
                         self.try_replicas_for_check(&client_id, bucket).await
                     }
                 }
@@ -196,7 +200,10 @@ impl Node for HashringNode {
                         }
                     }
                     Err(e) => {
-                        warn!("Primary owner failed for bucket {}: {}. Trying replicas...", bucket, e);
+                        warn!(
+                            "Primary owner failed for bucket {}: {}. Trying replicas...",
+                            bucket, e
+                        );
                         self.try_replicas_for_rate_limit(&client_id, bucket).await
                     }
                 }
@@ -421,7 +428,11 @@ impl HashringNode {
     }
 
     /// Calculate which buckets this node should replicate based on replication factor
-    fn calculate_replica_buckets(bucket: u32, number_of_buckets: u32, replication_factor: &ReplicationFactor) -> Vec<u32> {
+    fn calculate_replica_buckets(
+        bucket: u32,
+        number_of_buckets: u32,
+        replication_factor: &ReplicationFactor,
+    ) -> Vec<u32> {
         let rf = *replication_factor as usize;
         let mut replicas = Vec::with_capacity(rf - 1);
 
@@ -500,35 +511,58 @@ impl HashringNode {
 
                                     // Import the data into our local rate limiter
                                     let rate_limiter = self.rate_limiter.lock().map_err(|_| {
-                                        ColibriError::Api("Failed to acquire rate limiter lock".to_string())
+                                        ColibriError::Api(
+                                            "Failed to acquire rate limiter lock".to_string(),
+                                        )
                                     })?;
 
-                                    let token_buckets: std::collections::HashMap<String, crate::limiters::token_bucket::TokenBucket> =
-                                        export_data.client_data
-                                            .into_iter()
-                                            .map(|client_data| {
-                                                (client_data.client_id, crate::limiters::token_bucket::TokenBucket {
+                                    let token_buckets: std::collections::HashMap<
+                                        String,
+                                        crate::limiters::token_bucket::TokenBucket,
+                                    > = export_data
+                                        .client_data
+                                        .into_iter()
+                                        .map(|client_data| {
+                                            (
+                                                client_data.client_id,
+                                                crate::limiters::token_bucket::TokenBucket {
                                                     tokens: client_data.tokens,
                                                     last_call: client_data.last_call,
-                                                })
-                                            })
-                                            .collect();
+                                                },
+                                            )
+                                        })
+                                        .collect();
 
                                     rate_limiter.import_buckets(token_buckets);
                                     drop(rate_limiter);
 
-                                    debug!("Successfully synced {} clients from bucket {}",
-                                          client_count, bucket);
+                                    debug!(
+                                        "Successfully synced {} clients from bucket {}",
+                                        client_count, bucket
+                                    );
                                     Ok(())
                                 }
                                 Err(e) => {
-                                    warn!("Failed to parse export data for bucket {}: {}", bucket, e);
-                                    Err(ColibriError::Api(format!("Failed to parse export data: {}", e)))
+                                    warn!(
+                                        "Failed to parse export data for bucket {}: {}",
+                                        bucket, e
+                                    );
+                                    Err(ColibriError::Api(format!(
+                                        "Failed to parse export data: {}",
+                                        e
+                                    )))
                                 }
                             }
                         } else {
-                            warn!("Export request failed for bucket {}: {}", bucket, response.status());
-                            Err(ColibriError::Api(format!("Export request failed: {}", response.status())))
+                            warn!(
+                                "Export request failed for bucket {}: {}",
+                                bucket,
+                                response.status()
+                            );
+                            Err(ColibriError::Api(format!(
+                                "Export request failed: {}",
+                                response.status()
+                            )))
                         }
                     }
                     Err(e) => {
@@ -538,7 +572,10 @@ impl HashringNode {
                 }
             }
             _ => {
-                debug!("Bucket {} primary is self or not found, skipping sync", bucket);
+                debug!(
+                    "Bucket {} primary is self or not found, skipping sync",
+                    bucket
+                );
                 Ok(())
             }
         }
@@ -558,7 +595,11 @@ impl HashringNode {
                 }
 
                 // Check if this node replicates the target bucket
-                let replicas = Self::calculate_replica_buckets(node_bucket, self.number_of_buckets, &self.replication_factor);
+                let replicas = Self::calculate_replica_buckets(
+                    node_bucket,
+                    self.number_of_buckets,
+                    &self.replication_factor,
+                );
                 if replicas.contains(&target_bucket) {
                     Some((url, client))
                 } else {
@@ -569,7 +610,11 @@ impl HashringNode {
     }
 
     /// Try replica nodes for check_limit operations when primary fails
-    async fn try_replicas_for_check(&self, client_id: &str, bucket: u32) -> Result<CheckCallsResponse> {
+    async fn try_replicas_for_check(
+        &self,
+        client_id: &str,
+        bucket: u32,
+    ) -> Result<CheckCallsResponse> {
         let replica_nodes = self.get_replica_nodes_for_bucket(bucket);
 
         for (host, client) in replica_nodes {
@@ -591,12 +636,19 @@ impl HashringNode {
         }
 
         // All replicas failed, fallback to local handling
-        warn!("All replicas failed for bucket {}, handling locally", bucket);
+        warn!(
+            "All replicas failed for bucket {}, handling locally",
+            bucket
+        );
         local_check_limit(client_id.to_string(), self.rate_limiter.clone()).await
     }
 
     /// Try replica nodes for rate_limit operations when primary fails
-    async fn try_replicas_for_rate_limit(&self, client_id: &str, bucket: u32) -> Result<Option<CheckCallsResponse>> {
+    async fn try_replicas_for_rate_limit(
+        &self,
+        client_id: &str,
+        bucket: u32,
+    ) -> Result<Option<CheckCallsResponse>> {
         let replica_nodes = self.get_replica_nodes_for_bucket(bucket);
 
         for (host, client) in replica_nodes {
@@ -614,7 +666,10 @@ impl HashringNode {
             {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    info!("Replica success at {} for bucket {}, status: {}", host, bucket, status);
+                    info!(
+                        "Replica success at {} for bucket {}, status: {}",
+                        host, bucket, status
+                    );
                     if status == 429 {
                         return Ok(None);
                     } else {
@@ -629,7 +684,10 @@ impl HashringNode {
         }
 
         // All replicas failed, fallback to local handling
-        warn!("All replicas failed for bucket {}, handling locally", bucket);
+        warn!(
+            "All replicas failed for bucket {}, handling locally",
+            bucket
+        );
         local_rate_limit(client_id.to_string(), self.rate_limiter.clone()).await
     }
 

@@ -23,6 +23,11 @@ pub mod cluster {
     pub const HEALTH: &str = "/cluster/health";
     pub const EXPORT_BUCKET: &str = "/cluster/bucket/{bucket_id}/export";
     pub const IMPORT_BUCKET: &str = "/cluster/bucket/{bucket_id}/import";
+    pub const TOPOLOGY: &str = "/cluster/topology";
+    pub const PREPARE_CHANGE: &str = "/cluster/prepare-change";
+    pub const COMMIT_CHANGE: &str = "/cluster/commit-change";
+    pub const ABORT_CHANGE: &str = "/cluster/abort-change";
+    pub const STATUS: &str = "/cluster/status";
 }
 
 pub fn drop_leading_slash(path: &str) -> &str {

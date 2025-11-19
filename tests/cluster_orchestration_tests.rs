@@ -63,7 +63,7 @@ async fn test_prepare_change_response_serialization() {
         serde_json::from_str(&json).expect("Should deserialize");
 
     assert_eq!(deserialized.node_id, "node1");
-    assert_eq!(deserialized.ready, true);
+    assert!(deserialized.ready);
     assert_eq!(deserialized.error, None);
     assert_eq!(deserialized.data_exported, true);
 }
@@ -185,7 +185,7 @@ async fn test_prepare_change_response_error_handling() {
     let deserialized: PrepareChangeResponse =
         serde_json::from_str(&json).expect("Should deserialize");
 
-    assert_eq!(deserialized.ready, true);
+    assert!(deserialized.ready);
     assert_eq!(deserialized.error, None);
 }
 

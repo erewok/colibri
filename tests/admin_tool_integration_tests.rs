@@ -118,7 +118,7 @@ async fn test_admin_tool_health_check_expectations() {
         serde_json::from_str(&json).expect("Admin tool should parse health");
 
     assert_eq!(parsed.status, "healthy");
-    assert_eq!(parsed.replication_active, true);
+    assert!(parsed.replication_active);
     assert_eq!(parsed.buckets_owned.len(), 2);
     assert_eq!(parsed.buckets_replicated.len(), 2);
 }

@@ -19,6 +19,12 @@ pub mod custom {
     pub const CHECK: &str = "/rl-check/{rule_name}/{key}";
 }
 
+pub mod cluster {
+    pub const HEALTH: &str = "/cluster/health";
+    pub const EXPORT_BUCKET: &str = "/cluster/bucket/{bucket_id}/export";
+    pub const IMPORT_BUCKET: &str = "/cluster/bucket/{bucket_id}/import";
+}
+
 pub fn drop_leading_slash(path: &str) -> &str {
     if let Some(stripped) = path.strip_prefix('/') {
         stripped

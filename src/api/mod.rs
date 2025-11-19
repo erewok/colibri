@@ -1,4 +1,5 @@
 mod base;
+pub mod cluster;
 mod rate_limits;
 
 use std::borrow::Cow;
@@ -61,6 +62,19 @@ pub async fn api(rl_node: node::NodeWrapper) -> Result<Router> {
         .route(
             paths::custom::LIMIT,
             routing::post(rate_limits::rate_limit_custom),
+        )
+        // Cluster management endpoints
+        .route(
+            paths::cluster::HEALTH,
+            routing::get(cluster::cluster_health),
+        )
+        .route(
+            paths::cluster::EXPORT_BUCKET,
+            routing::get(cluster::export_bucket),
+        )
+        .route(
+            paths::cluster::IMPORT_BUCKET,
+            routing::post(cluster::import_bucket),
         )
         // Middleware
         .layer(

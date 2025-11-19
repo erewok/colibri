@@ -635,12 +635,33 @@ impl HashringNode {
             }
         }
 
-        // All replicas failed, fallback to local handling
-        warn!(
-            "All replicas failed for bucket {}, handling locally",
-            bucket
-        );
-        local_check_limit(client_id.to_string(), self.rate_limiter.clone()).await
+        // All replicas failed, check if this node owns or replicates the bucket
+        let is_owner = self.owns_bucket(bucket);
+        let is_replica = {
+            let my_bucket = self.get_own_bucket();
+            let replicas = Self::calculate_replica_buckets(
+                my_bucket,
+                self.number_of_buckets,
+                &self.replication_factor,
+            );
+            replicas.contains(&bucket)
+        };
+        if is_owner || is_replica {
+            warn!(
+                "All replicas failed for bucket {}, handling locally (this node is owner or replica)",
+                bucket
+            );
+            local_check_limit(client_id.to_string(), self.rate_limiter.clone()).await
+        } else {
+            error!(
+                "All replicas failed for bucket {}, and this node is neither owner nor replica. Refusing to serve potentially stale data.",
+                bucket
+            );
+            Err(ColibriError::Unavailable(format!(
+                "All replicas failed for bucket {}, and this node is neither owner nor replica. Cannot serve request.",
+                bucket
+            )))
+        }
     }
 
     /// Try replica nodes for rate_limit operations when primary fails

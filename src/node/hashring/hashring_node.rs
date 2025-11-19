@@ -483,8 +483,13 @@ impl HashringNode {
                     warn!("Failed to sync bucket {}: {}", bucket, e);
                 } else {
                     // Update last sync time
-                    if let Ok(mut sync_state) = self.sync_state.write() {
-                        sync_state.insert(bucket, Instant::now());
+                    match self.sync_state.write() {
+                        Ok(mut sync_state) => {
+                            sync_state.insert(bucket, Instant::now());
+                        }
+                        Err(e) => {
+                            warn!("Failed to acquire write lock on sync_state for bucket {}: {}", bucket, e);
+                        }
                     }
                 }
             }

@@ -65,7 +65,7 @@ async fn test_prepare_change_response_serialization() {
     assert_eq!(deserialized.node_id, "node1");
     assert!(deserialized.ready);
     assert_eq!(deserialized.error, None);
-    assert_eq!(deserialized.data_exported, true);
+    assert!(deserialized.data_exported);
 }
 
 #[tokio::test]

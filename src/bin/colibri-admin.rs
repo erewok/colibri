@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+use colibri::node::hashring::consistent_hashing;
+
 /// Information about a topology change operation
 #[derive(Debug)]
 struct TopologyChangeInfo {
@@ -133,11 +135,12 @@ async fn validate_topology(
 ) -> Result<TopologyChangeInfo, Box<dyn std::error::Error>> {
     let current_nodes: HashSet<SocketAddr> = parse_topology(current)?;
     let new_nodes: HashSet<SocketAddr> = parse_topology(new)?;
+    let current_count = current_nodes.len();
+    let new_count = new_nodes.len();
 
     info!("Validating topology change...");
-    info!("   Current: {} nodes", current_nodes.len());
-    info!("   New: {} nodes", new_nodes.len());
-
+    info!("   Current: {} nodes", current_count);
+    info!("   New: {} nodes", new_count);
     // Basic validation rules
     if new_nodes.is_empty() {
         return Err("New topology cannot be empty".into());
@@ -205,9 +208,10 @@ async fn export_cluster_data(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node_addrs = parse_topology(nodes)?;
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let node_count = node_addrs.len();
 
     info!(
-        node_count = node_addrs.len(),
+        node_count = node_count,
         "Starting data export from nodes"
     );
 
@@ -216,8 +220,9 @@ async fn export_cluster_data(
 
     for node in &node_addrs {
         // For hashring nodes, we need to determine which bucket they own
-        // For now, we'll try bucket 0 and handle errors gracefully
-        let export_url = format!("http://{}/cluster/export/0", node);
+        let bucketnum =
+            consistent_hashing::jump_consistent_hash(&node.to_string(), node_count as u32);
+        let export_url = format!("http://{}/cluster/bucket/{}/export", node, bucketnum);
 
         match client.get(&export_url).send().await {
             Ok(response) if response.status().is_success() => {
@@ -249,9 +254,9 @@ async fn import_cluster_data(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node_addrs = parse_topology(nodes)?;
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-
+    let node_count = node_addrs.len();
     info!(
-        node_count = node_addrs.len(),
+        node_count = node_count,
         "Starting data import to nodes"
     );
 
@@ -261,9 +266,11 @@ async fn import_cluster_data(
             input_dir,
             node.to_string().replace(':', "_")
         );
+        let bucketnum =
+            consistent_hashing::jump_consistent_hash(&node.to_string(), node_count as u32);
 
-        if let Ok(import_data) = std::fs::read_to_string(&input_file) {
-            let import_url = format!("http://{}/cluster/import/0", node);
+            if let Ok(import_data) = std::fs::read_to_string(&input_file) {
+                let import_url = format!("http://{}/cluster/bucket/{}/import", node, bucketnum);
 
             match client
                 .post(&import_url)

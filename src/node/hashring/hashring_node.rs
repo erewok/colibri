@@ -122,7 +122,7 @@ impl Node for HashringNode {
 
         info!(
             "[Node<{}>] Hashring node starting at {} with bucket {} out of {} buckets, replicas {:?}, and topology {:?}",
-            node_id, listen_api, bucket, number_of_buckets, replica_buckets, topology
+            node_id, listen_api, bucket, number_of_buckets, replica_buckets, topology.values().map(|v| v.0.as_str()).collect::<Vec<&str>>()
         );
         let rate_limit_config = settings::RateLimitConfig::new(settings.rate_limit_settings());
 

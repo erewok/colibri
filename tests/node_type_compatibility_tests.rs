@@ -30,6 +30,7 @@ fn single_node_settings() -> Settings {
         gossip_fanout: 3,
         topology: HashSet::new(),
         failure_timeout_secs: 30,
+        hash_replication_factor: 1,
     }
 }
 
@@ -51,6 +52,7 @@ fn gossip_node_settings() -> Settings {
         gossip_fanout: 3,
         topology,
         failure_timeout_secs: 30,
+        hash_replication_factor: 1,
     }
 }
 
@@ -72,6 +74,7 @@ fn hashring_node_settings() -> Settings {
         gossip_fanout: 3,
         topology,
         failure_timeout_secs: 30,
+        hash_replication_factor: 2,
     }
 }
 

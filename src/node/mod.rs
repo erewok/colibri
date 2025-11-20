@@ -91,7 +91,12 @@ impl NodeWrapper {
                 settings::RunMode::Hashring => {
                     // Build hashring node
                     let hashring_node = HashringNode::new(node_id, settings).await?;
-                    Ok(Self::Hashring(Arc::new(hashring_node)))
+                    let hashring_arc = Arc::new(hashring_node);
+
+                    // Start background replication sync
+                    hashring_arc.clone().start_replication_sync();
+
+                    Ok(Self::Hashring(hashring_arc))
                 }
             }
         }

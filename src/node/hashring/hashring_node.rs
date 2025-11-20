@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -16,8 +18,10 @@ use crate::node::{
 use crate::settings;
 
 /// Replication factor for data distribution
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReplicationFactor {
-    One = 1,
+    Zero = 1,
+    #[default]
     Two = 2,
     Three = 3,
 }
@@ -31,7 +35,11 @@ pub struct HashringNode {
     listen_api: String,
     // Connection-pooling clients reuse TCP connections to each node
     pub topology: HashMap<u32, (Url, reqwest::Client)>,
-    // replication_factor: ReplicationFactor,
+    replication_factor: ReplicationFactor,
+    replica_buckets: Vec<u32>,
+    replication_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    // Replication sync state: track last sync time per bucket we replicate
+    sync_state: Arc<RwLock<HashMap<u32, Instant>>>,
     pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
     pub rate_limit_config: Arc<RwLock<settings::RateLimitConfig>>,
     pub named_rate_limiters:
@@ -99,9 +107,22 @@ impl Node for HashringNode {
                 ))
             })?;
 
+        // Set up replication. For unsupported values, default to ReplicationFactor::default() (currently RF=2).
+        let replication_factor = match settings.hash_replication_factor {
+            0 | 1 => ReplicationFactor::Zero,
+            2 => ReplicationFactor::Two,
+            3 => ReplicationFactor::Three,
+            other => {
+                warn!("Unsupported replication factor {}, defaulting to 2", other);
+                ReplicationFactor::default()
+            }
+        };
+        let replica_buckets =
+            Self::calculate_replica_buckets(bucket, number_of_buckets, &replication_factor);
+
         info!(
-            "[Node<{}>] Hashring node starting at {} with bucket {} out of {} buckets and topology {:?}",
-            node_id, listen_api, bucket, number_of_buckets, topology
+            "[Node<{}>] Hashring node starting at {} with bucket {} out of {} buckets, replicas {:?}, and topology {:?}",
+            node_id, listen_api, bucket, number_of_buckets, replica_buckets, topology
         );
         let rate_limit_config = settings::RateLimitConfig::new(settings.rate_limit_settings());
 
@@ -111,7 +132,10 @@ impl Node for HashringNode {
             number_of_buckets,
             listen_api,
             topology,
-            // replication_factor: ReplicationFactor,
+            replication_factor,
+            replica_buckets,
+            replication_task_handle: Arc::new(Mutex::new(None)),
+            sync_state: Arc::new(RwLock::new(HashMap::new())),
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(RwLock::new(rate_limit_config)),
             named_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
@@ -122,7 +146,7 @@ impl Node for HashringNode {
         let bucket =
             consistent_hashing::jump_consistent_hash(client_id.as_str(), self.number_of_buckets);
 
-        // Use bucket to select into the topology HashMap
+        // Try primary owner first
         match self.get_topology_address_for_bucket(bucket) {
             Some((host, client)) => {
                 info!(
@@ -132,23 +156,34 @@ impl Node for HashringNode {
                 let path = paths::drop_leading_slash(paths::default_rate_limits::CHECK)
                     .replace("{client_id}", &client_id);
                 let url = format!("{}{}", host, path);
-                client
-                    .get(url)
-                    .send()
-                    .await?
-                    .json()
-                    .await
-                    .map_err(Into::into)
+
+                match client.get(&url).send().await {
+                    Ok(response) => response.json().await.map_err(Into::into),
+                    Err(e) => {
+                        warn!(
+                            "Primary owner failed for bucket {}: {}. Trying replicas...",
+                            bucket, e
+                        );
+                        self.try_replicas_for_check(&client_id, bucket).await
+                    }
+                }
             }
-            // fallback to self?
-            None => local_check_limit(client_id, self.rate_limiter.clone()).await,
+            // Handle locally if this is our bucket, or try replicas
+            None => {
+                if bucket == self.bucket {
+                    local_check_limit(client_id, self.rate_limiter.clone()).await
+                } else {
+                    self.try_replicas_for_check(&client_id, bucket).await
+                }
+            }
         }
     }
 
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        let number_of_buckets = self.topology.len().try_into()?;
         let bucket =
-            consistent_hashing::jump_consistent_hash(client_id.as_str(), number_of_buckets);
+            consistent_hashing::jump_consistent_hash(client_id.as_str(), self.number_of_buckets);
+
+        // Try primary owner first
         match self.get_topology_address_for_bucket(bucket) {
             Some((host, client)) => {
                 let path = paths::drop_leading_slash(paths::default_rate_limits::LIMIT)
@@ -158,22 +193,40 @@ impl Node for HashringNode {
                     "[bucket {}] Requesting data from bucket {} at {}",
                     self.bucket, bucket, url
                 );
-                let resp = client
-                    .post(url)
+
+                match client
+                    .post(&url)
                     .header("content-type", "application/json")
                     .body("{}")
                     .send()
-                    .await?;
-                let status = resp.status().as_u16();
-                info!("Received status code {}", status);
-                if status == 429 {
-                    Ok(None)
-                } else {
-                    resp.json().await.map_err(Into::into)
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        info!("Received status code {}", status);
+                        if status == 429 {
+                            Ok(None)
+                        } else {
+                            resp.json().await.map_err(Into::into)
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Primary owner failed for bucket {}: {}. Trying replicas...",
+                            bucket, e
+                        );
+                        self.try_replicas_for_rate_limit(&client_id, bucket).await
+                    }
                 }
             }
-            // fallback to self
-            None => local_rate_limit(client_id, self.rate_limiter.clone()).await,
+            // Handle locally if this is our bucket, or try replicas
+            None => {
+                if bucket == self.bucket {
+                    local_rate_limit(client_id, self.rate_limiter.clone()).await
+                } else {
+                    self.try_replicas_for_rate_limit(&client_id, bucket).await
+                }
+            }
         }
     }
 
@@ -374,7 +427,364 @@ impl Node for HashringNode {
     }
 }
 
+impl Drop for HashringNode {
+    fn drop(&mut self) {
+        // Clean up the replication task when the node is dropped
+        if let Ok(mut task_handle) = self.replication_task_handle.lock() {
+            if let Some(handle) = task_handle.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 impl HashringNode {
+    /// Get the bucket ID that this node owns
+    pub fn get_owned_bucket(&self) -> u32 {
+        self.bucket
+    }
+
+    /// Get the buckets that this node replicates
+    pub fn get_replica_buckets(&self) -> Vec<u32> {
+        self.replica_buckets.clone()
+    }
+
+    /// Calculate which buckets this node should replicate based on replication factor
+    fn calculate_replica_buckets(
+        bucket: u32,
+        number_of_buckets: u32,
+        replication_factor: &ReplicationFactor,
+    ) -> Vec<u32> {
+        let rf = match replication_factor {
+            ReplicationFactor::Zero => return Vec::new(),
+            ReplicationFactor::Two => 2,
+            ReplicationFactor::Three => 3,
+        };
+        let mut replicas = Vec::with_capacity(rf);
+        // For RF=2, replicate next bucket. For RF=3, replicate next 2 buckets
+        for i in 1..rf {
+            let replica_bucket = (bucket + i as u32) % number_of_buckets;
+            replicas.push(replica_bucket);
+        }
+
+        replicas
+    }
+
+    /// Start background replication sync task
+    pub fn start_replication_sync(self: Arc<Self>) {
+        let node = Arc::clone(&self);
+        let handle = tokio::spawn(async move {
+            let mut sync_interval = interval(Duration::from_secs(5)); // Base sync interval
+            loop {
+                sync_interval.tick().await;
+                if let Err(e) = node.sync_replicas().await {
+                    warn!("Replication sync failed: {}", e);
+                }
+            }
+        });
+
+        // Store the handle for proper cleanup
+        if let Ok(mut task_handle) = self.replication_task_handle.lock() {
+            *task_handle = Some(handle);
+        } else {
+            warn!("Failed to acquire lock on replication_task_handle");
+        }
+    }
+
+    /// Stop the background replication sync task
+    pub fn stop_replication_sync(&self) {
+        if let Ok(mut task_handle) = self.replication_task_handle.lock() {
+            if let Some(handle) = task_handle.take() {
+                handle.abort();
+                info!("Replication sync task stopped");
+            }
+        } else {
+            warn!("Failed to acquire lock on replication_task_handle during shutdown");
+        }
+    }
+
+    /// Sync data from primary owners for buckets we replicate
+    async fn sync_replicas(&self) -> Result<()> {
+        for &bucket in &self.replica_buckets {
+            // Check if we need to sync this bucket based on activity
+            let should_sync = {
+                let sync_state = self.sync_state.read().map_err(|e| {
+                    ColibriError::Concurrency(format!("Failed to read sync state: {}", e))
+                })?;
+
+                match sync_state.get(&bucket) {
+                    Some(last_sync) => {
+                        // Exponential backoff: sync more frequently for recently active buckets
+                        let since_last_sync = last_sync.elapsed();
+                        since_last_sync >= Duration::from_secs(10) // Min sync interval
+                    }
+                    None => true, // Never synced before
+                }
+            };
+
+            if should_sync {
+                if let Err(e) = self.sync_bucket_from_primary(bucket).await {
+                    warn!("Failed to sync bucket {}: {}", bucket, e);
+                } else {
+                    // Update last sync time
+                    match self.sync_state.write() {
+                        Ok(mut sync_state) => {
+                            sync_state.insert(bucket, Instant::now());
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to acquire write lock on sync_state for bucket {}: {}",
+                                bucket, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sync a specific bucket from its primary owner
+    async fn sync_bucket_from_primary(&self, bucket: u32) -> Result<()> {
+        // Find the primary owner of this bucket
+        match self.topology.get(&bucket) {
+            Some((host, client)) if !self.topology_address_is_self(host) => {
+                // Use the cluster API to export bucket data from the primary node
+                let export_url = format!("{}{}", host, paths::cluster::export_bucket_path(bucket));
+                debug!("Syncing bucket {} from primary at {}", bucket, export_url);
+
+                match client.get(&export_url).send().await {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            match response.json::<crate::api::cluster::BucketExport>().await {
+                                Ok(export_data) => {
+                                    // Store count before moving the data
+                                    let client_count = export_data.client_data.len();
+
+                                    // Import the data into our local rate limiter
+                                    let rate_limiter = self.rate_limiter.lock().map_err(|_| {
+                                        ColibriError::Api(
+                                            "Failed to acquire rate limiter lock".to_string(),
+                                        )
+                                    })?;
+
+                                    let token_buckets: std::collections::HashMap<
+                                        String,
+                                        crate::limiters::token_bucket::TokenBucket,
+                                    > = export_data
+                                        .client_data
+                                        .into_iter()
+                                        .map(|client_data| {
+                                            (
+                                                client_data.client_id,
+                                                crate::limiters::token_bucket::TokenBucket {
+                                                    tokens: client_data.tokens,
+                                                    last_call: client_data.last_call,
+                                                },
+                                            )
+                                        })
+                                        .collect();
+
+                                    rate_limiter.import_buckets(token_buckets);
+                                    drop(rate_limiter);
+
+                                    debug!(
+                                        "Successfully synced {} clients from bucket {}",
+                                        client_count, bucket
+                                    );
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to parse export data for bucket {}: {}",
+                                        bucket, e
+                                    );
+                                    Err(ColibriError::Api(format!(
+                                        "Failed to parse export data: {}",
+                                        e
+                                    )))
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "Export request failed for bucket {}: {}",
+                                bucket,
+                                response.status()
+                            );
+                            Err(ColibriError::Api(format!(
+                                "Export request failed: {}",
+                                response.status()
+                            )))
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to sync bucket {} from {}: {}", bucket, host, e);
+                        Err(ColibriError::Api(format!("Sync request failed: {}", e)))
+                    }
+                }
+            }
+            _ => {
+                debug!(
+                    "Bucket {} primary is self or not found, skipping sync",
+                    bucket
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Get replica nodes for a given bucket (nodes that replicate this bucket's data)
+    fn get_replica_nodes_for_bucket(&self, target_bucket: u32) -> Vec<(&Url, &reqwest::Client)> {
+        // Find nodes whose replica list includes the target bucket
+        self.topology
+            .iter()
+            .filter_map(|(&node_bucket, (url, client))| {
+                if node_bucket == target_bucket {
+                    return None; // Skip the primary owner
+                }
+                if self.topology_address_is_self(url) {
+                    return None; // Skip self
+                }
+
+                // Check if this node replicates the target bucket
+                let replicas = Self::calculate_replica_buckets(
+                    node_bucket,
+                    self.number_of_buckets,
+                    &self.replication_factor,
+                );
+                if replicas.contains(&target_bucket) {
+                    Some((url, client))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Try replica nodes for check_limit operations when primary fails
+    async fn try_replicas_for_check(
+        &self,
+        client_id: &str,
+        bucket: u32,
+    ) -> Result<CheckCallsResponse> {
+        let replica_nodes = self.get_replica_nodes_for_bucket(bucket);
+
+        for (host, client) in replica_nodes {
+            let path = paths::drop_leading_slash(paths::default_rate_limits::CHECK)
+                .replace("{client_id}", client_id);
+            let url = format!("{}{}", host, path);
+
+            info!("Trying replica at {} for bucket {}", host, bucket);
+            match client.get(&url).send().await {
+                Ok(response) => {
+                    info!("Replica success at {} for bucket {}", host, bucket);
+                    return response.json().await.map_err(Into::into);
+                }
+                Err(e) => {
+                    warn!("Replica at {} failed for bucket {}: {}", host, bucket, e);
+                    continue;
+                }
+            }
+        }
+
+        // All replicas failed, check if this node owns or replicates the bucket
+        let my_bucket = self.get_owned_bucket();
+        let is_owner = my_bucket == bucket;
+        let is_replica = {
+            let replicas = Self::calculate_replica_buckets(
+                my_bucket,
+                self.number_of_buckets,
+                &self.replication_factor,
+            );
+            replicas.contains(&bucket)
+        };
+        if is_owner || is_replica {
+            warn!(
+                "All replicas failed for bucket {}, handling locally (this node is owner or replica)",
+                bucket
+            );
+            local_check_limit(client_id.to_string(), self.rate_limiter.clone()).await
+        } else {
+            error!(
+                "All replicas failed for bucket {}, and this node is neither owner nor replica. Refusing to serve potentially stale data.",
+                bucket
+            );
+            Err(ColibriError::Transport(format!(
+                "All replicas failed for bucket {}, and this node is neither owner nor replica. Cannot serve request.",
+                bucket
+            )))
+        }
+    }
+
+    /// Try replica nodes for rate_limit operations when primary fails
+    async fn try_replicas_for_rate_limit(
+        &self,
+        client_id: &str,
+        bucket: u32,
+    ) -> Result<Option<CheckCallsResponse>> {
+        let replica_nodes = self.get_replica_nodes_for_bucket(bucket);
+
+        for (host, client) in replica_nodes {
+            let path = paths::drop_leading_slash(paths::default_rate_limits::LIMIT)
+                .replace("{client_id}", client_id);
+            let url = format!("{}{}", host, path);
+
+            info!("Trying replica at {} for bucket {}", host, bucket);
+            match client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    info!(
+                        "Replica success at {} for bucket {}, status: {}",
+                        host, bucket, status
+                    );
+                    if status == 429 {
+                        return Ok(None);
+                    } else {
+                        return resp.json().await.map_err(Into::into);
+                    }
+                }
+                Err(e) => {
+                    warn!("Replica at {} failed for bucket {}: {}", host, bucket, e);
+                    continue;
+                }
+            }
+        }
+
+        // All replicas failed, check if this node owns or replicates the bucket
+        let my_bucket = self.get_owned_bucket();
+        let is_owner = my_bucket == bucket;
+        let is_replica = {
+            let replicas = Self::calculate_replica_buckets(
+                my_bucket,
+                self.number_of_buckets,
+                &self.replication_factor,
+            );
+            replicas.contains(&bucket)
+        };
+        if is_owner || is_replica {
+            warn!(
+                "All replicas failed for bucket {}, handling locally (this node is owner or replica)",
+                bucket
+            );
+            local_rate_limit(client_id.to_string(), self.rate_limiter.clone()).await
+        } else {
+            error!(
+                "All replicas failed for bucket {}, and this node is neither owner nor replica. Refusing to serve potentially stale data.",
+                bucket
+            );
+            Err(ColibriError::Transport(format!(
+                "All replicas failed for bucket {}, and this node is neither owner nor replica. Cannot serve request.",
+                bucket
+            )))
+        }
+    }
+
     fn topology_address_is_self(&self, address: &Url) -> bool {
         // confirm that the address matches our own listen_api: we DO NOT WANT TO SEND REQUESTS TO SELF!
         address.as_str().contains(&self.listen_api)
@@ -484,6 +894,7 @@ mod tests {
             gossip_fanout: 3,
             topology,
             failure_timeout_secs: 30,
+            hash_replication_factor: 1,
         }
     }
 
@@ -505,6 +916,7 @@ mod tests {
             gossip_fanout: 3,
             topology,
             failure_timeout_secs: 30,
+            hash_replication_factor: 2,
         }
     }
 

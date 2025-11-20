@@ -1,12 +1,24 @@
 [package]
 name = "colibri"
-version = "0.5.0-dev.2"
+version = "0.5.0-dev.3"
 description = "Distributed rate-limiting as a service"
 authors = ["Erik Aker <eraker@gmail.com>"]
 homepage = "https://github.com/erewok/colibri"
 repository = "https://github.com/erewok/colibri"
 edition = "2021"
 license = "MPL-2.0"
+
+
+default-run = "colibri-server"
+
+
+[[bin]]
+name = "colibri-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "colibri-admin"
+path = "src/bin/colibri-admin.rs"
 
 [dependencies]
 anyhow = "1.0.100"

@@ -102,6 +102,14 @@ pub struct Cli {
         help = "Number of peers to gossip to per round"
     )]
     pub gossip_fanout: usize,
+
+    #[clap(
+        long,
+        default_value = "1",
+        env("COLIBRI_HASH_REPLICATION_FACTOR"),
+        help = "Number of replicas for hashring mode (1, 2, or 3)"
+    )]
+    pub hash_replication_factor: usize,
 }
 
 impl Cli {
@@ -118,6 +126,7 @@ impl Cli {
             failure_timeout_secs: self.failure_timeout_secs,
             gossip_interval_ms: self.gossip_interval_ms,
             gossip_fanout: self.gossip_fanout,
+            hash_replication_factor: self.hash_replication_factor,
         }
     }
 }

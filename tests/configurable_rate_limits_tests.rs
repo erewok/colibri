@@ -37,6 +37,7 @@ fn create_test_settings() -> Settings {
         gossip_fanout: 3,
         topology: HashSet::new(), // Empty topology for single node
         failure_timeout_secs: 30,
+        hash_replication_factor: 1,
     }
 }
 

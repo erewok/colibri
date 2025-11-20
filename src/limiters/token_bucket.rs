@@ -220,6 +220,50 @@ impl TokenBucketLimiter {
             }
         }
     }
+
+    /// Export all token buckets for cluster migration
+    pub fn export_all_buckets(&self) -> std::collections::HashMap<String, TokenBucket> {
+        let guard = self.cache.pin();
+        let mut exported = std::collections::HashMap::new();
+
+        // Iterate through all entries in the papaya HashMap
+        for (key, bucket) in guard.iter() {
+            exported.insert(key.clone(), bucket.clone());
+        }
+
+        exported
+    }
+
+    /// Import token buckets from another node during cluster migration
+    pub fn import_buckets(&self, buckets: std::collections::HashMap<String, TokenBucket>) {
+        let guard = self.cache.pin();
+
+        for (key, bucket) in buckets {
+            // Only import if the bucket doesn't already exist or if the imported bucket
+            // has more recent activity (higher last_call timestamp)
+            match guard.get(&key) {
+                Some(existing) => {
+                    if bucket.last_call > existing.last_call {
+                        guard.insert(key, bucket);
+                    }
+                }
+                None => {
+                    guard.insert(key, bucket);
+                }
+            }
+        }
+    }
+
+    /// Get all client keys currently in the cache (for debugging/monitoring)
+    pub fn get_all_client_keys(&self) -> Vec<String> {
+        let guard = self.cache.pin();
+        guard.iter().map(|(key, _)| key.clone()).collect()
+    }
+
+    /// Get bucket count for monitoring
+    pub fn bucket_count(&self) -> usize {
+        self.cache.pin().len()
+    }
 }
 
 #[cfg(test)]

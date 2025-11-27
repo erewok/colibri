@@ -56,7 +56,6 @@ async fn test_token_bucket_export_import() {
 #[test]
 fn test_bucket_export_serialization() {
     let export = BucketExport {
-        bucket_id: 42,
         client_data: vec![ClientBucketData {
             client_id: "test-client".to_string(),
             tokens: 95.5,
@@ -69,7 +68,6 @@ fn test_bucket_export_serialization() {
     let json = serde_json::to_string(&export).expect("Should serialize");
     let deserialized: BucketExport = serde_json::from_str(&json).expect("Should deserialize");
 
-    assert_eq!(deserialized.bucket_id, 42);
     assert_eq!(deserialized.client_data.len(), 1);
     assert_eq!(deserialized.client_data[0].client_id, "test-client");
     assert_eq!(deserialized.client_data[0].tokens, 95.5);

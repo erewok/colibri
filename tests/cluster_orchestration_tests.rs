@@ -96,7 +96,6 @@ async fn test_cluster_status_response_serialization() {
 fn test_bucket_export_with_topology_change() {
     // Test that BucketExport can handle large datasets during topology changes
     let export = BucketExport {
-        bucket_id: 42,
         client_data: (0..1000)
             .map(|i| ClientBucketData {
                 client_id: format!("client_{}", i),
@@ -114,7 +113,6 @@ fn test_bucket_export_with_topology_change() {
     // Verify deserialization
     let deserialized: BucketExport =
         serde_json::from_str(&json).expect("Should deserialize large export");
-    assert_eq!(deserialized.bucket_id, 42);
     assert_eq!(deserialized.client_data.len(), 1000);
     assert_eq!(deserialized.client_data[0].client_id, "client_0");
     assert_eq!(deserialized.client_data[999].client_id, "client_999");
@@ -195,7 +193,6 @@ fn test_gossip_node_export_behavior() {
     // (This tests the data structure behavior that would be returned
     // from a gossip node export - empty client data)
     let gossip_export = BucketExport {
-        bucket_id: 0,        // Gossip nodes don't use bucket concept
         client_data: vec![], // Empty because gossip uses different sync
         export_timestamp: 1640995200,
     };
@@ -204,7 +201,6 @@ fn test_gossip_node_export_behavior() {
     let json = serde_json::to_string(&gossip_export).expect("Should serialize");
     let deserialized: BucketExport = serde_json::from_str(&json).expect("Should deserialize");
 
-    assert_eq!(deserialized.bucket_id, 0);
     assert_eq!(deserialized.client_data.len(), 0);
     assert_eq!(deserialized.export_timestamp, 1640995200);
 }

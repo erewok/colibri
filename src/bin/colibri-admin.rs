@@ -210,10 +210,7 @@ async fn export_cluster_data(
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let node_count = node_addrs.len();
 
-    info!(
-        node_count = node_count,
-        "Starting data export from nodes"
-    );
+    info!(node_count = node_count, "Starting data export from nodes");
 
     // Create output directory
     std::fs::create_dir_all(output_dir)?;
@@ -224,7 +221,12 @@ async fn export_cluster_data(
             consistent_hashing::jump_consistent_hash(&node.to_string(), node_count as u32);
         let export_url = format!("http://{}/cluster/bucket/{}/export", node, bucketnum);
 
-        match client.get(&export_url).send().await {
+        match client
+            .get(&export_url)
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+        {
             Ok(response) if response.status().is_success() => {
                 let export_data = response.text().await?;
                 let output_file = format!(
@@ -255,10 +257,7 @@ async fn import_cluster_data(
     let node_addrs = parse_topology(nodes)?;
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let node_count = node_addrs.len();
-    info!(
-        node_count = node_count,
-        "Starting data import to nodes"
-    );
+    info!(node_count = node_count, "Starting data import to nodes");
 
     for node in &node_addrs {
         let input_file = format!(
@@ -269,8 +268,8 @@ async fn import_cluster_data(
         let bucketnum =
             consistent_hashing::jump_consistent_hash(&node.to_string(), node_count as u32);
 
-            if let Ok(import_data) = std::fs::read_to_string(&input_file) {
-                let import_url = format!("http://{}/cluster/bucket/{}/import", node, bucketnum);
+        if let Ok(import_data) = std::fs::read_to_string(&input_file) {
+            let import_url = format!("http://{}/cluster/bucket/{}/import", node, bucketnum);
 
             match client
                 .post(&import_url)

@@ -1,19 +1,17 @@
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::error::{ColibriError, Result};
 use crate::limiters::token_bucket::TokenBucket;
 use crate::node::NodeWrapper;
+use crate::{
+    error::{ColibriError, Result},
+    node::hashring::consistent_hashing,
+};
 
 /// Bucket data export format for migration
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BucketExport {
-    pub bucket_id: u32,
     pub client_data: Vec<ClientBucketData>,
     pub export_timestamp: u64,
 }
@@ -76,21 +74,9 @@ pub struct ClusterStatusResponse {
 
 /// Export all rate limiting data for a specific bucket
 #[instrument(skip(state), level = "info")]
-pub async fn export_bucket(
-    Path(bucket_id): Path<u32>,
-    State(state): State<NodeWrapper>,
-) -> Result<Json<BucketExport>> {
+pub async fn export_bucket(State(state): State<NodeWrapper>) -> Result<Json<BucketExport>> {
     let client_data = match &state {
         NodeWrapper::Hashring(node) => {
-            // Check if this node owns the bucket (hashring nodes own exactly one bucket)
-            let owned_bucket = node.get_owned_bucket();
-            if owned_bucket != bucket_id {
-                return Err(ColibriError::Api(format!(
-                    "Node owns bucket {} but was asked to export bucket {}",
-                    owned_bucket, bucket_id
-                )));
-            }
-
             // Export all token buckets from the rate limiter
             let rate_limiter = node.rate_limiter.lock().map_err(|_| {
                 ColibriError::Api("Failed to acquire rate limiter lock".to_string())
@@ -132,7 +118,6 @@ pub async fn export_bucket(
         }
     };
     let export = BucketExport {
-        bucket_id,
         client_data,
         export_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -140,11 +125,7 @@ pub async fn export_bucket(
             .as_secs(),
     };
 
-    tracing::info!(
-        "Exported {} client records from bucket {}",
-        export.client_data.len(),
-        bucket_id
-    );
+    tracing::info!("Exported {} client records", export.client_data.len(),);
 
     Ok(Json(export))
 }
@@ -152,29 +133,11 @@ pub async fn export_bucket(
 /// Import rate limiting data into a specific bucket
 #[instrument(skip(state), level = "info")]
 pub async fn import_bucket(
-    Path(bucket_id): Path<u32>,
     State(state): State<NodeWrapper>,
     Json(import_data): Json<BucketExport>,
 ) -> Result<StatusCode> {
-    // Validate bucket ID matches
-    if import_data.bucket_id != bucket_id {
-        return Err(ColibriError::Api(format!(
-            "Bucket ID mismatch: expected {}, got {}",
-            bucket_id, import_data.bucket_id
-        )));
-    }
-
     match &state {
         NodeWrapper::Hashring(node) => {
-            // Check if this node owns the bucket
-            let owned_bucket = node.get_owned_bucket();
-            if owned_bucket != bucket_id {
-                return Err(ColibriError::Api(format!(
-                    "Node owns bucket {} but was asked to import into bucket {}",
-                    owned_bucket, bucket_id
-                )));
-            }
-
             // Store count before moving the data
             let client_count = import_data.client_data.len();
 
@@ -182,14 +145,22 @@ pub async fn import_bucket(
             let token_buckets: std::collections::HashMap<String, TokenBucket> = import_data
                 .client_data
                 .into_iter()
-                .map(|client_data| {
-                    (
+                .filter_map(|client_data| {
+                    let bucket = consistent_hashing::jump_consistent_hash(
+                        client_data.client_id.as_str(),
+                        node.number_of_buckets,
+                    );
+                    if bucket != node.get_owned_bucket() {
+                        // This client does not belong to this bucket
+                        return None;
+                    }
+                    Some((
                         client_data.client_id,
                         TokenBucket {
                             tokens: client_data.tokens,
                             last_call: client_data.last_call,
                         },
-                    )
+                    ))
                 })
                 .collect();
 
@@ -200,11 +171,7 @@ pub async fn import_bucket(
             rate_limiter.import_buckets(token_buckets);
             drop(rate_limiter);
 
-            tracing::info!(
-                "Successfully imported {} client records into bucket {}",
-                client_count,
-                bucket_id
-            );
+            tracing::info!("Successfully imported {} client records", client_count,);
         }
         NodeWrapper::Single(node) => {
             // Single nodes can import all data, bucket_id is ignored

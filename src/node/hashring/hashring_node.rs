@@ -31,7 +31,7 @@ pub enum ReplicationFactor {
 pub struct HashringNode {
     pub node_id: NodeId,
     bucket: u32,
-    number_of_buckets: u32,
+    pub number_of_buckets: u32,
     listen_api: String,
     // Connection-pooling clients reuse TCP connections to each node
     pub topology: HashMap<u32, (Url, reqwest::Client)>,

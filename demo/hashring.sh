@@ -1,4 +1,4 @@
-#!/bin/bash -eux
+#!/bin/bash -eu
 export RUST_LOG=debug
 export mode="hashring"
 export max_calls=5
@@ -38,7 +38,7 @@ resize_cluster_with_admin() {
     local current="$1"
     local new="$2"
     echo "Performing cluster resize with colibri-admin..."
-    cargo run --bin colibri-admin -- resize --current "$current" --new "$new" --dry-run
+    cargo run --bin colibri-admin -- resize --current "$current" --new "$new"
     if [ $? -ne 0 ]; then
         echo "❌ Cluster resize validation failed!"
         return 1
@@ -89,32 +89,28 @@ sleep 7
 echo -e "All ${mode} nodes started. PIDs: $NODE1_PID, $NODE2_PID, $NODE3_PID \e"
 echo -e "Test with: curl -X POST http://localhost:8001/rl/test-client \n"
 
-# Check initial cluster health
-echo "\n=== INITIAL CLUSTER HEALTH CHECK ==="
-INITIAL_TOPOLOGY="127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003"
-check_cluster_health "$INITIAL_TOPOLOGY"
-
-./demo/cluster-request-tests.sh
-
-# CLUSTER RESIZE OPERATIONS WITH COLIBRI-ADMIN
-echo "\n=== CLUSTER RESIZE OPERATIONS ==="
-
 # Define topologies
-CURRENT_TOPOLOGY="127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003"
+INITIAL_TOPOLOGY="127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003"
 EXPANDED_TOPOLOGY="127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003,127.0.0.1:8004"
 SHRUNK_TOPOLOGY="127.0.0.1:8001,127.0.0.1:8002"
 
-# 1. EXPAND: Add a 4th node (port 8004)
-echo "\n--- EXPANDING CLUSTER: Adding node on port 8004 ---"
+# Check initial cluster health
+echo -e "\n=== INITIAL CLUSTER HEALTH CHECK ==="
+check_cluster_health "$INITIAL_TOPOLOGY"
 
+echo -e "\n=== Test request demo ==="
+./demo/cluster-request-tests.sh
+
+# CLUSTER RESIZE OPERATIONS WITH COLIBRI-ADMIN
+echo -e "\n=== CLUSTER RESIZE OPERATIONS ==="
+
+# 1. EXPAND: Add a 4th node (port 8004)
+echo -e "\n--- EXPANDING CLUSTER: Adding node on port 8004 ---"
 # Validate the expansion
-validate_topology_change "$CURRENT_TOPOLOGY" "$EXPANDED_TOPOLOGY"
+validate_topology_change "$INITIAL_TOPOLOGY" "$EXPANDED_TOPOLOGY"
 if [ $? -ne 0 ]; then
     echo "Skipping expansion due to validation failure"
 else
-    # Use admin tool to prepare resize
-    resize_cluster_with_admin "$CURRENT_TOPOLOGY" "$EXPANDED_TOPOLOGY"
-
     # Start the new node
     echo "Starting node 4 on port 8004..."
     cargo run -- \
@@ -127,6 +123,10 @@ else
         --topology "http://127.0.0.1:8003" \
         --topology "http://127.0.0.1:8004" &
     NODE4_PID=$!
+    sleep 3
+
+    # Use admin tool to resize
+    resize_cluster_with_admin "$INITIAL_TOPOLOGY" "$EXPANDED_TOPOLOGY"
 
     sleep 5
 
@@ -140,14 +140,14 @@ fi
 sleep 3
 
 # 2. SHRINK: Remove a node (port 8003)
-echo "\n--- SHRINKING CLUSTER: Removing node on port 8003 ---"
+echo -e "\n--- SHRINKING CLUSTER: Removing node on port 8003 ---"
 
 # Validate the shrinking (from expanded or original topology)
 if [ ! -z "${NODE4_PID:-}" ]; then
     SOURCE_TOPOLOGY="$EXPANDED_TOPOLOGY"
     echo "Shrinking from 4-node topology"
 else
-    SOURCE_TOPOLOGY="$CURRENT_TOPOLOGY"
+    SOURCE_TOPOLOGY="$INITIAL_TOPOLOGY"
     echo "Shrinking from 3-node topology (expansion was skipped)"
 fi
 
@@ -160,12 +160,16 @@ else
 
     # Export data before stopping nodes (demo - normally you'd coordinate this carefully)
     echo "Exporting cluster data..."
-    mkdir -p ./demo_cluster_exports
-    cargo run --bin colibri-admin -- export-data --nodes "$SOURCE_TOPOLOGY" --output-dir "./demo_cluster_exports" || echo "⚠️  Export failed - continuing anyway"
+    mkdir -p ./cluster_exports
+    cargo run --bin colibri-admin -- export-data --nodes "$SOURCE_TOPOLOGY" --output-dir "./cluster_exports" || echo "⚠️  Export failed - continuing anyway"
 
     # Stop node 3
     echo "Stopping node 3 (port 8003)..."
     kill $NODE3_PID 2>/dev/null || true
+
+    # Stop node 4
+    echo "Stopping node 4 (port 8004)..."
+    kill $NODE4_PID 2>/dev/null || true
 
     sleep 3
 
@@ -180,7 +184,7 @@ sleep 5
 
 
 # Final cluster status
-echo "\n=== FINAL CLUSTER STATUS ==="
+echo -e "\n=== FINAL CLUSTER STATUS ==="
 echo "Remaining active nodes:"
 ps -p $NODE1_PID > /dev/null 2>&1 && echo "  ✅ Node 1 (port 8001): Running (PID $NODE1_PID)"
 ps -p $NODE2_PID > /dev/null 2>&1 && echo "  ✅ Node 2 (port 8002): Running (PID $NODE2_PID)"
@@ -189,10 +193,10 @@ if [ ! -z "${NODE4_PID:-}" ]; then
     ps -p $NODE4_PID > /dev/null 2>&1 && echo "  ✅ Node 4 (port 8004): Running (PID $NODE4_PID)" || echo "  ❌ Node 4 (port 8004): Stopped"
 fi
 
-echo "\nDemo complete! The cluster has been through expansion and contraction cycles."
-echo "Export data is available in: ./demo_cluster_exports/"
-echo "\nPress Ctrl+C to stop all remaining nodes"
+echo -e "\nDemo complete! The cluster has been through expansion and contraction cycles."
+echo "Export data is available in: ./cluster_exports/"
+echo -e "\nPress Ctrl+C to stop all remaining nodes"
 
 # Wait for interrupt and cleanup
-trap "echo '\nStopping all nodes...'; kill $NODE1_PID $NODE2_PID $NODE3_PID ${NODE4_PID:-} 2>/dev/null || true; rm -rf ./demo_cluster_exports; exit 0" INT
+trap "echo '\nStopping all nodes...'; kill $NODE1_PID $NODE2_PID $NODE3_PID ${NODE4_PID:-} 2>/dev/null || true; rm -rf ./cluster_exports; exit 0" INT
 wait

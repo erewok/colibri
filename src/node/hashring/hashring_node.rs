@@ -129,7 +129,8 @@ impl Node for HashringNode {
         let rate_limit_config = settings::RateLimitConfig::new(settings.rate_limit_settings());
 
         // Create cluster member using factory - unified UDP transport for cluster operations
-        let cluster_member = crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+        let cluster_member =
+            crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
 
         Ok(Self {
             node_id,
@@ -897,9 +898,10 @@ impl HashringNode {
         use crate::cluster::{BucketExport, ClientBucketData};
 
         // Export all token buckets from the rate limiter
-        let rate_limiter = self.rate_limiter.lock().map_err(|_| {
-            ColibriError::Api("Failed to acquire rate limiter lock".to_string())
-        })?;
+        let rate_limiter = self
+            .rate_limiter
+            .lock()
+            .map_err(|_| ColibriError::Api("Failed to acquire rate limiter lock".to_string()))?;
         let all_buckets = rate_limiter.export_all_buckets();
         drop(rate_limiter); // Release lock early
 
@@ -931,7 +933,10 @@ impl HashringNode {
         Ok(export)
     }
 
-    pub async fn handle_import_buckets(&self, import_data: crate::cluster::BucketExport) -> Result<()> {
+    pub async fn handle_import_buckets(
+        &self,
+        import_data: crate::cluster::BucketExport,
+    ) -> Result<()> {
         use crate::limiters::token_bucket::TokenBucket;
 
         // Store count before moving the data
@@ -961,9 +966,10 @@ impl HashringNode {
             .collect();
 
         // Import into rate limiter
-        let rate_limiter = self.rate_limiter.lock().map_err(|_| {
-            ColibriError::Api("Failed to acquire rate limiter lock".to_string())
-        })?;
+        let rate_limiter = self
+            .rate_limiter
+            .lock()
+            .map_err(|_| ColibriError::Api("Failed to acquire rate limiter lock".to_string()))?;
         rate_limiter.import_buckets(token_buckets);
         drop(rate_limiter);
 
@@ -972,13 +978,13 @@ impl HashringNode {
     }
 
     pub async fn handle_cluster_health(&self) -> Result<crate::cluster::StatusResponse> {
-        use crate::cluster::{StatusResponse, ClusterStatus};
+        use crate::cluster::{ClusterStatus, StatusResponse};
 
         Ok(StatusResponse {
             node_id: self.node_id.to_string(),
             node_type: "hashring".to_string(),
             status: ClusterStatus::Healthy,
-            active_clients: 0, // TODO: implement client key counting
+            active_clients: 0,          // TODO: implement client key counting
             last_topology_change: None, // TODO: track topology changes
         })
     }
@@ -1004,19 +1010,31 @@ impl HashringNode {
             node_type: "hashring".to_string(),
             owned_bucket: Some(owned_bucket),
             replica_buckets,
-            cluster_nodes: self.topology.keys().map(|bucket_id| {
-                // Convert bucket IDs back to socket addresses (this is a simplification)
-                format!("127.0.0.1:{}", 8080 + bucket_id).parse().unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap())
-            }).collect(),
+            cluster_nodes: self
+                .topology
+                .keys()
+                .map(|bucket_id| {
+                    // Convert bucket IDs back to socket addresses (this is a simplification)
+                    format!("127.0.0.1:{}", 8080 + bucket_id)
+                        .parse()
+                        .unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap())
+                })
+                .collect(),
             peer_nodes,
             errors: None,
         })
     }
 
-    pub async fn handle_new_topology(&self, request: crate::cluster::TopologyChangeRequest) -> Result<crate::cluster::TopologyResponse> {
+    pub async fn handle_new_topology(
+        &self,
+        request: crate::cluster::TopologyChangeRequest,
+    ) -> Result<crate::cluster::TopologyResponse> {
         use crate::cluster::TopologyResponse;
 
-        tracing::info!("Preparing for topology change with {} new nodes", request.new_topology.len());
+        tracing::info!(
+            "Preparing for topology change with {} new nodes",
+            request.new_topology.len()
+        );
 
         // Validate the new topology format
         if request.new_topology.is_empty() {
@@ -1033,7 +1051,11 @@ impl HashringNode {
             owned_bucket: Some(self.get_owned_bucket()),
             replica_buckets: self.get_replica_buckets(),
             cluster_nodes: request.new_topology.clone(),
-            peer_nodes: request.new_topology.iter().map(|addr| addr.to_string()).collect(),
+            peer_nodes: request
+                .new_topology
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect(),
             errors: None,
         })
     }

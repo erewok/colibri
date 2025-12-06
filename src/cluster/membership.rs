@@ -48,7 +48,11 @@ impl ClusterNodes {
     }
 
     fn mark_unresponsive(&mut self, address: SocketAddr) {
-        if let Some(pos) = self.responsive_nodes.iter().position(|&addr| addr == address) {
+        if let Some(pos) = self
+            .responsive_nodes
+            .iter()
+            .position(|&addr| addr == address)
+        {
             let node = self.responsive_nodes.remove(pos);
             if !self.unresponsive_nodes.contains(&node) {
                 self.unresponsive_nodes.push(node);
@@ -57,7 +61,11 @@ impl ClusterNodes {
     }
 
     fn mark_responsive(&mut self, address: SocketAddr) {
-        if let Some(pos) = self.unresponsive_nodes.iter().position(|&addr| addr == address) {
+        if let Some(pos) = self
+            .unresponsive_nodes
+            .iter()
+            .position(|&addr| addr == address)
+        {
             let node = self.unresponsive_nodes.remove(pos);
             if !self.responsive_nodes.contains(&node) {
                 self.responsive_nodes.push(node);
@@ -66,7 +74,8 @@ impl ClusterNodes {
     }
 
     fn add_node(&mut self, address: SocketAddr) {
-        if !self.responsive_nodes.contains(&address) && !self.unresponsive_nodes.contains(&address) {
+        if !self.responsive_nodes.contains(&address) && !self.unresponsive_nodes.contains(&address)
+        {
             self.responsive_nodes.push(address);
         }
     }
@@ -89,11 +98,15 @@ pub struct NoOpClusterMember;
 #[async_trait]
 impl ClusterMember for NoOpClusterMember {
     async fn send_to_node(&self, _target: SocketAddr, _data: &[u8]) -> Result<()> {
-        Err(crate::error::ColibriError::Api("Single nodes don't participate in clusters".to_string()))
+        Err(crate::error::ColibriError::Api(
+            "Single nodes don't participate in clusters".to_string(),
+        ))
     }
 
     async fn send_to_random_node(&self, _data: &[u8]) -> Result<()> {
-        Err(crate::error::ColibriError::Api("Single nodes don't participate in clusters".to_string()))
+        Err(crate::error::ColibriError::Api(
+            "Single nodes don't participate in clusters".to_string(),
+        ))
     }
 
     async fn get_cluster_nodes(&self) -> Vec<SocketAddr> {
@@ -148,14 +161,18 @@ impl ClusterMember for UdpClusterMember {
                 }
             }
         } else {
-            Err(crate::error::ColibriError::Transport("Node is marked as unresponsive".to_string()))
+            Err(crate::error::ColibriError::Transport(
+                "Node is marked as unresponsive".to_string(),
+            ))
         }
     }
 
     async fn send_to_random_node(&self, data: &[u8]) -> Result<()> {
         let nodes = self.nodes.read().await;
         if nodes.responsive_nodes.is_empty() {
-            return Err(crate::error::ColibriError::Transport("No responsive nodes available".to_string()));
+            return Err(crate::error::ColibriError::Transport(
+                "No responsive nodes available".to_string(),
+            ));
         }
 
         match self.transport.send_to_random_peer(data).await {
@@ -185,5 +202,50 @@ impl ClusterMember for UdpClusterMember {
 
     async fn remove_node(&self, address: SocketAddr) {
         self.nodes.write().await.remove_node(address);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_noop_cluster_member() {
+        let noop = NoOpClusterMember;
+
+        // Should start with empty nodes
+        assert_eq!(noop.get_cluster_nodes().await.len(), 0);
+
+        // Adding/removing should be no-ops
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        noop.add_node(addr).await;
+        assert_eq!(noop.get_cluster_nodes().await.len(), 0);
+
+        // Send should fail (single nodes don't participate in clusters)
+        let result = noop.send_to_node(addr, b"test").await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cluster_nodes_internal() {
+        // Test the internal ClusterNodes struct
+        let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        let mut nodes = ClusterNodes::new(vec![addr1, addr2]);
+        assert_eq!(nodes.all_nodes().len(), 2);
+
+        // Test marking unresponsive/responsive
+        nodes.mark_unresponsive(addr1);
+        assert_eq!(nodes.all_nodes().len(), 2); // Still there
+
+        nodes.mark_responsive(addr1);
+        assert_eq!(nodes.all_nodes().len(), 2);
+
+        // Test removal
+        nodes.remove_node(addr1);
+        let remaining = nodes.all_nodes();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.contains(&addr2));
     }
 }

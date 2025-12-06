@@ -27,11 +27,14 @@ impl AdminCommandDispatcher {
         command: AdminCommand,
     ) -> Result<AdminResponse> {
         let config = bincode::config::standard();
-        let serialized = bincode::encode_to_vec(&command, config)
-            .map_err(|e| ColibriError::Serialization(crate::error::SerializationError::BinaryEncode(e)))?;
+        let serialized = bincode::encode_to_vec(&command, config).map_err(|e| {
+            ColibriError::Serialization(crate::error::SerializationError::BinaryEncode(e))
+        })?;
 
         // Send via cluster member (UDP transport)
-        self.cluster_member.send_to_node(target, &serialized).await?;
+        self.cluster_member
+            .send_to_node(target, &serialized)
+            .await?;
 
         // For now, return Ack - in a full implementation we'd wait for response
         // This would require implementing a request/response pattern over UDP
@@ -39,7 +42,10 @@ impl AdminCommandDispatcher {
     }
 
     /// Send command to all responsive cluster nodes
-    pub async fn broadcast_admin_command(&self, command: AdminCommand) -> Result<Vec<AdminResponse>> {
+    pub async fn broadcast_admin_command(
+        &self,
+        command: AdminCommand,
+    ) -> Result<Vec<AdminResponse>> {
         let nodes = self.cluster_member.get_cluster_nodes().await;
         let mut responses = Vec::new();
 
@@ -109,18 +115,22 @@ impl AdminCommandDispatcher {
 
     /// Perform cluster topology change (replaces hashring export/restart/import cycle)
     pub async fn change_cluster_topology(&self, new_topology: Vec<SocketAddr>) -> Result<()> {
-        debug!("Admin: Changing cluster topology to {} nodes", new_topology.len());
+        debug!(
+            "Admin: Changing cluster topology to {} nodes",
+            new_topology.len()
+        );
 
         // Send PrepareTopologyChange to all current nodes
         let command = AdminCommand::PrepareTopologyChange {
-            new_topology: new_topology.clone()
+            new_topology: new_topology.clone(),
         };
         let _responses = self.broadcast_admin_command(command).await?;
 
         // Update our own cluster membership
         let current_nodes = self.cluster_member.get_cluster_nodes().await;
         let new_nodes_set: std::collections::HashSet<_> = new_topology.iter().cloned().collect();
-        let current_nodes_set: std::collections::HashSet<_> = current_nodes.iter().cloned().collect();
+        let current_nodes_set: std::collections::HashSet<_> =
+            current_nodes.iter().cloned().collect();
 
         // Add new nodes
         for addr in new_nodes_set.difference(&current_nodes_set) {
@@ -162,4 +172,53 @@ pub fn serialize_admin_response(response: &AdminResponse) -> Result<Vec<u8>> {
     let config = bincode::config::standard();
     bincode::encode_to_vec(response, config)
         .map_err(|e| ColibriError::Serialization(crate::error::SerializationError::BinaryEncode(e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_admin_command_parsing() {
+        let command = AdminCommand::AddNode {
+            address: "127.0.0.1:8080".parse().unwrap(),
+        };
+
+        let config = bincode::config::standard();
+        let serialized = bincode::encode_to_vec(&command, config).unwrap();
+
+        let parsed = parse_admin_command(&serialized).unwrap();
+        match parsed {
+            AdminCommand::AddNode { address } => {
+                assert_eq!(address.to_string(), "127.0.0.1:8080");
+            }
+            _ => panic!("Wrong command type"),
+        }
+    }
+
+    #[test]
+    fn test_admin_response_serialization() {
+        let response = AdminResponse::Ack;
+        let serialized = serialize_admin_response(&response).unwrap();
+
+        let config = bincode::config::standard();
+        let (deserialized, _): (AdminResponse, _) =
+            bincode::decode_from_slice(&serialized, config).unwrap();
+
+        match deserialized {
+            AdminResponse::Ack => {}
+            _ => panic!("Wrong response type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_dispatcher_creation() {
+        // Test creating dispatcher with NoOp member
+        let no_op = Arc::new(crate::cluster::NoOpClusterMember);
+        let dispatcher = AdminCommandDispatcher::new(no_op);
+
+        // Should be able to get empty topology
+        let topology = dispatcher.get_cluster_topology().await;
+        assert_eq!(topology.len(), 0);
+    }
 }

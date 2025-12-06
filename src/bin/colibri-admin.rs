@@ -25,9 +25,8 @@ use std::net::SocketAddr;
 use tracing::info;
 
 use colibri::cluster::{AdminCommand, AdminCommandDispatcher, ClusterFactory};
-use colibri::node::NodeId;
 use colibri::error::Result;
-
+use colibri::node::NodeId;
 
 #[derive(Parser)]
 #[command(name = "colibri-admin")]
@@ -116,88 +115,91 @@ async fn main() -> Result<()> {
     // Public clients can only access HTTP/REST API, not this internal transport
     match cli.command {
         Commands::AddNode { address, cluster } => {
-            let cluster_member = ClusterFactory::create_from_cli_params(
-                node_id, cli.listen_addr, cluster
-            ).await?;
+            let cluster_member =
+                ClusterFactory::create_from_cli_params(node_id, cli.listen_addr, cluster).await?;
             let admin_dispatcher = AdminCommandDispatcher::new(cluster_member);
 
             admin_dispatcher.add_cluster_node(address).await?;
             info!("Successfully added node {} to cluster", address);
-        },
+        }
         Commands::RemoveNode { address, cluster } => {
-            let cluster_member = ClusterFactory::create_from_cli_params(
-                node_id, cli.listen_addr, cluster
-            ).await?;
+            let cluster_member =
+                ClusterFactory::create_from_cli_params(node_id, cli.listen_addr, cluster).await?;
             let admin_dispatcher = AdminCommandDispatcher::new(cluster_member);
 
             admin_dispatcher.remove_cluster_node(address).await?;
             info!("Successfully removed node {} from cluster", address);
-        },
+        }
         Commands::MarkUnresponsive { address, cluster } => {
-            let cluster_member = ClusterFactory::create_from_cli_params(
-                node_id, cli.listen_addr, cluster
-            ).await?;
+            let cluster_member =
+                ClusterFactory::create_from_cli_params(node_id, cli.listen_addr, cluster).await?;
             let admin_dispatcher = AdminCommandDispatcher::new(cluster_member);
 
             admin_dispatcher.mark_node_unresponsive(address).await?;
             info!("Marked node {} as unresponsive", address);
-        },
+        }
         Commands::MarkResponsive { address, cluster } => {
-            let cluster_member = ClusterFactory::create_from_cli_params(
-                node_id, cli.listen_addr, cluster
-            ).await?;
+            let cluster_member =
+                ClusterFactory::create_from_cli_params(node_id, cli.listen_addr, cluster).await?;
             let admin_dispatcher = AdminCommandDispatcher::new(cluster_member);
 
             admin_dispatcher.mark_node_responsive(address).await?;
             info!("Marked node {} as responsive", address);
-        },
-        Commands::ChangeTopology { new_topology, cluster } => {
-            let cluster_member = ClusterFactory::create_from_cli_params(
-                node_id, cli.listen_addr, cluster
-            ).await?;
+        }
+        Commands::ChangeTopology {
+            new_topology,
+            cluster,
+        } => {
+            let cluster_member =
+                ClusterFactory::create_from_cli_params(node_id, cli.listen_addr, cluster).await?;
             let admin_dispatcher = AdminCommandDispatcher::new(cluster_member);
 
-            admin_dispatcher.change_cluster_topology(new_topology.clone()).await?;
-            info!("Successfully changed cluster topology to {} nodes", new_topology.len());
+            admin_dispatcher
+                .change_cluster_topology(new_topology.clone())
+                .await?;
+            info!(
+                "Successfully changed cluster topology to {} nodes",
+                new_topology.len()
+            );
             for node in new_topology {
                 info!("  - {}", node);
             }
-        },
+        }
         Commands::GetStatus { target } => {
             // Send GetClusterHealth command to target node
-            let cluster_member = ClusterFactory::create_from_cli_params(
-                node_id, cli.listen_addr, vec![target]
-            ).await?;
+            let cluster_member =
+                ClusterFactory::create_from_cli_params(node_id, cli.listen_addr, vec![target])
+                    .await?;
             let admin_dispatcher = AdminCommandDispatcher::new(cluster_member);
 
             let command = AdminCommand::GetClusterHealth;
             let response = admin_dispatcher.send_admin_command(target, command).await?;
 
             info!("Status response from {}: {:?}", target, response);
-        },
+        }
         Commands::GetTopology { target } => {
             // Send GetTopology command to target node
-            let cluster_member = ClusterFactory::create_from_cli_params(
-                node_id, cli.listen_addr, vec![target]
-            ).await?;
+            let cluster_member =
+                ClusterFactory::create_from_cli_params(node_id, cli.listen_addr, vec![target])
+                    .await?;
             let admin_dispatcher = AdminCommandDispatcher::new(cluster_member);
 
             let command = AdminCommand::GetTopology;
             let response = admin_dispatcher.send_admin_command(target, command).await?;
 
             info!("Topology response from {}: {:?}", target, response);
-        },
+        }
         Commands::ExportBuckets { target } => {
-            let cluster_member = ClusterFactory::create_from_cli_params(
-                node_id, cli.listen_addr, vec![target]
-            ).await?;
+            let cluster_member =
+                ClusterFactory::create_from_cli_params(node_id, cli.listen_addr, vec![target])
+                    .await?;
             let admin_dispatcher = AdminCommandDispatcher::new(cluster_member);
 
             let command = AdminCommand::ExportBuckets;
             let response = admin_dispatcher.send_admin_command(target, command).await?;
 
             info!("Export response from {}: {:?}", target, response);
-        },
+        }
     }
 
     Ok(())

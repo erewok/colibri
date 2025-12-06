@@ -133,7 +133,9 @@ impl NodeWrapper {
         rule_name: String,
         settings: settings::RateLimitSettings,
     ) -> Result<()> {
-        self.get_node_ref().create_named_rule(rule_name, settings).await
+        self.get_node_ref()
+            .create_named_rule(rule_name, settings)
+            .await
     }
 
     pub async fn get_named_rule(
@@ -170,15 +172,22 @@ impl NodeWrapper {
     // Cluster-specific methods (only for gossip and hashring nodes)
     pub async fn handle_export_buckets(&self) -> Result<crate::cluster::BucketExport> {
         match self {
-            Self::Single(_) => Err(crate::error::ColibriError::Api("Single nodes don't support bucket export".to_string())),
+            Self::Single(_) => Err(crate::error::ColibriError::Api(
+                "Single nodes don't support bucket export".to_string(),
+            )),
             Self::Gossip(node) => node.handle_export_buckets().await,
             Self::Hashring(node) => node.handle_export_buckets().await,
         }
     }
 
-    pub async fn handle_import_buckets(&self, import_data: crate::cluster::BucketExport) -> Result<()> {
+    pub async fn handle_import_buckets(
+        &self,
+        import_data: crate::cluster::BucketExport,
+    ) -> Result<()> {
         match self {
-            Self::Single(_) => Err(crate::error::ColibriError::Api("Single nodes don't support bucket import".to_string())),
+            Self::Single(_) => Err(crate::error::ColibriError::Api(
+                "Single nodes don't support bucket import".to_string(),
+            )),
             Self::Gossip(node) => node.handle_import_buckets(import_data).await,
             Self::Hashring(node) => node.handle_import_buckets(import_data).await,
         }
@@ -186,7 +195,9 @@ impl NodeWrapper {
 
     pub async fn handle_cluster_health(&self) -> Result<crate::cluster::StatusResponse> {
         match self {
-            Self::Single(_) => Err(crate::error::ColibriError::Api("Single nodes don't provide cluster health".to_string())),
+            Self::Single(_) => Err(crate::error::ColibriError::Api(
+                "Single nodes don't provide cluster health".to_string(),
+            )),
             Self::Gossip(node) => node.handle_cluster_health().await,
             Self::Hashring(node) => node.handle_cluster_health().await,
         }
@@ -194,15 +205,22 @@ impl NodeWrapper {
 
     pub async fn handle_get_topology(&self) -> Result<crate::cluster::TopologyResponse> {
         match self {
-            Self::Single(_) => Err(crate::error::ColibriError::Api("Single nodes don't have topology".to_string())),
+            Self::Single(_) => Err(crate::error::ColibriError::Api(
+                "Single nodes don't have topology".to_string(),
+            )),
             Self::Gossip(node) => node.handle_get_topology().await,
             Self::Hashring(node) => node.handle_get_topology().await,
         }
     }
 
-    pub async fn handle_new_topology(&self, request: crate::cluster::TopologyChangeRequest) -> Result<crate::cluster::TopologyResponse> {
+    pub async fn handle_new_topology(
+        &self,
+        request: crate::cluster::TopologyChangeRequest,
+    ) -> Result<crate::cluster::TopologyResponse> {
         match self {
-            Self::Single(_) => Err(crate::error::ColibriError::Api("Single nodes don't support topology changes".to_string())),
+            Self::Single(_) => Err(crate::error::ColibriError::Api(
+                "Single nodes don't support topology changes".to_string(),
+            )),
             Self::Gossip(node) => node.handle_new_topology(request).await,
             Self::Hashring(node) => node.handle_new_topology(request).await,
         }

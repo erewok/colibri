@@ -130,7 +130,8 @@ impl Node for GossipNode {
         let gossip_command_tx = Arc::new(gossip_command_tx);
 
         // Create cluster member using factory - clean path from config to cluster membership
-        let cluster_member = crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+        let cluster_member =
+            crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
 
         // Start the GossipCommand controller loop
         let controller = GossipController::new(settings.clone()).await?;
@@ -356,7 +357,10 @@ impl GossipNode {
         Ok(export)
     }
 
-    pub async fn handle_import_buckets(&self, _import_data: crate::cluster::BucketExport) -> Result<()> {
+    pub async fn handle_import_buckets(
+        &self,
+        _import_data: crate::cluster::BucketExport,
+    ) -> Result<()> {
         // Gossip nodes don't use bucket-based data import
         // Data synchronization happens through gossip protocol
         tracing::info!("Gossip node data import skipped - using gossip synchronization");
@@ -364,13 +368,13 @@ impl GossipNode {
     }
 
     pub async fn handle_cluster_health(&self) -> Result<crate::cluster::StatusResponse> {
-        use crate::cluster::{StatusResponse, ClusterStatus};
+        use crate::cluster::{ClusterStatus, StatusResponse};
 
         Ok(StatusResponse {
             node_id: self.node_id.to_string(),
             node_type: "gossip".to_string(),
             status: ClusterStatus::Healthy,
-            active_clients: 0, // TODO: implement client key counting
+            active_clients: 0,          // TODO: implement client key counting
             last_topology_change: None, // TODO: track topology changes
         })
     }
@@ -392,16 +396,24 @@ impl GossipNode {
         })
     }
 
-    pub async fn handle_new_topology(&self, request: crate::cluster::TopologyChangeRequest) -> Result<crate::cluster::TopologyResponse> {
+    pub async fn handle_new_topology(
+        &self,
+        request: crate::cluster::TopologyChangeRequest,
+    ) -> Result<crate::cluster::TopologyResponse> {
         use crate::cluster::TopologyResponse;
 
-        tracing::info!("Gossip node topology change acknowledged with {} new nodes", request.new_topology.len());
+        tracing::info!(
+            "Gossip node topology change acknowledged with {} new nodes",
+            request.new_topology.len()
+        );
 
         // Update cluster membership with new topology
         // First get current nodes, then compute differences
         let current_nodes = self.cluster_member.get_cluster_nodes().await;
-        let new_nodes: std::collections::HashSet<_> = request.new_topology.iter().cloned().collect();
-        let current_nodes_set: std::collections::HashSet<_> = current_nodes.iter().cloned().collect();
+        let new_nodes: std::collections::HashSet<_> =
+            request.new_topology.iter().cloned().collect();
+        let current_nodes_set: std::collections::HashSet<_> =
+            current_nodes.iter().cloned().collect();
 
         // Add new nodes
         for addr in new_nodes.difference(&current_nodes_set) {
@@ -415,7 +427,10 @@ impl GossipNode {
 
         // Return updated topology
         let updated_cluster_nodes = self.cluster_member.get_cluster_nodes().await;
-        let peer_nodes: Vec<String> = updated_cluster_nodes.iter().map(|addr| addr.to_string()).collect();
+        let peer_nodes: Vec<String> = updated_cluster_nodes
+            .iter()
+            .map(|addr| addr.to_string())
+            .collect();
 
         Ok(TopologyResponse {
             node_id: self.node_id.to_string(),

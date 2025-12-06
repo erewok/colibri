@@ -17,7 +17,7 @@ use crate::node::NodeId;
 use crate::settings;
 pub use common::SocketPoolStats;
 pub use receiver::{ReceiverStats, UdpReceiver};
-pub use socket_pool_udp::{UdpSocketPool};
+pub use socket_pool_udp::UdpSocketPool;
 
 #[derive(Clone, Debug)]
 pub struct UdpTransport {

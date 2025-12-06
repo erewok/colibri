@@ -62,10 +62,6 @@ pub async fn api(rl_node: node::NodeWrapper) -> Result<Router> {
             paths::custom::LIMIT,
             routing::post(rate_limits::rate_limit_custom),
         )
-        // NOTE: Cluster management endpoints moved to admin-only access
-        // Use AdminCommandDispatcher with internal UDP transport instead
-        // See examples/colibri_admin_cli.rs for admin operations
-        // Middleware
         .layer(
             ServiceBuilder::new()
                 // Handle errors from middleware

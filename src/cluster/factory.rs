@@ -20,7 +20,7 @@ impl ClusterFactory {
     /// 2. Non-empty topology → UdpClusterMember (gossip + hashring both use UDP)
     pub async fn create_from_settings(
         node_id: NodeId,
-        settings: &Settings
+        settings: &Settings,
     ) -> Result<Arc<dyn ClusterMember>> {
         if settings.topology.is_empty() {
             // Single node - no cluster operations
@@ -31,17 +31,23 @@ impl ClusterFactory {
             let udp_transport = Arc::new(UdpTransport::new(node_id, &transport_config).await?);
 
             // Convert topology strings to SocketAddr
-            let cluster_nodes: Vec<SocketAddr> = settings.topology
+            let cluster_nodes: Vec<SocketAddr> = settings
+                .topology
                 .iter()
                 .filter_map(|addr_str| addr_str.parse().ok())
                 .collect();
 
             if cluster_nodes.is_empty() {
                 // Invalid topology addresses - treat as single node
-                tracing::warn!("Invalid cluster topology addresses, falling back to single node mode");
+                tracing::warn!(
+                    "Invalid cluster topology addresses, falling back to single node mode"
+                );
                 Ok(Arc::new(NoOpClusterMember))
             } else {
-                Ok(Arc::new(UdpClusterMember::new(udp_transport, cluster_nodes)))
+                Ok(Arc::new(UdpClusterMember::new(
+                    udp_transport,
+                    cluster_nodes,
+                )))
             }
         }
     }
@@ -62,7 +68,10 @@ impl ClusterFactory {
             };
 
             let udp_transport = Arc::new(UdpTransport::new(node_id, &transport_config).await?);
-            Ok(Arc::new(UdpClusterMember::new(udp_transport, cluster_nodes)))
+            Ok(Arc::new(UdpClusterMember::new(
+                udp_transport,
+                cluster_nodes,
+            )))
         }
     }
 
@@ -168,11 +177,10 @@ mod tests {
             "127.0.0.1:9002".parse().unwrap(),
         ];
 
-        let cluster_member = ClusterFactory::create_from_cli_params(
-            node_id,
-            listen_addr,
-            cluster_nodes.clone()
-        ).await.unwrap();
+        let cluster_member =
+            ClusterFactory::create_from_cli_params(node_id, listen_addr, cluster_nodes.clone())
+                .await
+                .unwrap();
 
         let nodes = cluster_member.get_cluster_nodes().await;
         assert_eq!(nodes.len(), 2);

@@ -13,9 +13,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::error;
 
+use super::common::SocketPoolStats;
 use crate::error::{ColibriError, Result};
 use crate::node::NodeId;
-use super::common::SocketPoolStats;
 
 /// Pool of UDP sockets for efficient peer communication
 #[derive(Clone, Debug)]

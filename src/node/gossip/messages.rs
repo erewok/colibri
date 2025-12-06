@@ -168,6 +168,18 @@ pub enum GossipCommand {
         key: String,
         resp_chan: oneshot::Sender<crate::error::Result<CheckCallsResponse>>,
     },
+    // Cluster management commands
+    GetClusterNodes {
+        resp_chan: oneshot::Sender<crate::error::Result<Vec<SocketAddr>>>,
+    },
+    AddClusterNode {
+        address: SocketAddr,
+        resp_chan: oneshot::Sender<crate::error::Result<()>>,
+    },
+    RemoveClusterNode {
+        address: SocketAddr,
+        resp_chan: oneshot::Sender<crate::error::Result<()>>,
+    },
 }
 
 impl GossipCommand {

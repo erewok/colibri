@@ -92,8 +92,7 @@ impl NodeWrapper {
                     let hashring_node = HashringNode::new(node_id, settings).await?;
                     let hashring_arc = Arc::new(hashring_node);
 
-                    // Start background replication sync
-                    hashring_arc.clone().start_replication_sync();
+                    // Background replication sync is now handled by the controller
 
                     Ok(Self::Hashring(hashring_arc))
                 }

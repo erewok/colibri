@@ -19,9 +19,6 @@ pub mod custom {
     pub const CHECK: &str = "/rl-check/{rule_name}/{key}";
 }
 
-// NOTE: Cluster endpoints moved to admin-only access via UDP transport
-// See examples/colibri_admin_cli.rs for cluster administration commands
-
 pub fn drop_leading_slash(path: &str) -> &str {
     if let Some(stripped) = path.strip_prefix('/') {
         stripped

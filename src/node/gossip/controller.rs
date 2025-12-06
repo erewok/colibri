@@ -35,6 +35,8 @@ pub struct GossipController {
     /// Gossip configuration
     pub gossip_interval_ms: u64,
     pub gossip_fanout: usize,
+    /// Cluster membership management - handles UDP transport
+    pub cluster_member: Arc<dyn crate::cluster::ClusterMember>,
 }
 
 impl std::fmt::Debug for GossipController {
@@ -81,6 +83,10 @@ impl GossipController {
             None
         };
 
+        // Create cluster member using factory - unified UDP transport for cluster operations
+        let cluster_member =
+            crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+
         Ok(Self {
             node_id,
             rate_limit_settings: rl_settings,
@@ -94,6 +100,7 @@ impl GossipController {
             response_addr,
             gossip_interval_ms: settings.gossip_interval_ms,
             gossip_fanout: settings.gossip_fanout,
+            cluster_member,
         })
     }
 
@@ -388,6 +395,33 @@ impl GossipController {
                         "[{}] Failed sending check_limit_custom response",
                         self.node_id
                     );
+                }
+                Ok(())
+            }
+
+            // Cluster management commands - delegate to cluster_member
+            GossipCommand::GetClusterNodes { resp_chan } => {
+                let result = Ok(self.cluster_member.get_cluster_nodes().await);
+                if resp_chan.send(result).is_err() {
+                    error!("[{}] Failed sending get_cluster_nodes response", self.node_id);
+                }
+                Ok(())
+            }
+
+            GossipCommand::AddClusterNode { address, resp_chan } => {
+                self.cluster_member.add_node(address).await;
+                let result = Ok(());
+                if resp_chan.send(result).is_err() {
+                    error!("[{}] Failed sending add_cluster_node response", self.node_id);
+                }
+                Ok(())
+            }
+
+            GossipCommand::RemoveClusterNode { address, resp_chan } => {
+                self.cluster_member.remove_node(address).await;
+                let result = Ok(());
+                if resp_chan.send(result).is_err() {
+                    error!("[{}] Failed sending remove_cluster_node response", self.node_id);
                 }
                 Ok(())
             }

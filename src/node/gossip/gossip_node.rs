@@ -25,8 +25,7 @@ pub struct GossipNode {
     /// Receiver handler
     pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 
-    /// Cluster membership management - uses same UDP transport as gossip controller
-    pub cluster_member: Arc<dyn crate::cluster::ClusterMember>,
+
 }
 
 impl GossipNode {
@@ -129,9 +128,7 @@ impl Node for GossipNode {
 
         let gossip_command_tx = Arc::new(gossip_command_tx);
 
-        // Create cluster member using factory - clean path from config to cluster membership
-        let cluster_member =
-            crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+
 
         // Start the GossipCommand controller loop
         let controller = GossipController::new(settings.clone()).await?;
@@ -153,7 +150,7 @@ impl Node for GossipNode {
             gossip_command_tx,
             controller_handle: Arc::new(Mutex::new(Some(controller_handle))),
             receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
-            cluster_member,
+
         })
     }
 
@@ -382,7 +379,20 @@ impl GossipNode {
     pub async fn handle_get_topology(&self) -> Result<crate::cluster::TopologyResponse> {
         use crate::cluster::TopologyResponse;
 
-        let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        // Get cluster nodes via command to controller
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.gossip_command_tx
+            .send(crate::node::gossip::GossipCommand::GetClusterNodes { resp_chan: tx })
+            .await
+            .map_err(|e| ColibriError::Transport(format!("Failed sending get_cluster_nodes command {}", e)))?;
+
+        let cluster_nodes = rx.await.unwrap_or_else(|e| {
+            Err(ColibriError::Transport(format!(
+                "Failed receiving get_cluster_nodes response {}",
+                e
+            )))
+        })?;
+
         let peer_nodes: Vec<String> = cluster_nodes.iter().map(|addr| addr.to_string()).collect();
 
         Ok(TopologyResponse {
@@ -409,7 +419,18 @@ impl GossipNode {
 
         // Update cluster membership with new topology
         // First get current nodes, then compute differences
-        let current_nodes = self.cluster_member.get_cluster_nodes().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.gossip_command_tx
+            .send(crate::node::gossip::GossipCommand::GetClusterNodes { resp_chan: tx })
+            .await
+            .map_err(|e| ColibriError::Transport(format!("Failed getting current cluster nodes {}", e)))?;
+        let current_nodes = rx.await.unwrap_or_else(|e| {
+            Err(ColibriError::Transport(format!(
+                "Failed receiving current cluster nodes {}",
+                e
+            )))
+        })?;
+
         let new_nodes: std::collections::HashSet<_> =
             request.new_topology.iter().cloned().collect();
         let current_nodes_set: std::collections::HashSet<_> =
@@ -417,16 +438,42 @@ impl GossipNode {
 
         // Add new nodes
         for addr in new_nodes.difference(&current_nodes_set) {
-            self.cluster_member.add_node(*addr).await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.gossip_command_tx
+                .send(crate::node::gossip::GossipCommand::AddClusterNode {
+                    address: *addr,
+                    resp_chan: tx
+                })
+                .await
+                .map_err(|e| ColibriError::Transport(format!("Failed adding node {}", e)))?;
+            let _ = rx.await; // Ignore response
         }
 
         // Remove nodes that are no longer in topology
         for addr in current_nodes_set.difference(&new_nodes) {
-            self.cluster_member.remove_node(*addr).await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.gossip_command_tx
+                .send(crate::node::gossip::GossipCommand::RemoveClusterNode {
+                    address: *addr,
+                    resp_chan: tx
+                })
+                .await
+                .map_err(|e| ColibriError::Transport(format!("Failed removing node {}", e)))?;
+            let _ = rx.await; // Ignore response
         }
 
         // Return updated topology
-        let updated_cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.gossip_command_tx
+            .send(crate::node::gossip::GossipCommand::GetClusterNodes { resp_chan: tx })
+            .await
+            .map_err(|e| ColibriError::Transport(format!("Failed getting updated cluster nodes {}", e)))?;
+        let updated_cluster_nodes = rx.await.unwrap_or_else(|e| {
+            Err(ColibriError::Transport(format!(
+                "Failed receiving updated cluster nodes {}",
+                e
+            )))
+        })?;
         let peer_nodes: Vec<String> = updated_cluster_nodes
             .iter()
             .map(|addr| addr.to_string())

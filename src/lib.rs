@@ -1,5 +1,6 @@
 pub mod api;
 pub mod cli;
+pub mod cluster;
 pub mod error;
 pub mod limiters;
 pub mod node;

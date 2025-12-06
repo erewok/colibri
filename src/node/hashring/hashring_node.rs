@@ -27,7 +27,7 @@ pub enum ReplicationFactor {
 }
 
 /// Consistent hash ring distributed rate limiter node
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HashringNode {
     pub node_id: NodeId,
     bucket: u32,
@@ -44,6 +44,8 @@ pub struct HashringNode {
     pub rate_limit_config: Arc<RwLock<settings::RateLimitConfig>>,
     pub named_rate_limiters:
         Arc<RwLock<HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>>>>,
+    /// Cluster membership management - uses UDP transport instead of HTTP
+    pub cluster_member: Arc<dyn crate::cluster::ClusterMember>,
 }
 
 #[async_trait]
@@ -126,6 +128,9 @@ impl Node for HashringNode {
         );
         let rate_limit_config = settings::RateLimitConfig::new(settings.rate_limit_settings());
 
+        // Create cluster member using factory - unified UDP transport for cluster operations
+        let cluster_member = crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+
         Ok(Self {
             node_id,
             bucket,
@@ -139,6 +144,7 @@ impl Node for HashringNode {
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(RwLock::new(rate_limit_config)),
             named_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
+            cluster_member,
         })
     }
 
@@ -427,6 +433,20 @@ impl Node for HashringNode {
     }
 }
 
+impl std::fmt::Debug for HashringNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HashringNode")
+            .field("node_id", &self.node_id)
+            .field("bucket", &self.bucket)
+            .field("number_of_buckets", &self.number_of_buckets)
+            .field("listen_api", &self.listen_api)
+            .field("topology_size", &self.topology.len())
+            .field("replication_factor", &self.replication_factor)
+            .field("replica_buckets", &self.replica_buckets)
+            .finish()
+    }
+}
+
 impl Drop for HashringNode {
     fn drop(&mut self) {
         // Clean up the replication task when the node is dropped
@@ -549,14 +569,15 @@ impl HashringNode {
         // Find the primary owner of this bucket
         match self.topology.get(&bucket) {
             Some((host, client)) if !self.topology_address_is_self(host) => {
-                // Use the cluster API to export bucket data from the primary node
-                let export_url = format!("{}{}", host, paths::cluster::export_bucket_path(bucket));
+                // TODO: Replace with AdminCommandDispatcher using UDP transport
+                // Old HTTP-based sync is deprecated - use cluster member for UDP-based sync
+                let export_url = format!("{}/cluster/export", host);
                 debug!("Syncing bucket {} from primary at {}", bucket, export_url);
 
                 match client.get(&export_url).send().await {
                     Ok(response) => {
                         if response.status().is_success() {
-                            match response.json::<crate::api::cluster::BucketExport>().await {
+                            match response.json::<crate::cluster::BucketExport>().await {
                                 Ok(export_data) => {
                                     // Store count before moving the data
                                     let client_count = export_data.client_data.len();
@@ -578,8 +599,8 @@ impl HashringNode {
                                             (
                                                 client_data.client_id,
                                                 crate::limiters::token_bucket::TokenBucket {
-                                                    tokens: client_data.tokens,
-                                                    last_call: client_data.last_call,
+                                                    tokens: client_data.remaining_tokens as f64,
+                                                    last_call: client_data.last_refill as i64,
                                                 },
                                             )
                                         })
@@ -868,6 +889,153 @@ impl HashringNode {
 
         // Check limit without consuming tokens
         local_check_limit(key, rate_limiter).await
+    }
+
+    // Cluster-specific methods for API delegation
+
+    pub async fn handle_export_buckets(&self) -> Result<crate::cluster::BucketExport> {
+        use crate::cluster::{BucketExport, ClientBucketData};
+
+        // Export all token buckets from the rate limiter
+        let rate_limiter = self.rate_limiter.lock().map_err(|_| {
+            ColibriError::Api("Failed to acquire rate limiter lock".to_string())
+        })?;
+        let all_buckets = rate_limiter.export_all_buckets();
+        drop(rate_limiter); // Release lock early
+
+        // Convert to our export format
+        let client_data: Vec<ClientBucketData> = all_buckets
+            .into_iter()
+            .map(|(client_id, token_bucket)| ClientBucketData {
+                client_id,
+                remaining_tokens: token_bucket.tokens as i64,
+                last_refill: token_bucket.last_call as u64,
+                bucket_id: Some(self.bucket),
+            })
+            .collect();
+
+        let export = BucketExport {
+            client_data: client_data.clone(),
+            metadata: crate::cluster::ExportMetadata {
+                node_id: self.node_id.to_string(),
+                export_timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                node_type: "hashring".to_string(),
+                bucket_count: client_data.len(),
+            },
+        };
+
+        tracing::info!("Exported {} client records", export.client_data.len());
+        Ok(export)
+    }
+
+    pub async fn handle_import_buckets(&self, import_data: crate::cluster::BucketExport) -> Result<()> {
+        use crate::limiters::token_bucket::TokenBucket;
+
+        // Store count before moving the data
+        let client_count = import_data.client_data.len();
+
+        // Convert import data to TokenBucket format, filtering by bucket ownership
+        let token_buckets: std::collections::HashMap<String, TokenBucket> = import_data
+            .client_data
+            .into_iter()
+            .filter_map(|client_data| {
+                let bucket = consistent_hashing::jump_consistent_hash(
+                    client_data.client_id.as_str(),
+                    self.number_of_buckets,
+                );
+                if bucket != self.get_owned_bucket() {
+                    // This client does not belong to this bucket
+                    return None;
+                }
+                Some((
+                    client_data.client_id,
+                    TokenBucket {
+                        tokens: client_data.remaining_tokens as f64,
+                        last_call: client_data.last_refill as i64,
+                    },
+                ))
+            })
+            .collect();
+
+        // Import into rate limiter
+        let rate_limiter = self.rate_limiter.lock().map_err(|_| {
+            ColibriError::Api("Failed to acquire rate limiter lock".to_string())
+        })?;
+        rate_limiter.import_buckets(token_buckets);
+        drop(rate_limiter);
+
+        tracing::info!("Successfully imported {} client records", client_count);
+        Ok(())
+    }
+
+    pub async fn handle_cluster_health(&self) -> Result<crate::cluster::StatusResponse> {
+        use crate::cluster::{StatusResponse, ClusterStatus};
+
+        Ok(StatusResponse {
+            node_id: self.node_id.to_string(),
+            node_type: "hashring".to_string(),
+            status: ClusterStatus::Healthy,
+            active_clients: 0, // TODO: implement client key counting
+            last_topology_change: None, // TODO: track topology changes
+        })
+    }
+
+    pub async fn handle_get_topology(&self) -> Result<crate::cluster::TopologyResponse> {
+        use crate::cluster::TopologyResponse;
+
+        let owned_bucket = self.get_owned_bucket();
+        let replica_buckets = self.get_replica_buckets();
+        let peer_nodes: Vec<String> = self
+            .topology
+            .keys()
+            .map(|bucket_id| {
+                self.topology
+                    .get(bucket_id)
+                    .map(|(url, _)| url.to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        Ok(TopologyResponse {
+            node_id: self.node_id.to_string(),
+            node_type: "hashring".to_string(),
+            owned_bucket: Some(owned_bucket),
+            replica_buckets,
+            cluster_nodes: self.topology.keys().map(|bucket_id| {
+                // Convert bucket IDs back to socket addresses (this is a simplification)
+                format!("127.0.0.1:{}", 8080 + bucket_id).parse().unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap())
+            }).collect(),
+            peer_nodes,
+            errors: None,
+        })
+    }
+
+    pub async fn handle_new_topology(&self, request: crate::cluster::TopologyChangeRequest) -> Result<crate::cluster::TopologyResponse> {
+        use crate::cluster::TopologyResponse;
+
+        tracing::info!("Preparing for topology change with {} new nodes", request.new_topology.len());
+
+        // Validate the new topology format
+        if request.new_topology.is_empty() {
+            return Err(ColibriError::Api(
+                "New topology cannot be empty for cluster participants".to_string(),
+            ));
+        }
+
+        // Basic readiness check - node is ready if it's currently healthy
+        // TODO: implement proper topology change preparation
+        Ok(TopologyResponse {
+            node_id: self.node_id.to_string(),
+            node_type: "hashring".to_string(),
+            owned_bucket: Some(self.get_owned_bucket()),
+            replica_buckets: self.get_replica_buckets(),
+            cluster_nodes: request.new_topology.clone(),
+            peer_nodes: request.new_topology.iter().map(|addr| addr.to_string()).collect(),
+            errors: None,
+        })
     }
 }
 

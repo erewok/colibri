@@ -1,3 +1,4 @@
+use rand::Rng;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
@@ -20,6 +21,11 @@ impl NodeId {
 
     pub fn value(&self) -> u32 {
         self.0
+    }
+
+    pub fn generate_random() -> Self {
+        let mut rng = rand::rng();
+        NodeId(rng.random())
     }
 }
 

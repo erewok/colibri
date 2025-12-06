@@ -24,6 +24,9 @@ pub struct GossipNode {
 
     /// Receiver handler
     pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+
+    /// Cluster membership management - uses same UDP transport as gossip controller
+    pub cluster_member: Arc<dyn crate::cluster::ClusterMember>,
 }
 
 impl GossipNode {
@@ -126,6 +129,9 @@ impl Node for GossipNode {
 
         let gossip_command_tx = Arc::new(gossip_command_tx);
 
+        // Create cluster member using factory - clean path from config to cluster membership
+        let cluster_member = crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+
         // Start the GossipCommand controller loop
         let controller = GossipController::new(settings.clone()).await?;
         let controller_handle = tokio::spawn(async move {
@@ -146,6 +152,7 @@ impl Node for GossipNode {
             gossip_command_tx,
             controller_handle: Arc::new(Mutex::new(Some(controller_handle))),
             receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
+            cluster_member,
         })
     }
 
@@ -321,6 +328,103 @@ impl Node for GossipNode {
                 "Failed receiving check_limit_custom response {}",
                 e
             )))
+        })
+    }
+}
+
+// Cluster-specific methods for GossipNode
+impl GossipNode {
+    pub async fn handle_export_buckets(&self) -> Result<crate::cluster::BucketExport> {
+        use crate::cluster::BucketExport;
+
+        // Gossip nodes don't use bucket-based data export
+        // All data is replicated across gossip network
+        let export = BucketExport {
+            client_data: Vec::new(),
+            metadata: crate::cluster::ExportMetadata {
+                node_id: self.node_id.to_string(),
+                export_timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                node_type: "gossip".to_string(),
+                bucket_count: 0,
+            },
+        };
+
+        tracing::info!("Gossip node export skipped - using gossip synchronization");
+        Ok(export)
+    }
+
+    pub async fn handle_import_buckets(&self, _import_data: crate::cluster::BucketExport) -> Result<()> {
+        // Gossip nodes don't use bucket-based data import
+        // Data synchronization happens through gossip protocol
+        tracing::info!("Gossip node data import skipped - using gossip synchronization");
+        Ok(())
+    }
+
+    pub async fn handle_cluster_health(&self) -> Result<crate::cluster::StatusResponse> {
+        use crate::cluster::{StatusResponse, ClusterStatus};
+
+        Ok(StatusResponse {
+            node_id: self.node_id.to_string(),
+            node_type: "gossip".to_string(),
+            status: ClusterStatus::Healthy,
+            active_clients: 0, // TODO: implement client key counting
+            last_topology_change: None, // TODO: track topology changes
+        })
+    }
+
+    pub async fn handle_get_topology(&self) -> Result<crate::cluster::TopologyResponse> {
+        use crate::cluster::TopologyResponse;
+
+        let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        let peer_nodes: Vec<String> = cluster_nodes.iter().map(|addr| addr.to_string()).collect();
+
+        Ok(TopologyResponse {
+            node_id: self.node_id.to_string(),
+            node_type: "gossip".to_string(),
+            owned_bucket: None,
+            replica_buckets: vec![],
+            cluster_nodes,
+            peer_nodes,
+            errors: None,
+        })
+    }
+
+    pub async fn handle_new_topology(&self, request: crate::cluster::TopologyChangeRequest) -> Result<crate::cluster::TopologyResponse> {
+        use crate::cluster::TopologyResponse;
+
+        tracing::info!("Gossip node topology change acknowledged with {} new nodes", request.new_topology.len());
+
+        // Update cluster membership with new topology
+        // First get current nodes, then compute differences
+        let current_nodes = self.cluster_member.get_cluster_nodes().await;
+        let new_nodes: std::collections::HashSet<_> = request.new_topology.iter().cloned().collect();
+        let current_nodes_set: std::collections::HashSet<_> = current_nodes.iter().cloned().collect();
+
+        // Add new nodes
+        for addr in new_nodes.difference(&current_nodes_set) {
+            self.cluster_member.add_node(*addr).await;
+        }
+
+        // Remove nodes that are no longer in topology
+        for addr in current_nodes_set.difference(&new_nodes) {
+            self.cluster_member.remove_node(*addr).await;
+        }
+
+        // Return updated topology
+        let updated_cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        let peer_nodes: Vec<String> = updated_cluster_nodes.iter().map(|addr| addr.to_string()).collect();
+
+        Ok(TopologyResponse {
+            node_id: self.node_id.to_string(),
+            node_type: "gossip".to_string(),
+            owned_bucket: None,
+            replica_buckets: vec![],
+            cluster_nodes: updated_cluster_nodes,
+            peer_nodes,
+            errors: None,
         })
     }
 }

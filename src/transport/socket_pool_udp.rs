@@ -15,6 +15,7 @@ use tracing::error;
 
 use crate::error::{ColibriError, Result};
 use crate::node::NodeId;
+use super::common::SocketPoolStats;
 
 /// Pool of UDP sockets for efficient peer communication
 #[derive(Clone, Debug)]
@@ -25,15 +26,6 @@ pub struct UdpSocketPool {
     node_id: NodeId,
     // for statistics and monitoring
     stats: Arc<SocketPoolStats>,
-}
-
-/// Statistics for the socket pool
-#[derive(Debug, Default)]
-pub struct SocketPoolStats {
-    pub peer_count: AtomicUsize,
-    pub total_sockets: AtomicUsize,
-    pub messages_sent: AtomicU64,
-    pub send_errors: AtomicU64,
 }
 
 impl UdpSocketPool {

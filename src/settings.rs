@@ -28,6 +28,9 @@ pub struct NamedRateLimitRule {
     pub settings: RateLimitSettings,
 }
 
+/// Alias for consistency with cluster protocol
+pub type NamedRule = NamedRateLimitRule;
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct RateLimitConfig {
     pub default_settings: RateLimitSettings,
@@ -36,9 +39,18 @@ pub struct RateLimitConfig {
 
 #[derive(Clone, Debug)]
 pub struct TransportConfig {
-    pub listen_tcp: SocketAddr,
     pub listen_udp: SocketAddr,
     pub topology: HashSet<SocketAddr>,
+}
+
+/// Unified cluster configuration for the new architecture
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    pub node_id: Option<NodeId>,
+    pub listen_address: String,
+    pub bootstrap_nodes: Vec<String>,
+    pub failure_timeout_seconds: Option<u64>,
+    pub health_check_interval_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -169,11 +181,6 @@ impl Settings {
     }
 
     pub fn transport_config(&self) -> TransportConfig {
-        let listen_tcp = format!("{}:{}", self.listen_address, self.listen_port_tcp)
-            .to_socket_addrs()
-            .unwrap()
-            .next()
-            .unwrap();
         let listen_udp = format!("{}:{}", self.listen_address, self.listen_port_udp)
             .to_socket_addrs()
             .unwrap()
@@ -186,7 +193,6 @@ impl Settings {
             .flatten()
             .collect();
         TransportConfig {
-            listen_tcp,
             listen_udp,
             topology,
         }

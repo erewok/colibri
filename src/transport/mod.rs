@@ -3,9 +3,9 @@
 //! Provides a pool of UDP unicast sockets for distributed communication.
 //! Supports both request-response patterns (for consistent hashing) and
 //! fire-and-forget patterns (for gossip protocols).
-
+pub mod common;
 pub mod receiver;
-pub mod socket_pool;
+pub mod socket_pool_udp;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,8 +15,9 @@ use tokio::sync::RwLock;
 use crate::error::Result;
 use crate::node::NodeId;
 use crate::settings;
+pub use common::SocketPoolStats;
 pub use receiver::{ReceiverStats, UdpReceiver};
-pub use socket_pool::{SocketPoolStats, UdpSocketPool};
+pub use socket_pool_udp::{UdpSocketPool};
 
 #[derive(Clone, Debug)]
 pub struct UdpTransport {
@@ -104,7 +105,6 @@ mod tests {
         cluster_urls.insert("127.0.0.1:8002".parse().unwrap());
 
         settings::TransportConfig {
-            listen_tcp: "127.0.0.1:0".parse().unwrap(),
             listen_udp: "127.0.0.1:0".parse().unwrap(),
             topology: cluster_urls,
         }

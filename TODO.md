@@ -4,6 +4,7 @@
 - [x] Add tests
 - [x] Make it possible to setup a rate-limiter key that diverges from settings
 - [x] Consistent hashing should offer replication
+- [ ] Make it possible to resize a cluster (gossip or hashring)
 - [ ] Add docs
 - [ ] Add deployment infra: config-file and kubernetes resource definitions
 - [ ] Snapshot node state to persistent storage and reload on crash

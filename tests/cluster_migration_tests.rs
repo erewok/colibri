@@ -1,5 +1,5 @@
 use colibri::{
-    api::cluster::{BucketExport, ClientBucketData},
+    cluster::{BucketExport, ClientBucketData, ExportMetadata},
     limiters::token_bucket::{TokenBucket, TokenBucketLimiter},
     node::NodeId,
     settings::RateLimitSettings,
@@ -58,10 +58,16 @@ fn test_bucket_export_serialization() {
     let export = BucketExport {
         client_data: vec![ClientBucketData {
             client_id: "test-client".to_string(),
-            tokens: 95.5,
-            last_call: 1234567890,
+            remaining_tokens: 95,
+            last_refill: 1234567890,
+            bucket_id: Some(0),
         }],
-        export_timestamp: 1234567890,
+        metadata: ExportMetadata {
+            node_id: "test-node".to_string(),
+            export_timestamp: 1234567890,
+            node_type: "single".to_string(),
+            bucket_count: 1,
+        },
     };
 
     // Test JSON serialization/deserialization
@@ -70,8 +76,8 @@ fn test_bucket_export_serialization() {
 
     assert_eq!(deserialized.client_data.len(), 1);
     assert_eq!(deserialized.client_data[0].client_id, "test-client");
-    assert_eq!(deserialized.client_data[0].tokens, 95.5);
-    assert_eq!(deserialized.client_data[0].last_call, 1234567890);
+    assert_eq!(deserialized.client_data[0].remaining_tokens, 95);
+    assert_eq!(deserialized.client_data[0].last_refill, 1234567890);
 }
 
 #[tokio::test]

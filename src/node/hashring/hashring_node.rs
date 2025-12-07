@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
-use super::{HashringCommand, HashringController};
+use super::{messages::HashringCommand, HashringController};
 use crate::error::{ColibriError, Result};
 use crate::node::{CheckCallsResponse, Node, NodeId};
 use crate::settings;
@@ -151,7 +151,9 @@ impl Node for HashringNode {
                 resp_chan: tx,
             })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending create_named_rule command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending create_named_rule command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving create_named_rule response {}",
@@ -168,7 +170,9 @@ impl Node for HashringNode {
                 resp_chan: tx,
             })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending delete_named_rule command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending delete_named_rule command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving delete_named_rule response {}",
@@ -182,7 +186,9 @@ impl Node for HashringNode {
         self.hashring_command_tx
             .send(HashringCommand::ListNamedRules { resp_chan: tx })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending list_named_rules command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending list_named_rules command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving list_named_rules response {}",
@@ -202,7 +208,9 @@ impl Node for HashringNode {
                 resp_chan: tx,
             })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending get_named_rule command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending get_named_rule command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving get_named_rule response {}",
@@ -224,7 +232,9 @@ impl Node for HashringNode {
                 resp_chan: tx,
             })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending rate_limit_custom command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending rate_limit_custom command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving rate_limit_custom response {}",
@@ -246,7 +256,9 @@ impl Node for HashringNode {
                 resp_chan: tx,
             })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending check_limit_custom command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending check_limit_custom command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving check_limit_custom response {}",
@@ -263,7 +275,9 @@ impl HashringNode {
         self.hashring_command_tx
             .send(HashringCommand::ExportBuckets { resp_chan: tx })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending export_buckets command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending export_buckets command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving export_buckets response {}",
@@ -278,12 +292,14 @@ impl HashringNode {
     ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(HashringCommand::ImportBuckets { 
-                import_data, 
-                resp_chan: tx 
+            .send(HashringCommand::ImportBuckets {
+                import_data,
+                resp_chan: tx,
             })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending import_buckets command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending import_buckets command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving import_buckets response {}",
@@ -297,7 +313,9 @@ impl HashringNode {
         self.hashring_command_tx
             .send(HashringCommand::ClusterHealth { resp_chan: tx })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending cluster_health command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending cluster_health command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving cluster_health response {}",
@@ -311,7 +329,9 @@ impl HashringNode {
         self.hashring_command_tx
             .send(HashringCommand::GetTopology { resp_chan: tx })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending get_topology command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending get_topology command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving get_topology response {}",
@@ -326,12 +346,14 @@ impl HashringNode {
     ) -> Result<crate::cluster::TopologyResponse> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(HashringCommand::NewTopology { 
-                request, 
-                resp_chan: tx 
+            .send(HashringCommand::NewTopology {
+                request,
+                resp_chan: tx,
             })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending new_topology command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending new_topology command {}", e))
+            })?;
         rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving new_topology response {}",

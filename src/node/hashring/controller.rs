@@ -2,107 +2,39 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::cluster::{AdminCommand, AdminResponse, ClusterMember};
+use super::consistent_hashing;
+use super::messages;
+use crate::cluster::{
+    AdminCommand, AdminResponse, BucketExport, ClusterMember, ClusterStatus, ExportMetadata,
+    StatusResponse, TopologyResponse,
+};
 use crate::error::{ColibriError, Result};
 use crate::limiters::token_bucket::TokenBucketLimiter;
-use crate::node::{CheckCallsResponse, NodeId};
+use crate::node::{
+    single_node::local_check_limit, single_node::local_rate_limit, CheckCallsResponse, NodeId,
+};
 use crate::settings;
 
-/// Commands that can be sent to the HashringController
-#[derive(Debug)]
-pub enum HashringCommand {
-    /// Check remaining calls for a client
-    CheckLimit {
-        client_id: String,
-        resp_chan: oneshot::Sender<Result<CheckCallsResponse>>,
-    },
-    /// Apply rate limiting for a client
-    RateLimit {
-        client_id: String,
-        resp_chan: oneshot::Sender<Result<Option<CheckCallsResponse>>>,
-    },
-    /// Expire old keys
-    ExpireKeys,
-    /// Create a named rate limiting rule
-    CreateNamedRule {
-        rule_name: String,
-        settings: settings::RateLimitSettings,
-        resp_chan: oneshot::Sender<Result<()>>,
-    },
-    /// Delete a named rate limiting rule
-    DeleteNamedRule {
-        rule_name: String,
-        resp_chan: oneshot::Sender<Result<()>>,
-    },
-    /// List all named rate limiting rules
-    ListNamedRules {
-        resp_chan: oneshot::Sender<Result<Vec<settings::NamedRateLimitRule>>>,
-    },
-    /// Get a specific named rule
-    GetNamedRule {
-        rule_name: String,
-        resp_chan: oneshot::Sender<Result<Option<settings::NamedRateLimitRule>>>,
-    },
-    /// Apply custom rate limiting with a named rule
-    RateLimitCustom {
-        rule_name: String,
-        key: String,
-        resp_chan: oneshot::Sender<Result<Option<CheckCallsResponse>>>,
-    },
-    /// Check custom rate limiting with a named rule
-    CheckLimitCustom {
-        rule_name: String,
-        key: String,
-        resp_chan: oneshot::Sender<Result<CheckCallsResponse>>,
-    },
-    /// Handle admin commands from cluster
-    AdminCommand {
-        command: AdminCommand,
-        source: SocketAddr,
-        resp_chan: oneshot::Sender<Result<AdminResponse>>,
-    },
-    /// Export bucket data for cluster migration
-    ExportBuckets {
-        resp_chan: oneshot::Sender<Result<crate::cluster::BucketExport>>,
-    },
-    /// Import bucket data from cluster migration
-    ImportBuckets {
-        import_data: crate::cluster::BucketExport,
-        resp_chan: oneshot::Sender<Result<()>>,
-    },
-    /// Get cluster health status
-    ClusterHealth {
-        resp_chan: oneshot::Sender<Result<crate::cluster::StatusResponse>>,
-    },
-    /// Get current topology
-    GetTopology {
-        resp_chan: oneshot::Sender<Result<crate::cluster::TopologyResponse>>,
-    },
-    /// Handle topology change
-    NewTopology {
-        request: crate::cluster::TopologyChangeRequest,
-        resp_chan: oneshot::Sender<Result<crate::cluster::TopologyResponse>>,
-    },
-}
-
 /// Controller for consistent hash ring distributed rate limiter
-/// Handles all UDP communication and cluster coordination
+/// Handles all communication and cluster coordination
 #[derive(Clone)]
 pub struct HashringController {
     node_id: NodeId,
     bucket: u32,
     number_of_buckets: u32,
-    listen_api: String,
     // Bucket-to-address mapping for consistent hashing
     bucket_to_address: HashMap<u32, SocketAddr>,
     // Rate limiting state
     pub rate_limiter: Arc<Mutex<TokenBucketLimiter>>,
     pub rate_limit_config: Arc<Mutex<settings::RateLimitConfig>>,
     pub named_rate_limiters: Arc<Mutex<HashMap<String, Arc<Mutex<TokenBucketLimiter>>>>>,
-    /// Cluster membership management - handles UDP transport
+    /// Cluster membership management - handles transport
     pub cluster_member: Arc<dyn ClusterMember>,
 }
 
@@ -119,30 +51,51 @@ impl std::fmt::Debug for HashringController {
 
 impl HashringController {
     pub async fn new(settings: settings::Settings) -> Result<Self> {
-        let node_id = NodeId::new(1); // TODO: extract from settings
-        let number_of_buckets = settings.topology.len().try_into().map_err(|e| {
-            ColibriError::Config(format!("Invalid topology size: {}", e))
-        })?;
+        let node_id = settings.node_id();
+        let number_of_buckets = settings
+            .topology
+            .len()
+            .try_into()
+            .map_err(|e| ColibriError::Config(format!("Invalid topology size: {}", e)))?;
 
-        let listen_api = format!("{}:{}", settings.listen_address, settings.listen_port_api);
+        // Create bucket mapping and calculate our bucket
+        let mut bucket_to_address = HashMap::new();
 
-        // Create bucket mapping (placeholder for now)
-        let bucket_to_address = HashMap::new();
-        let bucket = 0; // TODO: calculate actual bucket
+        // Convert topology strings to SocketAddr and sort for consistent bucket ordering
+        let mut topology_vec: Vec<SocketAddr> = settings
+            .topology
+            .iter()
+            .filter_map(|addr_str| addr_str.parse().ok())
+            .collect();
+        topology_vec.sort();
 
-        // Create rate limiter
+        // Populate bucket mapping from sorted topology
+        for (bucket_id, &node_addr) in topology_vec.iter().enumerate() {
+            bucket_to_address.insert(bucket_id as u32, node_addr);
+        }
+
+        // Calculate which bucket this node owns by finding our address in the topology
+        let our_address: SocketAddr =
+            format!("{}:{}", settings.listen_address, settings.listen_port_tcp)
+                .parse()
+                .map_err(|e| ColibriError::Config(format!("Invalid listen address: {}", e)))?;
+
+        let bucket = topology_vec
+            .iter()
+            .position(|&addr| addr == our_address)
+            .unwrap_or(0) as u32; // Create rate limiter
         let rl_settings = settings.rate_limit_settings();
         let rate_limiter = TokenBucketLimiter::new(node_id, rl_settings);
         let rate_limit_config = settings::RateLimitConfig::new(settings.rate_limit_settings());
 
         // Create cluster member
-        let cluster_member = crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+        let cluster_member =
+            crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
 
         Ok(Self {
             node_id,
             bucket,
             number_of_buckets,
-            listen_api,
             bucket_to_address,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(Mutex::new(rate_limit_config)),
@@ -152,7 +105,7 @@ impl HashringController {
     }
 
     /// Start the main controller loop
-    pub async fn start(self, mut command_rx: mpsc::Receiver<HashringCommand>) {
+    pub async fn start(self, mut command_rx: mpsc::Receiver<messages::HashringCommand>) {
         info!("HashringController started for node {}", self.node_id);
 
         while let Some(command) = command_rx.recv().await {
@@ -167,64 +120,95 @@ impl HashringController {
         info!("HashringController stopped for node {}", self.node_id);
     }
 
-    async fn handle_command(&self, command: HashringCommand) -> Result<()> {
+    async fn handle_command(&self, command: messages::HashringCommand) -> Result<()> {
         match command {
-            HashringCommand::CheckLimit { client_id, resp_chan } => {
+            messages::HashringCommand::CheckLimit {
+                client_id,
+                resp_chan,
+            } => {
                 let result = self.handle_check_limit(client_id).await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::RateLimit { client_id, resp_chan } => {
+            messages::HashringCommand::RateLimit {
+                client_id,
+                resp_chan,
+            } => {
                 let result = self.handle_rate_limit(client_id).await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::ExpireKeys => {
+            messages::HashringCommand::ExpireKeys => {
                 self.handle_expire_keys().await?;
             }
-            HashringCommand::CreateNamedRule { rule_name, settings, resp_chan } => {
+            messages::HashringCommand::CreateNamedRule {
+                rule_name,
+                settings,
+                resp_chan,
+            } => {
                 let result = self.handle_create_named_rule(rule_name, settings).await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::DeleteNamedRule { rule_name, resp_chan } => {
+            messages::HashringCommand::DeleteNamedRule {
+                rule_name,
+                resp_chan,
+            } => {
                 let result = self.handle_delete_named_rule(rule_name).await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::ListNamedRules { resp_chan } => {
+            messages::HashringCommand::ListNamedRules { resp_chan } => {
                 let result = self.handle_list_named_rules().await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::GetNamedRule { rule_name, resp_chan } => {
+            messages::HashringCommand::GetNamedRule {
+                rule_name,
+                resp_chan,
+            } => {
                 let result = self.handle_get_named_rule(rule_name).await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::RateLimitCustom { rule_name, key, resp_chan } => {
+            messages::HashringCommand::RateLimitCustom {
+                rule_name,
+                key,
+                resp_chan,
+            } => {
                 let result = self.handle_rate_limit_custom(rule_name, key).await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::CheckLimitCustom { rule_name, key, resp_chan } => {
+            messages::HashringCommand::CheckLimitCustom {
+                rule_name,
+                key,
+                resp_chan,
+            } => {
                 let result = self.handle_check_limit_custom(rule_name, key).await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::AdminCommand { command, source, resp_chan } => {
+            messages::HashringCommand::AdminCommand {
+                command,
+                source,
+                resp_chan,
+            } => {
                 let result = self.handle_admin_command(command, source).await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::ExportBuckets { resp_chan } => {
+            messages::HashringCommand::ExportBuckets { resp_chan } => {
                 let result = self.handle_export_buckets().await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::ImportBuckets { import_data, resp_chan } => {
+            messages::HashringCommand::ImportBuckets {
+                import_data,
+                resp_chan,
+            } => {
                 let result = self.handle_import_buckets(import_data).await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::ClusterHealth { resp_chan } => {
+            messages::HashringCommand::ClusterHealth { resp_chan } => {
                 let result = self.handle_cluster_health().await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::GetTopology { resp_chan } => {
+            messages::HashringCommand::GetTopology { resp_chan } => {
                 let result = self.handle_get_topology().await;
                 let _ = resp_chan.send(result);
             }
-            HashringCommand::NewTopology { request, resp_chan } => {
+            messages::HashringCommand::NewTopology { request, resp_chan } => {
                 let result = self.handle_new_topology(request).await;
                 let _ = resp_chan.send(result);
             }
@@ -232,25 +216,57 @@ impl HashringController {
         Ok(())
     }
 
-    // Command handlers implementation will follow...
-    // For now, these are placeholder implementations
-
     async fn handle_check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
-        // TODO: Implement distributed check limit logic with UDP communication
-        warn!("HashringController::handle_check_limit not yet fully implemented");
+        // Calculate which bucket owns this client
+        let bucket = consistent_hashing::jump_consistent_hash(&client_id, self.number_of_buckets);
 
-        // For now, handle locally
-        use crate::node::single_node::local_check_limit;
-        local_check_limit(client_id, self.rate_limiter.clone()).await
+        // If this is our bucket, handle locally
+        if bucket == self.bucket {
+            return local_check_limit(client_id, self.rate_limiter.clone()).await;
+        }
+
+        // Find the address for the owning bucket
+        if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
+            // Send rate limiting request via TCP and wait for response
+            self.send_rate_limit_request(target_addr, &client_id, false)
+                .await
+        } else {
+            // No node found for bucket, fallback to local
+            warn!("No node found for bucket {}, handling locally", bucket);
+            local_check_limit(client_id, self.rate_limiter.clone()).await
+        }
     }
 
     async fn handle_rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        // TODO: Implement distributed rate limit logic with UDP communication
-        warn!("HashringController::handle_rate_limit not yet fully implemented");
+        // Calculate which bucket owns this client
+        let bucket = consistent_hashing::jump_consistent_hash(&client_id, self.number_of_buckets);
 
-        // For now, handle locally
-        use crate::node::single_node::local_rate_limit;
-        local_rate_limit(client_id, self.rate_limiter.clone()).await
+        // If this is our bucket, handle locally
+        if bucket == self.bucket {
+            return local_rate_limit(client_id, self.rate_limiter.clone()).await;
+        }
+
+        // Find the address for the owning bucket
+        if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
+            // Send rate limiting request via UDP and wait for response
+            match self
+                .send_rate_limit_request(target_addr, &client_id, true)
+                .await
+            {
+                Ok(response) => Ok(Some(response)),
+                Err(e) => {
+                    warn!(
+                        "Failed to rate limit on remote node {}: {}, falling back to local",
+                        target_addr, e
+                    );
+                    local_rate_limit(client_id, self.rate_limiter.clone()).await
+                }
+            }
+        } else {
+            // No node found for bucket, fallback to local
+            warn!("No node found for bucket {}, handling locally", bucket);
+            local_rate_limit(client_id, self.rate_limiter.clone()).await
+        }
     }
 
     async fn handle_expire_keys(&self) -> Result<()> {
@@ -263,17 +279,60 @@ impl HashringController {
 
     async fn handle_create_named_rule(
         &self,
-        _rule_name: String,
-        _settings: settings::RateLimitSettings,
+        rule_name: String,
+        settings: settings::RateLimitSettings,
     ) -> Result<()> {
-        // TODO: Implement distributed rule creation with UDP sync
-        warn!("HashringController::handle_create_named_rule not yet fully implemented");
+        // Create the rule locally
+        {
+            let mut config = self.rate_limit_config.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            let rule = settings::NamedRateLimitRule {
+                name: rule_name.clone(),
+                settings: settings.clone(),
+            };
+            config.add_named_rule(&rule);
+        }
+
+        // Create the rate limiter for this rule
+        {
+            let rate_limiter = TokenBucketLimiter::new(self.node_id, settings.clone());
+            let mut limiters = self.named_rate_limiters.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            limiters.insert(rule_name.clone(), Arc::new(Mutex::new(rate_limiter)));
+        }
+
+        // TODO: Synchronize the rule to all other nodes via extended AdminCommand protocol
+        debug!(
+            "Created named rule {} locally (cluster sync not yet implemented)",
+            rule_name
+        );
         Ok(())
     }
 
-    async fn handle_delete_named_rule(&self, _rule_name: String) -> Result<()> {
-        // TODO: Implement distributed rule deletion with UDP sync
-        warn!("HashringController::handle_delete_named_rule not yet fully implemented");
+    async fn handle_delete_named_rule(&self, rule_name: String) -> Result<()> {
+        // Delete the rule locally
+        {
+            let mut config = self.rate_limit_config.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            config.remove_named_rule(&rule_name);
+        }
+
+        // Remove the rate limiter for this rule
+        {
+            let mut limiters = self.named_rate_limiters.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            limiters.remove(&rule_name);
+        }
+
+        // TODO: Synchronize the deletion to all other nodes via extended AdminCommand protocol
+        debug!(
+            "Deleted named rule {} locally (cluster sync not yet implemented)",
+            rule_name
+        );
         Ok(())
     }
 
@@ -301,27 +360,170 @@ impl HashringController {
 
     async fn handle_rate_limit_custom(
         &self,
-        _rule_name: String,
-        _key: String,
+        rule_name: String,
+        key: String,
     ) -> Result<Option<CheckCallsResponse>> {
-        // TODO: Implement distributed custom rate limit logic with UDP communication
-        warn!("HashringController::handle_rate_limit_custom not yet fully implemented");
-        Ok(None)
+        // Calculate which bucket owns this key
+        let bucket = consistent_hashing::jump_consistent_hash(&key, self.number_of_buckets);
+
+        // If this is our bucket, handle locally
+        if bucket == self.bucket {
+            // Get the named rate limiter
+            let limiter = {
+                let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                    ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                })?;
+                limiters.get(&rule_name).cloned()
+            };
+
+            if let Some(limiter) = limiter {
+                let mut rate_limiter = limiter.lock().map_err(|e| {
+                    ColibriError::Concurrency(format!("Failed to acquire rate limiter lock: {}", e))
+                })?;
+
+                // Apply rate limiting using correct API
+                if let Some(remaining) = rate_limiter.limit_calls_for_client(key.clone()) {
+                    Ok(Some(CheckCallsResponse {
+                        client_id: key,
+                        calls_remaining: remaining,
+                    }))
+                } else {
+                    Ok(Some(CheckCallsResponse {
+                        client_id: key,
+                        calls_remaining: 0,
+                    }))
+                }
+            } else {
+                Err(ColibriError::Config(format!(
+                    "Named rule '{}' not found",
+                    rule_name
+                )))
+            }
+        } else {
+            // Find the address for the owning bucket
+            if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
+                // TODO: Implement TCP-based custom rate limiting for remote nodes
+                warn!(
+                    "Remote custom rate limiting not yet implemented for {}, falling back to local",
+                    target_addr
+                );
+
+                // For now, fallback to local processing
+                let limiter = {
+                    let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                    })?;
+                    limiters.get(&rule_name).cloned()
+                };
+
+                if let Some(limiter) = limiter {
+                    let mut rate_limiter = limiter.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!(
+                            "Failed to acquire rate limiter lock: {}",
+                            e
+                        ))
+                    })?;
+
+                    if let Some(remaining) = rate_limiter.limit_calls_for_client(key.clone()) {
+                        Ok(Some(CheckCallsResponse {
+                            client_id: key,
+                            calls_remaining: remaining,
+                        }))
+                    } else {
+                        Ok(Some(CheckCallsResponse {
+                            client_id: key,
+                            calls_remaining: 0,
+                        }))
+                    }
+                } else {
+                    Err(ColibriError::Config(format!(
+                        "Named rule '{}' not found",
+                        rule_name
+                    )))
+                }
+            } else {
+                Err(ColibriError::Config(format!(
+                    "No node found for bucket {}",
+                    bucket
+                )))
+            }
+        }
     }
 
     async fn handle_check_limit_custom(
         &self,
-        _rule_name: String,
+        rule_name: String,
         key: String,
     ) -> Result<CheckCallsResponse> {
-        // TODO: Implement distributed custom check limit logic with UDP communication
-        warn!("HashringController::handle_check_limit_custom not yet fully implemented");
+        // Calculate which bucket owns this key
+        let bucket = consistent_hashing::jump_consistent_hash(&key, self.number_of_buckets);
 
-        // Placeholder response
-        Ok(CheckCallsResponse {
-            client_id: key,
-            calls_remaining: 0,
-        })
+        // If this is our bucket, handle locally
+        if bucket == self.bucket {
+            // Get the named rate limiter
+            let limiter = {
+                let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                    ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                })?;
+                limiters.get(&rule_name).cloned()
+            };
+
+            if let Some(limiter) = limiter {
+                let rate_limiter = limiter.lock().map_err(|e| {
+                    ColibriError::Concurrency(format!("Failed to acquire rate limiter lock: {}", e))
+                })?;
+
+                let remaining = rate_limiter.check_calls_remaining_for_client(&key);
+                Ok(CheckCallsResponse {
+                    client_id: key,
+                    calls_remaining: remaining,
+                })
+            } else {
+                Err(ColibriError::Config(format!(
+                    "Named rule '{}' not found",
+                    rule_name
+                )))
+            }
+        } else {
+            // Find the address for the owning bucket
+            if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
+                // TODO: Implement TCP-based custom check limiting for remote nodes
+                warn!("Remote custom check limiting not yet implemented for {}, falling back to local", target_addr);
+
+                // For now, fallback to local processing
+                let limiter = {
+                    let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                    })?;
+                    limiters.get(&rule_name).cloned()
+                };
+
+                if let Some(limiter) = limiter {
+                    let rate_limiter = limiter.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!(
+                            "Failed to acquire rate limiter lock: {}",
+                            e
+                        ))
+                    })?;
+
+                    let remaining = rate_limiter.check_calls_remaining_for_client(&key);
+                    Ok(CheckCallsResponse {
+                        client_id: key,
+                        calls_remaining: remaining,
+                    })
+                } else {
+                    Err(ColibriError::Config(format!(
+                        "Named rule '{}' not found",
+                        rule_name
+                    )))
+                }
+            } else {
+                Err(ColibriError::Config(format!(
+                    "No node found for bucket {}",
+                    bucket
+                )))
+            }
+        }
     }
 
     async fn handle_admin_command(
@@ -335,13 +537,13 @@ impl HashringController {
             AdminCommand::GetTopology => {
                 // TODO: Implement topology response
                 Ok(AdminResponse::Error {
-                    message: "Topology response not yet implemented".to_string()
+                    message: "Topology response not yet implemented".to_string(),
                 })
             }
             AdminCommand::ExportBuckets => {
                 // TODO: Implement bucket export
                 Ok(AdminResponse::Error {
-                    message: "Bucket export not yet implemented".to_string()
+                    message: "Bucket export not yet implemented".to_string(),
                 })
             }
             AdminCommand::ImportBuckets { .. } => {
@@ -351,7 +553,7 @@ impl HashringController {
             AdminCommand::GetClusterHealth => {
                 // TODO: Implement health check
                 Ok(AdminResponse::Error {
-                    message: "Health check not yet implemented".to_string()
+                    message: "Health check not yet implemented".to_string(),
                 })
             }
             _ => {
@@ -364,8 +566,6 @@ impl HashringController {
     }
 
     async fn handle_export_buckets(&self) -> Result<crate::cluster::BucketExport> {
-        use crate::cluster::{BucketExport, ExportMetadata};
-
         // TODO: Implement actual bucket data export
         warn!("HashringController::handle_export_buckets not yet fully implemented");
 
@@ -383,28 +583,27 @@ impl HashringController {
         })
     }
 
-    async fn handle_import_buckets(&self, _import_data: crate::cluster::BucketExport) -> Result<()> {
+    async fn handle_import_buckets(
+        &self,
+        _import_data: crate::cluster::BucketExport,
+    ) -> Result<()> {
         // TODO: Implement bucket import logic with UDP transport
         warn!("HashringController::handle_import_buckets not yet fully implemented");
         Ok(())
     }
 
     async fn handle_cluster_health(&self) -> Result<crate::cluster::StatusResponse> {
-        use crate::cluster::{ClusterStatus, StatusResponse};
-
         // TODO: Implement actual health checks with UDP transport
         Ok(StatusResponse {
             node_id: self.node_id.to_string(),
             node_type: "hashring".to_string(),
             status: ClusterStatus::Healthy,
-            active_clients: 0, // TODO: implement client counting
+            active_clients: 0,          // TODO: implement client counting
             last_topology_change: None, // TODO: track topology changes
         })
     }
 
     async fn handle_get_topology(&self) -> Result<crate::cluster::TopologyResponse> {
-        use crate::cluster::TopologyResponse;
-
         // TODO: Get cluster nodes via UDP cluster member
         let cluster_nodes: Vec<SocketAddr> = self.bucket_to_address.values().cloned().collect();
         let peer_nodes: Vec<String> = cluster_nodes.iter().map(|addr| addr.to_string()).collect();
@@ -427,5 +626,680 @@ impl HashringController {
         // TODO: Implement topology change with UDP cluster member
         warn!("HashringController::handle_new_topology not yet fully implemented");
         self.handle_get_topology().await
+    }
+
+    /// Send a rate limiting request via TCP and wait for response
+    async fn send_rate_limit_request(
+        &self,
+        target_addr: SocketAddr,
+        client_id: &str,
+        consume_token: bool,
+    ) -> Result<CheckCallsResponse> {
+        let request_id = format!(
+            "req_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let request = messages::HashringRequest {
+            request_id: request_id.clone(),
+            client_id: client_id.to_string(),
+            consume_token,
+        };
+
+        // Serialize the request
+        let request_bytes = request.serialize()?;
+
+        // Connect to target node via TCP with timeout
+        let connect_timeout = Duration::from_millis(200);
+        let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect(target_addr))
+            .await
+            .map_err(|_| {
+                ColibriError::RateLimit(format!("TCP connect timeout to {}", target_addr))
+            })?
+            .map_err(|e| {
+                ColibriError::RateLimit(format!("TCP connect failed to {}: {}", target_addr, e))
+            })?;
+
+        // Send request length followed by request data
+        let request_len = request_bytes.len() as u32;
+        let len_bytes = request_len.to_be_bytes();
+
+        stream.write_all(&len_bytes).await.map_err(|e| {
+            ColibriError::RateLimit(format!("Failed to write request length: {}", e))
+        })?;
+        stream
+            .write_all(&request_bytes)
+            .await
+            .map_err(|e| ColibriError::RateLimit(format!("Failed to write request: {}", e)))?;
+
+        // Read response length
+        let mut len_bytes = [0u8; 4];
+        stream.read_exact(&mut len_bytes).await.map_err(|e| {
+            ColibriError::RateLimit(format!("Failed to read response length: {}", e))
+        })?;
+        let response_len = u32::from_be_bytes(len_bytes) as usize;
+
+        // Read response data
+        let mut response_bytes = vec![0u8; response_len];
+        stream
+            .read_exact(&mut response_bytes)
+            .await
+            .map_err(|e| ColibriError::RateLimit(format!("Failed to read response: {}", e)))?;
+
+        // Deserialize response
+        let response = messages::HashringResponse::deserialize(&response_bytes)?;
+
+        // Verify request ID matches
+        if response.request_id != request_id {
+            return Err(ColibriError::RateLimit(format!(
+                "Request ID mismatch: expected {}, got {}",
+                request_id, response.request_id
+            )));
+        }
+
+        // Return the result from the response
+        response.result.map_err(ColibriError::RateLimit)
+    }
+
+    /// Handle incoming TCP connection for hashring rate limiting requests
+    pub async fn handle_tcp_connection(&self, mut stream: tokio::net::TcpStream) -> Result<()> {
+        let peer_addr = stream
+            .peer_addr()
+            .map_err(|e| ColibriError::RateLimit(format!("Failed to get peer address: {}", e)))?;
+
+        debug!("Handling TCP connection from {}", peer_addr);
+
+        // Read request length
+        let mut len_bytes = [0u8; 4];
+        stream.read_exact(&mut len_bytes).await.map_err(|e| {
+            ColibriError::RateLimit(format!("Failed to read request length: {}", e))
+        })?;
+        let request_len = u32::from_be_bytes(len_bytes) as usize;
+
+        // Read request data
+        let mut request_bytes = vec![0u8; request_len];
+        stream
+            .read_exact(&mut request_bytes)
+            .await
+            .map_err(|e| ColibriError::RateLimit(format!("Failed to read request: {}", e)))?;
+
+        // Deserialize the request
+        let request = messages::HashringRequest::deserialize(&request_bytes)?;
+
+        debug!(
+            "Processing hashring request {} from {} for client {}",
+            request.request_id, peer_addr, request.client_id
+        );
+
+        // Process the request locally
+        let result = if request.consume_token {
+            match local_rate_limit(request.client_id.clone(), self.rate_limiter.clone()).await {
+                Ok(Some(response)) => Ok(response),
+                Ok(None) => Err("Rate limit exceeded".to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            local_check_limit(request.client_id.clone(), self.rate_limiter.clone())
+                .await
+                .map_err(|e| e.to_string())
+        };
+
+        // Create response
+        let response = messages::HashringResponse {
+            request_id: request.request_id,
+            result,
+        };
+
+        // Serialize response
+        let response_bytes = response.serialize()?;
+
+        // Send response length followed by response data
+        let response_len = response_bytes.len() as u32;
+        let len_bytes = response_len.to_be_bytes();
+
+        stream.write_all(&len_bytes).await.map_err(|e| {
+            ColibriError::RateLimit(format!("Failed to write response length: {}", e))
+        })?;
+        stream
+            .write_all(&response_bytes)
+            .await
+            .map_err(|e| ColibriError::RateLimit(format!("Failed to write response: {}", e)))?;
+
+        debug!(
+            "Successfully handled hashring request {} from {}",
+            response.request_id, peer_addr
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Comprehensive tests for HashringController to verify distributed rate limiting functionality
+
+    use super::*;
+    use crate::node::hashring::messages;
+    use std::collections::HashSet;
+    use tokio::sync::oneshot;
+
+    /// Create a test settings instance for hashring controller with multiple nodes
+    fn create_test_settings_with_topology(nodes: Vec<&str>) -> settings::Settings {
+        let topology: HashSet<String> = nodes.iter().map(|s| s.to_string()).collect();
+
+        settings::Settings {
+            listen_address: "127.0.0.1".to_string(),
+            listen_port_api: 8420,
+            listen_port_tcp: 8421,
+            listen_port_udp: 8422,
+            rate_limit_max_calls_allowed: 100,
+            rate_limit_interval_seconds: 60,
+            run_mode: settings::RunMode::Hashring,
+            gossip_interval_ms: 1000,
+            gossip_fanout: 3,
+            topology,
+            failure_timeout_secs: 30,
+            hash_replication_factor: 1,
+        }
+    }
+
+    /// Create a single-node test settings instance
+    fn create_single_node_test_settings() -> settings::Settings {
+        create_test_settings_with_topology(vec!["127.0.0.1:8421"])
+    }
+
+    /// Create a multi-node test settings instance
+    fn create_multi_node_test_settings() -> settings::Settings {
+        create_test_settings_with_topology(vec![
+            "127.0.0.1:8421",
+            "127.0.0.1:8431",
+            "127.0.0.1:8441",
+        ])
+    }
+
+    #[tokio::test]
+    async fn test_controller_creation_single_node() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+
+        // Basic checks that controller is properly initialized
+        assert_eq!(controller.number_of_buckets, 1);
+        assert_eq!(controller.bucket, 0); // Should own bucket 0 in single-node setup
+        assert_eq!(controller.bucket_to_address.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_controller_creation_multi_node() {
+        let settings = create_multi_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+
+        // Should have 3 buckets and proper bucket assignment
+        assert_eq!(controller.number_of_buckets, 3);
+        assert_eq!(controller.bucket_to_address.len(), 3);
+
+        // This node should own bucket 0 (first in sorted order)
+        assert_eq!(controller.bucket, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bucket_ownership_calculation() {
+        let settings = create_multi_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+
+        // Test consistent hashing for different clients
+        let test_cases = vec![
+            ("client_1", "should route to specific bucket"),
+            ("client_2", "should route to specific bucket"),
+            ("user_abc", "should route to specific bucket"),
+        ];
+
+        for (client_id, _description) in test_cases {
+            let bucket =
+                consistent_hashing::jump_consistent_hash(client_id, controller.number_of_buckets);
+
+            // Bucket should be valid
+            assert!(bucket < controller.number_of_buckets);
+
+            // Same client should always map to same bucket
+            let bucket2 =
+                consistent_hashing::jump_consistent_hash(client_id, controller.number_of_buckets);
+            assert_eq!(
+                bucket, bucket2,
+                "Consistent hashing should be deterministic"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_check_limit_command() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        let cmd = messages::HashringCommand::CheckLimit {
+            client_id: "test_client".to_string(),
+            resp_chan: tx,
+        };
+
+        // Handle the check limit command
+        controller.handle_command(cmd).await.unwrap();
+
+        // Check response
+        let response = rx.await.unwrap().unwrap();
+        assert_eq!(response.client_id, "test_client");
+        // For a new client, should have full token bucket
+        assert_eq!(response.calls_remaining, 100);
+    }
+
+    #[tokio::test]
+    async fn test_local_rate_limit_command() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        let cmd = messages::HashringCommand::RateLimit {
+            client_id: "test_client".to_string(),
+            resp_chan: tx,
+        };
+
+        // Handle the rate limit command
+        controller.handle_command(cmd).await.unwrap();
+
+        // Check response
+        let response = rx.await.unwrap().unwrap();
+        assert!(response.is_some());
+        let check_result = response.unwrap();
+        assert_eq!(check_result.client_id, "test_client");
+        assert!(check_result.calls_remaining < 100); // Should consume tokens
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiting_exhaustion() {
+        let mut settings = create_single_node_test_settings();
+        settings.rate_limit_max_calls_allowed = 3; // Very small limit
+
+        let controller = HashringController::new(settings).await.unwrap();
+        let client_id = "heavy_client".to_string();
+
+        // Make multiple calls to exhaust the rate limit
+        let mut successful_calls = 0;
+        let mut failed_calls = 0;
+
+        for _i in 0..5 {
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::RateLimit {
+                client_id: client_id.clone(),
+                resp_chan: tx,
+            };
+
+            controller.handle_command(cmd).await.unwrap();
+            let response = rx.await.unwrap().unwrap();
+
+            if response.is_some() {
+                successful_calls += 1;
+            } else {
+                failed_calls += 1;
+            }
+        }
+
+        // We should have some successful calls (at least 1) and some failed ones
+        assert!(
+            successful_calls > 0,
+            "Should have at least one successful call"
+        );
+        assert!(
+            failed_calls > 0,
+            "Should have at least one rate-limited call"
+        );
+        assert!(successful_calls <= 3, "Should not exceed the rate limit");
+    }
+
+    #[tokio::test]
+    async fn test_expire_keys_command() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+
+        let cmd = messages::HashringCommand::ExpireKeys;
+
+        // Should not panic or error
+        controller.handle_command(cmd).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_named_rule_lifecycle() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+
+        let rule_name = "test_rule".to_string();
+        let rule_settings = settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 50,
+            rate_limit_interval_seconds: 30,
+        };
+
+        // Test create named rule
+        {
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::CreateNamedRule {
+                rule_name: rule_name.clone(),
+                settings: rule_settings.clone(),
+                resp_chan: tx,
+            };
+            controller.handle_command(cmd).await.unwrap();
+            let result = rx.await.unwrap();
+            assert!(result.is_ok());
+        }
+
+        // Test list named rules
+        {
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::ListNamedRules { resp_chan: tx };
+            controller.handle_command(cmd).await.unwrap();
+            let rules = rx.await.unwrap().unwrap();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].name, rule_name);
+        }
+
+        // Test get named rule
+        {
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::GetNamedRule {
+                rule_name: rule_name.clone(),
+                resp_chan: tx,
+            };
+            controller.handle_command(cmd).await.unwrap();
+            let rule = rx.await.unwrap().unwrap();
+            assert!(rule.is_some());
+            assert_eq!(rule.unwrap().name, rule_name);
+        }
+
+        // Test custom rate limiting with the rule
+        {
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::RateLimitCustom {
+                rule_name: rule_name.clone(),
+                key: "custom_key".to_string(),
+                resp_chan: tx,
+            };
+            controller.handle_command(cmd).await.unwrap();
+            let response = rx.await.unwrap().unwrap();
+            assert!(response.is_some());
+            let check_result = response.unwrap();
+            assert_eq!(check_result.client_id, "custom_key");
+            assert!(check_result.calls_remaining < 50); // Should consume tokens
+        }
+
+        // Test custom check limit with the rule
+        {
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::CheckLimitCustom {
+                rule_name: rule_name.clone(),
+                key: "custom_key".to_string(),
+                resp_chan: tx,
+            };
+            controller.handle_command(cmd).await.unwrap();
+            let response = rx.await.unwrap().unwrap();
+            assert_eq!(response.client_id, "custom_key");
+            assert!(response.calls_remaining < 50); // Should reflect previous consumption
+        }
+
+        // Test delete named rule
+        {
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::DeleteNamedRule {
+                rule_name: rule_name.clone(),
+                resp_chan: tx,
+            };
+            controller.handle_command(cmd).await.unwrap();
+            let result = rx.await.unwrap();
+            assert!(result.is_ok());
+        }
+
+        // Test that rule is gone
+        {
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::ListNamedRules { resp_chan: tx };
+            controller.handle_command(cmd).await.unwrap();
+            let rules = rx.await.unwrap().unwrap();
+            assert_eq!(rules.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cluster_health_command() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        let cmd = messages::HashringCommand::ClusterHealth { resp_chan: tx };
+
+        controller.handle_command(cmd).await.unwrap();
+        let response = rx.await.unwrap().unwrap();
+
+        assert_eq!(response.node_type, "hashring");
+        assert_eq!(response.node_id, controller.node_id.to_string());
+        assert!(matches!(
+            response.status,
+            crate::cluster::ClusterStatus::Healthy
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_topology_command() {
+        let settings = create_multi_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        let cmd = messages::HashringCommand::GetTopology { resp_chan: tx };
+
+        controller.handle_command(cmd).await.unwrap();
+        let response = rx.await.unwrap().unwrap();
+
+        assert_eq!(response.node_type, "hashring");
+        assert_eq!(response.owned_bucket, Some(0)); // This node should own bucket 0
+        assert_eq!(response.cluster_nodes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_export_import_buckets() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+
+        // Test export
+        {
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::ExportBuckets { resp_chan: tx };
+            controller.handle_command(cmd).await.unwrap();
+            let export = rx.await.unwrap().unwrap();
+
+            assert_eq!(export.metadata.node_type, "hashring");
+            assert_eq!(export.metadata.node_id, controller.node_id.to_string());
+        }
+
+        // Test import
+        {
+            let import_data = crate::cluster::BucketExport {
+                client_data: vec![],
+                metadata: crate::cluster::ExportMetadata {
+                    node_id: "test".to_string(),
+                    export_timestamp: 12345,
+                    node_type: "hashring".to_string(),
+                    bucket_count: 1,
+                },
+            };
+
+            let (tx, rx) = oneshot::channel();
+            let cmd = messages::HashringCommand::ImportBuckets {
+                import_data,
+                resp_chan: tx,
+            };
+            controller.handle_command(cmd).await.unwrap();
+            let result = rx.await.unwrap();
+            assert!(result.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_command_handling() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        let cmd = messages::HashringCommand::AdminCommand {
+            command: crate::cluster::AdminCommand::GetTopology,
+            source: "127.0.0.1:9999".parse().unwrap(),
+            resp_chan: tx,
+        };
+
+        controller.handle_command(cmd).await.unwrap();
+        let response = rx.await.unwrap().unwrap();
+
+        // Should handle admin commands (even if not fully implemented)
+        assert!(matches!(
+            response,
+            crate::cluster::AdminResponse::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_tcp_request_response_serialization() {
+        // Test the TCP message serialization/deserialization
+        let request = messages::HashringRequest {
+            request_id: "test_123".to_string(),
+            client_id: "test_client".to_string(),
+            consume_token: true,
+        };
+
+        // Test serialization
+        let serialized = request.serialize().unwrap();
+        assert!(!serialized.is_empty());
+
+        // Test deserialization
+        let deserialized = messages::HashringRequest::deserialize(&serialized).unwrap();
+        assert_eq!(deserialized.request_id, request.request_id);
+        assert_eq!(deserialized.client_id, request.client_id);
+        assert_eq!(deserialized.consume_token, request.consume_token);
+
+        // Test response serialization
+        let response = messages::HashringResponse {
+            request_id: "test_123".to_string(),
+            result: Ok(CheckCallsResponse {
+                client_id: "test_client".to_string(),
+                calls_remaining: 42,
+            }),
+        };
+
+        let response_serialized = response.serialize().unwrap();
+        let response_deserialized =
+            messages::HashringResponse::deserialize(&response_serialized).unwrap();
+
+        assert_eq!(response_deserialized.request_id, response.request_id);
+        assert!(response_deserialized.result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_distributed_bucket_routing() {
+        let settings = create_multi_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+
+        // Test various client IDs and verify they route to valid buckets
+        let test_clients = vec![
+            "user_1",
+            "user_2",
+            "api_key_abc123",
+            "service_xyz",
+            "client_special_chars_!@#",
+        ];
+
+        for client_id in test_clients {
+            let bucket =
+                consistent_hashing::jump_consistent_hash(client_id, controller.number_of_buckets);
+
+            // Should route to a valid bucket
+            assert!(bucket < controller.number_of_buckets);
+
+            // Should be deterministic
+            let bucket2 =
+                consistent_hashing::jump_consistent_hash(client_id, controller.number_of_buckets);
+            assert_eq!(bucket, bucket2);
+
+            // Check if this node owns the bucket
+            let is_local = bucket == controller.bucket;
+
+            // The bucket should have an address mapping
+            if !is_local {
+                assert!(controller.bucket_to_address.contains_key(&bucket));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_behavior() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+
+        // Even if we somehow try to route to a non-existent bucket,
+        // the system should fallback gracefully
+
+        // For a single-node setup, all requests should be handled locally
+        let (tx, rx) = oneshot::channel();
+        let cmd = messages::HashringCommand::CheckLimit {
+            client_id: "any_client".to_string(),
+            resp_chan: tx,
+        };
+
+        controller.handle_command(cmd).await.unwrap();
+        let response = rx.await.unwrap().unwrap();
+
+        // Should successfully handle the request locally
+        assert_eq!(response.client_id, "any_client");
+        assert!(response.calls_remaining > 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_rate_limiting() {
+        let settings = create_single_node_test_settings();
+        let controller = HashringController::new(settings).await.unwrap();
+        let client_id = "concurrent_client".to_string();
+
+        // Launch multiple concurrent rate limiting requests
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let controller = controller.clone();
+            let client_id = client_id.clone();
+
+            let handle = tokio::spawn(async move {
+                let (tx, rx) = oneshot::channel();
+                let cmd = messages::HashringCommand::RateLimit {
+                    client_id,
+                    resp_chan: tx,
+                };
+
+                controller.handle_command(cmd).await.unwrap();
+                rx.await.unwrap().unwrap()
+            });
+
+            handles.push(handle);
+        }
+
+        // Collect all results
+        let mut results = vec![];
+        for handle in handles {
+            results.push(handle.await);
+        }
+
+        // All requests should complete successfully
+        assert_eq!(results.len(), 10);
+
+        // Count successful vs rate-limited requests
+        let successful = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .filter(|response| response.is_some())
+            .count();
+
+        // Should have some successful requests (rate limiter allows 100 calls)
+        assert!(successful > 0);
     }
 }

@@ -403,7 +403,10 @@ impl GossipController {
             GossipCommand::GetClusterNodes { resp_chan } => {
                 let result = Ok(self.cluster_member.get_cluster_nodes().await);
                 if resp_chan.send(result).is_err() {
-                    error!("[{}] Failed sending get_cluster_nodes response", self.node_id);
+                    error!(
+                        "[{}] Failed sending get_cluster_nodes response",
+                        self.node_id
+                    );
                 }
                 Ok(())
             }
@@ -412,7 +415,10 @@ impl GossipController {
                 self.cluster_member.add_node(address).await;
                 let result = Ok(());
                 if resp_chan.send(result).is_err() {
-                    error!("[{}] Failed sending add_cluster_node response", self.node_id);
+                    error!(
+                        "[{}] Failed sending add_cluster_node response",
+                        self.node_id
+                    );
                 }
                 Ok(())
             }
@@ -421,7 +427,10 @@ impl GossipController {
                 self.cluster_member.remove_node(address).await;
                 let result = Ok(());
                 if resp_chan.send(result).is_err() {
-                    error!("[{}] Failed sending remove_cluster_node response", self.node_id);
+                    error!(
+                        "[{}] Failed sending remove_cluster_node response",
+                        self.node_id
+                    );
                 }
                 Ok(())
             }

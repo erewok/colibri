@@ -24,8 +24,6 @@ pub struct GossipNode {
 
     /// Receiver handler
     pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-
-
 }
 
 impl GossipNode {
@@ -128,8 +126,6 @@ impl Node for GossipNode {
 
         let gossip_command_tx = Arc::new(gossip_command_tx);
 
-
-
         // Start the GossipCommand controller loop
         let controller = GossipController::new(settings.clone()).await?;
         let controller_handle = tokio::spawn(async move {
@@ -150,7 +146,6 @@ impl Node for GossipNode {
             gossip_command_tx,
             controller_handle: Arc::new(Mutex::new(Some(controller_handle))),
             receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
-
         })
     }
 
@@ -384,7 +379,9 @@ impl GossipNode {
         self.gossip_command_tx
             .send(crate::node::gossip::GossipCommand::GetClusterNodes { resp_chan: tx })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed sending get_cluster_nodes command {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed sending get_cluster_nodes command {}", e))
+            })?;
 
         let cluster_nodes = rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
@@ -423,7 +420,9 @@ impl GossipNode {
         self.gossip_command_tx
             .send(crate::node::gossip::GossipCommand::GetClusterNodes { resp_chan: tx })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed getting current cluster nodes {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed getting current cluster nodes {}", e))
+            })?;
         let current_nodes = rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving current cluster nodes {}",
@@ -442,7 +441,7 @@ impl GossipNode {
             self.gossip_command_tx
                 .send(crate::node::gossip::GossipCommand::AddClusterNode {
                     address: *addr,
-                    resp_chan: tx
+                    resp_chan: tx,
                 })
                 .await
                 .map_err(|e| ColibriError::Transport(format!("Failed adding node {}", e)))?;
@@ -455,7 +454,7 @@ impl GossipNode {
             self.gossip_command_tx
                 .send(crate::node::gossip::GossipCommand::RemoveClusterNode {
                     address: *addr,
-                    resp_chan: tx
+                    resp_chan: tx,
                 })
                 .await
                 .map_err(|e| ColibriError::Transport(format!("Failed removing node {}", e)))?;
@@ -467,7 +466,9 @@ impl GossipNode {
         self.gossip_command_tx
             .send(crate::node::gossip::GossipCommand::GetClusterNodes { resp_chan: tx })
             .await
-            .map_err(|e| ColibriError::Transport(format!("Failed getting updated cluster nodes {}", e)))?;
+            .map_err(|e| {
+                ColibriError::Transport(format!("Failed getting updated cluster nodes {}", e))
+            })?;
         let updated_cluster_nodes = rx.await.unwrap_or_else(|e| {
             Err(ColibriError::Transport(format!(
                 "Failed receiving updated cluster nodes {}",

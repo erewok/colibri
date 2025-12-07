@@ -1,5 +1,5 @@
 #!/bin/bash -eux
-export RUST_LOG=debug
+export RUST_LOG=info
 export max_calls=5
 export interval_seconds=3
 
@@ -47,8 +47,19 @@ NODE3_PID=$!
 
 sleep 7
 
-echo -e "Test with: curl -X POST http://localhost:8001/rl/test-client \n"
-./demo/cluster-request-tests.sh
+echo -e "\nRunning comprehensive validation tests...\n"
+export max_calls
+export interval_seconds
+export mode="gossip"
+
+echo -e "=== Basic Rate Limit Validation ==="
+./demo/rate-limit-validation.sh 2>&1 | ./demo/log-filter.sh
+
+echo -e "\n=== Timing-Based Validation ==="
+./demo/timing-validation.sh 2>&1 | ./demo/log-filter.sh
+
+echo -e "\n=== Distributed Consistency Validation ==="
+./demo/consistency-validation.sh 2>&1 | ./demo/log-filter.sh
 
 # Wait for interrupt and cleanup
 trap "echo 'Stopping all nodes...'; kill $NODE1_PID $NODE2_PID $NODE3_PID 2>/dev/null || true; exit 0" INT

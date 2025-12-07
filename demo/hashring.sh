@@ -1,5 +1,5 @@
 #!/bin/bash -eu
-export RUST_LOG=debug
+export RUST_LOG=info
 export mode="hashring"
 export max_calls=5
 export interval_seconds=3
@@ -98,10 +98,19 @@ SHRUNK_TOPOLOGY="127.0.0.1:8001,127.0.0.1:8002"
 echo -e "\n=== INITIAL CLUSTER HEALTH CHECK ==="
 check_cluster_health "$INITIAL_TOPOLOGY"
 
-echo -e "\n=== Test request demo ==="
-./demo/cluster-request-tests.sh
+echo -e "\n=== Comprehensive Rate Limit Validation ==="
+export max_calls
+export interval_seconds
+export mode
 
-# CLUSTER RESIZE OPERATIONS WITH COLIBRI-ADMIN
+echo -e "=== Basic Rate Limit Validation ==="
+./demo/rate-limit-validation.sh 2>&1 | ./demo/log-filter.sh
+
+echo -e "\n=== Timing-Based Validation ==="
+./demo/timing-validation.sh 2>&1 | ./demo/log-filter.sh
+
+echo -e "\n=== Distributed Consistency Validation ==="
+./demo/consistency-validation.sh 2>&1 | ./demo/log-filter.sh# CLUSTER RESIZE OPERATIONS WITH COLIBRI-ADMIN
 echo -e "\n=== CLUSTER RESIZE OPERATIONS ==="
 
 # 1. EXPAND: Add a 4th node (port 8004)

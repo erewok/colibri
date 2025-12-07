@@ -222,17 +222,22 @@ impl HashringController {
 
         // If this is our bucket, handle locally
         if bucket == self.bucket {
-            return local_check_limit(client_id, self.rate_limiter.clone()).await;
+            let result = local_check_limit(client_id.clone(), self.rate_limiter.clone()).await?;
+            info!("[RATE_CHECK] client:{} bucket:{} node:{} remaining:{}",
+                 client_id, bucket, self.node_id, result.calls_remaining);
+            return Ok(result);
         }
 
         // Find the address for the owning bucket
         if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
             // Send rate limiting request via TCP and wait for response
-            self.send_rate_limit_request(target_addr, &client_id, false)
-                .await
+            let result = self.send_rate_limit_request(target_addr, &client_id, false).await?;
+            info!("[RATE_CHECK] client:{} bucket:{} target:{} remaining:{}",
+                 client_id, bucket, target_addr, result.calls_remaining);
+            Ok(result)
         } else {
             // No node found for bucket, fallback to local
-            warn!("No node found for bucket {}, handling locally", bucket);
+            warn!("[BUCKET_MISSING] client:{} bucket:{} -> local", client_id, bucket);
             local_check_limit(client_id, self.rate_limiter.clone()).await
         }
     }
@@ -243,7 +248,15 @@ impl HashringController {
 
         // If this is our bucket, handle locally
         if bucket == self.bucket {
-            return local_rate_limit(client_id, self.rate_limiter.clone()).await;
+            let result = local_rate_limit(client_id.clone(), self.rate_limiter.clone()).await?;
+            if let Some(ref response) = result {
+                info!("[RATE_LIMIT] client:{} bucket:{} node:{} remaining:{} allowed:true",
+                     client_id, bucket, self.node_id, response.calls_remaining);
+            } else {
+                info!("[RATE_LIMIT] client:{} bucket:{} node:{} allowed:false",
+                     client_id, bucket, self.node_id);
+            }
+            return Ok(result);
         }
 
         // Find the address for the owning bucket
@@ -253,18 +266,20 @@ impl HashringController {
                 .send_rate_limit_request(target_addr, &client_id, true)
                 .await
             {
-                Ok(response) => Ok(Some(response)),
+                Ok(response) => {
+                    info!("[RATE_LIMIT] client:{} bucket:{} target:{} remaining:{} allowed:true",
+                         client_id, bucket, target_addr, response.calls_remaining);
+                    Ok(Some(response))
+                }
                 Err(e) => {
-                    warn!(
-                        "Failed to rate limit on remote node {}: {}, falling back to local",
-                        target_addr, e
-                    );
+                    warn!("[ROUTE_FALLBACK] client:{} bucket:{} target:{} error:{} -> local",
+                         client_id, bucket, target_addr, e);
                     local_rate_limit(client_id, self.rate_limiter.clone()).await
                 }
             }
         } else {
             // No node found for bucket, fallback to local
-            warn!("No node found for bucket {}, handling locally", bucket);
+            warn!("[BUCKET_MISSING] client:{} bucket:{} -> local", client_id, bucket);
             local_rate_limit(client_id, self.rate_limiter.clone()).await
         }
     }
@@ -709,8 +724,6 @@ impl HashringController {
             .peer_addr()
             .map_err(|e| ColibriError::RateLimit(format!("Failed to get peer address: {}", e)))?;
 
-        debug!("Handling TCP connection from {}", peer_addr);
-
         // Read request length
         let mut len_bytes = [0u8; 4];
         stream.read_exact(&mut len_bytes).await.map_err(|e| {
@@ -728,11 +741,6 @@ impl HashringController {
         // Deserialize the request
         let request = messages::HashringRequest::deserialize(&request_bytes)?;
 
-        debug!(
-            "Processing hashring request {} from {} for client {}",
-            request.request_id, peer_addr, request.client_id
-        );
-
         // Process the request locally
         let result = if request.consume_token {
             match local_rate_limit(request.client_id.clone(), self.rate_limiter.clone()).await {
@@ -745,6 +753,11 @@ impl HashringController {
                 .await
                 .map_err(|e| e.to_string())
         };
+
+        // Log before creating response to avoid move issues
+        let remaining_tokens = result.as_ref().map_or(0, |r| r.calls_remaining);
+        info!("[TCP_RESPONSE] peer:{} client:{} consume:{} remaining:{}",
+             peer_addr, request.client_id, request.consume_token, remaining_tokens);
 
         // Create response
         let response = messages::HashringResponse {
@@ -766,11 +779,6 @@ impl HashringController {
             .write_all(&response_bytes)
             .await
             .map_err(|e| ColibriError::RateLimit(format!("Failed to write response: {}", e)))?;
-
-        debug!(
-            "Successfully handled hashring request {} from {}",
-            response.request_id, peer_addr
-        );
         Ok(())
     }
 }

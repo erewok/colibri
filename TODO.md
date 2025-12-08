@@ -1,12 +1,10 @@
-# Implementation Status
+# Colibri Rate Limiter - Implementation Plan & TODOs
 
-## Completed
-- Gossip-based cluster state propagation
-- Comprehensive test coverage
-- Custom rate limit rule configuration
-- Consistent hashing with replication
-
-## Remaining
-- Dynamic cluster resizing
-- Kubernetes deployment configuration
-- Persistent state snapshots and recovery
+- [x] Add gossip-based system for propagating cluster state
+- [x] Add tests
+- [x] Make it possible to setup a rate-limiter key that diverges from settings
+- [x] Consistent hashing should offer replication.
+- [ ] Alternatives for config: config files and env vars. Make a config file and use that for both *launching* a node *and* admin commands for all nodes.
+- [ ] Add deployment infra: config-file and kubernetes resource definitions
+- [ ] Snapshot node state to persistent storage and reload on crash
+- [ ] Add docs

@@ -2,10 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::consistent_hashing;
@@ -28,8 +25,6 @@ pub struct HashringController {
     node_id: NodeId,
     bucket: u32,
     number_of_buckets: u32,
-    // Bucket-to-address mapping for consistent hashing
-    bucket_to_address: HashMap<u32, SocketAddr>,
     // Rate limiting state
     pub rate_limiter: Arc<Mutex<TokenBucketLimiter>>,
     pub rate_limit_config: Arc<Mutex<settings::RateLimitConfig>>,
@@ -44,7 +39,6 @@ impl std::fmt::Debug for HashringController {
             .field("node_id", &self.node_id)
             .field("bucket", &self.bucket)
             .field("number_of_buckets", &self.number_of_buckets)
-            .field("topology_size", &self.bucket_to_address.len())
             .finish()
     }
 }
@@ -52,51 +46,48 @@ impl std::fmt::Debug for HashringController {
 impl HashringController {
     pub async fn new(settings: settings::Settings) -> Result<Self> {
         let node_id = settings.node_id();
-        let number_of_buckets = settings
-            .topology
+
+        // Create cluster member first
+        let cluster_member =
+            crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+
+        // Get cluster topology from cluster member
+        let cluster_nodes = cluster_member.get_cluster_nodes().await;
+        let number_of_buckets = cluster_nodes
             .len()
             .try_into()
-            .map_err(|e| ColibriError::Config(format!("Invalid topology size: {}", e)))?;
+            .map_err(|e| ColibriError::Config(format!("Invalid cluster size: {}", e)))?;
 
-        // Create bucket mapping and calculate our bucket
-        let mut bucket_to_address = HashMap::new();
-
-        // Convert topology strings to SocketAddr and sort for consistent bucket ordering
-        let mut topology_vec: Vec<SocketAddr> = settings
-            .topology
-            .iter()
-            .filter_map(|addr_str| addr_str.parse().ok())
-            .collect();
-        topology_vec.sort();
-
-        // Populate bucket mapping from sorted topology
-        for (bucket_id, &node_addr) in topology_vec.iter().enumerate() {
-            bucket_to_address.insert(bucket_id as u32, node_addr);
+        if number_of_buckets == 0 {
+            return Err(ColibriError::Config(
+                "Hashring mode requires cluster topology with other nodes".to_string(),
+            ));
         }
 
-        // Calculate which bucket this node owns by finding our address in the topology
-        let our_address: SocketAddr =
-            format!("{}:{}", settings.listen_address, settings.listen_port_tcp)
+        // Calculate which bucket this node owns by finding our UDP address in the sorted topology
+        let our_udp_address: SocketAddr =
+            format!("{}:{}", settings.listen_address, settings.listen_port_udp)
                 .parse()
                 .map_err(|e| ColibriError::Config(format!("Invalid listen address: {}", e)))?;
 
-        let bucket = topology_vec
+        // Sort cluster nodes for consistent bucket assignment
+        let mut sorted_nodes = cluster_nodes;
+        sorted_nodes.sort();
+
+        let bucket = sorted_nodes
             .iter()
-            .position(|&addr| addr == our_address)
-            .unwrap_or(0) as u32; // Create rate limiter
+            .position(|&addr| addr == our_udp_address)
+            .unwrap_or(0) as u32;
+
+        // Create rate limiter
         let rl_settings = settings.rate_limit_settings();
         let rate_limiter = TokenBucketLimiter::new(node_id, rl_settings);
         let rate_limit_config = settings::RateLimitConfig::new(settings.rate_limit_settings());
-
-        // Create cluster member
-        let cluster_member =
-            crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
 
         Ok(Self {
             node_id,
             bucket,
             number_of_buckets,
-            bucket_to_address,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(Mutex::new(rate_limit_config)),
             named_rate_limiters: Arc::new(Mutex::new(HashMap::new())),
@@ -230,19 +221,54 @@ impl HashringController {
             return Ok(result);
         }
 
-        // Find the address for the owning bucket
-        if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
-            // Send rate limiting request via TCP and wait for response
-            let result = self
-                .send_rate_limit_request(target_addr, &client_id, false)
-                .await?;
-            info!(
-                "[RATE_CHECK] client:{} bucket:{} target:{} remaining:{}",
-                client_id, bucket, target_addr, result.calls_remaining
-            );
-            Ok(result)
+        // Get cluster nodes and find the target for this bucket
+        let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        if cluster_nodes.is_empty() {
+            return local_check_limit(client_id, self.rate_limiter.clone()).await;
+        }
+
+        // Sort nodes for consistent bucket assignment
+        let mut sorted_nodes = cluster_nodes;
+        sorted_nodes.sort();
+
+        if let Some(&target_addr) = sorted_nodes.get(bucket as usize) {
+            // Create request message
+            let request = messages::HashringRequest {
+                request_id: format!(
+                    "check_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ),
+                client_id: client_id.clone(),
+                consume_token: false,
+            };
+
+            // Send via cluster member
+            match self
+                .cluster_member
+                .send_request_response(target_addr, &request.serialize()?)
+                .await?
+            {
+                Some(response_data) => {
+                    let response = messages::HashringResponse::deserialize(&response_data)?;
+                    let result = response.result.map_err(ColibriError::RateLimit)?;
+                    info!(
+                        "[RATE_CHECK] client:{} bucket:{} target:{} remaining:{}",
+                        client_id, bucket, target_addr, result.calls_remaining
+                    );
+                    Ok(result)
+                }
+                None => {
+                    warn!(
+                        "[CLUSTER_UNSUPPORTED] client:{} bucket:{} -> local",
+                        client_id, bucket
+                    );
+                    local_check_limit(client_id, self.rate_limiter.clone()).await
+                }
+            }
         } else {
-            // No node found for bucket, fallback to local
             warn!(
                 "[BUCKET_MISSING] client:{} bucket:{} -> local",
                 client_id, bucket
@@ -272,19 +298,69 @@ impl HashringController {
             return Ok(result);
         }
 
-        // Find the address for the owning bucket
-        if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
-            // Send rate limiting request via UDP and wait for response
+        // Get cluster nodes and find the target for this bucket
+        let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        if cluster_nodes.is_empty() {
+            return local_rate_limit(client_id, self.rate_limiter.clone()).await;
+        }
+
+        // Sort nodes for consistent bucket assignment
+        let mut sorted_nodes = cluster_nodes;
+        sorted_nodes.sort();
+
+        if let Some(&target_addr) = sorted_nodes.get(bucket as usize) {
+            // Create request message
+            let request = messages::HashringRequest {
+                request_id: format!(
+                    "limit_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ),
+                client_id: client_id.clone(),
+                consume_token: true,
+            };
+
+            // Send via cluster member
             match self
-                .send_rate_limit_request(target_addr, &client_id, true)
+                .cluster_member
+                .send_request_response(target_addr, &request.serialize()?)
                 .await
             {
-                Ok(response) => {
-                    info!(
-                        "[RATE_LIMIT] client:{} bucket:{} target:{} remaining:{} allowed:true",
-                        client_id, bucket, target_addr, response.calls_remaining
+                Ok(Some(response_data)) => {
+                    match messages::HashringResponse::deserialize(&response_data) {
+                        Ok(response) => match response.result {
+                            Ok(check_response) => {
+                                info!(
+                                        "[RATE_LIMIT] client:{} bucket:{} target:{} remaining:{} allowed:true",
+                                        client_id, bucket, target_addr, check_response.calls_remaining
+                                    );
+                                Ok(Some(check_response))
+                            }
+                            Err(_) => {
+                                info!(
+                                    "[RATE_LIMIT] client:{} bucket:{} target:{} allowed:false",
+                                    client_id, bucket, target_addr
+                                );
+                                Ok(None)
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                "[ROUTE_FALLBACK] client:{} bucket:{} target:{} decode_error:{} -> local",
+                                client_id, bucket, target_addr, e
+                            );
+                            local_rate_limit(client_id, self.rate_limiter.clone()).await
+                        }
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        "[CLUSTER_UNSUPPORTED] client:{} bucket:{} -> local",
+                        client_id, bucket
                     );
-                    Ok(Some(response))
+                    local_rate_limit(client_id, self.rate_limiter.clone()).await
                 }
                 Err(e) => {
                     warn!(
@@ -295,7 +371,6 @@ impl HashringController {
                 }
             }
         } else {
-            // No node found for bucket, fallback to local
             warn!(
                 "[BUCKET_MISSING] client:{} bucket:{} -> local",
                 client_id, bucket
@@ -436,7 +511,12 @@ impl HashringController {
             }
         } else {
             // Find the address for the owning bucket
-            if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
+            // Get cluster nodes and find target for bucket
+            let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+            let mut sorted_nodes = cluster_nodes;
+            sorted_nodes.sort();
+
+            if let Some(&target_addr) = sorted_nodes.get(bucket as usize) {
                 // TODO: Implement TCP-based custom rate limiting for remote nodes
                 warn!(
                     "Remote custom rate limiting not yet implemented for {}, falling back to local",
@@ -477,10 +557,39 @@ impl HashringController {
                     )))
                 }
             } else {
-                Err(ColibriError::Config(format!(
-                    "No node found for bucket {}",
-                    bucket
-                )))
+                // Fall back to local processing if no target node found
+                let limiter = {
+                    let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                    })?;
+                    limiters.get(&rule_name).cloned()
+                };
+
+                if let Some(limiter) = limiter {
+                    let mut rate_limiter = limiter.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!(
+                            "Failed to acquire rate limiter lock: {}",
+                            e
+                        ))
+                    })?;
+
+                    if let Some(remaining) = rate_limiter.limit_calls_for_client(key.clone()) {
+                        Ok(Some(CheckCallsResponse {
+                            client_id: key,
+                            calls_remaining: remaining,
+                        }))
+                    } else {
+                        Ok(Some(CheckCallsResponse {
+                            client_id: key,
+                            calls_remaining: 0,
+                        }))
+                    }
+                } else {
+                    Err(ColibriError::Config(format!(
+                        "Named rule '{}' not found",
+                        rule_name
+                    )))
+                }
             }
         }
     }
@@ -521,7 +630,12 @@ impl HashringController {
             }
         } else {
             // Find the address for the owning bucket
-            if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
+            // Get cluster nodes and find target for bucket
+            let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+            let mut sorted_nodes = cluster_nodes;
+            sorted_nodes.sort();
+
+            if let Some(&target_addr) = sorted_nodes.get(bucket as usize) {
                 // TODO: Implement TCP-based custom check limiting for remote nodes
                 warn!("Remote custom check limiting not yet implemented for {}, falling back to local", target_addr);
 
@@ -639,8 +753,7 @@ impl HashringController {
     }
 
     async fn handle_get_topology(&self) -> Result<crate::cluster::TopologyResponse> {
-        // TODO: Get cluster nodes via UDP cluster member
-        let cluster_nodes: Vec<SocketAddr> = self.bucket_to_address.values().cloned().collect();
+        let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
         let peer_nodes: Vec<String> = cluster_nodes.iter().map(|addr| addr.to_string()).collect();
 
         Ok(TopologyResponse {
@@ -661,147 +774,6 @@ impl HashringController {
         // TODO: Implement topology change with UDP cluster member
         warn!("HashringController::handle_new_topology not yet fully implemented");
         self.handle_get_topology().await
-    }
-
-    /// Send a rate limiting request via TCP and wait for response
-    async fn send_rate_limit_request(
-        &self,
-        target_addr: SocketAddr,
-        client_id: &str,
-        consume_token: bool,
-    ) -> Result<CheckCallsResponse> {
-        let request_id = format!(
-            "req_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let request = messages::HashringRequest {
-            request_id: request_id.clone(),
-            client_id: client_id.to_string(),
-            consume_token,
-        };
-
-        // Serialize the request
-        let request_bytes = request.serialize()?;
-
-        // Connect to target node via TCP with timeout
-        let connect_timeout = Duration::from_millis(200);
-        let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect(target_addr))
-            .await
-            .map_err(|_| {
-                ColibriError::RateLimit(format!("TCP connect timeout to {}", target_addr))
-            })?
-            .map_err(|e| {
-                ColibriError::RateLimit(format!("TCP connect failed to {}: {}", target_addr, e))
-            })?;
-
-        // Send request length followed by request data
-        let request_len = request_bytes.len() as u32;
-        let len_bytes = request_len.to_be_bytes();
-
-        stream.write_all(&len_bytes).await.map_err(|e| {
-            ColibriError::RateLimit(format!("Failed to write request length: {}", e))
-        })?;
-        stream
-            .write_all(&request_bytes)
-            .await
-            .map_err(|e| ColibriError::RateLimit(format!("Failed to write request: {}", e)))?;
-
-        // Read response length
-        let mut len_bytes = [0u8; 4];
-        stream.read_exact(&mut len_bytes).await.map_err(|e| {
-            ColibriError::RateLimit(format!("Failed to read response length: {}", e))
-        })?;
-        let response_len = u32::from_be_bytes(len_bytes) as usize;
-
-        // Read response data
-        let mut response_bytes = vec![0u8; response_len];
-        stream
-            .read_exact(&mut response_bytes)
-            .await
-            .map_err(|e| ColibriError::RateLimit(format!("Failed to read response: {}", e)))?;
-
-        // Deserialize response
-        let response = messages::HashringResponse::deserialize(&response_bytes)?;
-
-        // Verify request ID matches
-        if response.request_id != request_id {
-            return Err(ColibriError::RateLimit(format!(
-                "Request ID mismatch: expected {}, got {}",
-                request_id, response.request_id
-            )));
-        }
-
-        // Return the result from the response
-        response.result.map_err(ColibriError::RateLimit)
-    }
-
-    /// Handle incoming TCP connection for hashring rate limiting requests
-    pub async fn handle_tcp_connection(&self, mut stream: tokio::net::TcpStream) -> Result<()> {
-        let peer_addr = stream
-            .peer_addr()
-            .map_err(|e| ColibriError::RateLimit(format!("Failed to get peer address: {}", e)))?;
-
-        // Read request length
-        let mut len_bytes = [0u8; 4];
-        stream.read_exact(&mut len_bytes).await.map_err(|e| {
-            ColibriError::RateLimit(format!("Failed to read request length: {}", e))
-        })?;
-        let request_len = u32::from_be_bytes(len_bytes) as usize;
-
-        // Read request data
-        let mut request_bytes = vec![0u8; request_len];
-        stream
-            .read_exact(&mut request_bytes)
-            .await
-            .map_err(|e| ColibriError::RateLimit(format!("Failed to read request: {}", e)))?;
-
-        // Deserialize the request
-        let request = messages::HashringRequest::deserialize(&request_bytes)?;
-
-        // Process the request locally
-        let result = if request.consume_token {
-            match local_rate_limit(request.client_id.clone(), self.rate_limiter.clone()).await {
-                Ok(Some(response)) => Ok(response),
-                Ok(None) => Err("Rate limit exceeded".to_string()),
-                Err(e) => Err(e.to_string()),
-            }
-        } else {
-            local_check_limit(request.client_id.clone(), self.rate_limiter.clone())
-                .await
-                .map_err(|e| e.to_string())
-        };
-
-        // Log before creating response to avoid move issues
-        let remaining_tokens = result.as_ref().map_or(0, |r| r.calls_remaining);
-        info!(
-            "[TCP_RESPONSE] peer:{} client:{} consume:{} remaining:{}",
-            peer_addr, request.client_id, request.consume_token, remaining_tokens
-        );
-
-        // Create response
-        let response = messages::HashringResponse {
-            request_id: request.request_id,
-            result,
-        };
-
-        // Serialize response
-        let response_bytes = response.serialize()?;
-
-        // Send response length followed by response data
-        let response_len = response_bytes.len() as u32;
-        let len_bytes = response_len.to_be_bytes();
-
-        stream.write_all(&len_bytes).await.map_err(|e| {
-            ColibriError::RateLimit(format!("Failed to write response length: {}", e))
-        })?;
-        stream
-            .write_all(&response_bytes)
-            .await
-            .map_err(|e| ColibriError::RateLimit(format!("Failed to write response: {}", e)))?;
-        Ok(())
     }
 }
 
@@ -856,7 +828,10 @@ mod tests {
         // Basic checks that controller is properly initialized
         assert_eq!(controller.number_of_buckets, 1);
         assert_eq!(controller.bucket, 0); // Should own bucket 0 in single-node setup
-        assert_eq!(controller.bucket_to_address.len(), 1);
+
+        // Check cluster nodes
+        let cluster_nodes = controller.cluster_member.get_cluster_nodes().await;
+        assert_eq!(cluster_nodes.len(), 1);
     }
 
     #[tokio::test]
@@ -866,7 +841,10 @@ mod tests {
 
         // Should have 3 buckets and proper bucket assignment
         assert_eq!(controller.number_of_buckets, 3);
-        assert_eq!(controller.bucket_to_address.len(), 3);
+
+        // Check cluster nodes
+        let cluster_nodes = controller.cluster_member.get_cluster_nodes().await;
+        assert_eq!(cluster_nodes.len(), 3);
 
         // This node should own bucket 0 (first in sorted order)
         assert_eq!(controller.bucket, 0);
@@ -1256,9 +1234,10 @@ mod tests {
             // Check if this node owns the bucket
             let is_local = bucket == controller.bucket;
 
-            // The bucket should have an address mapping
+            // The bucket should have a corresponding cluster node
             if !is_local {
-                assert!(controller.bucket_to_address.contains_key(&bucket));
+                let cluster_nodes = controller.cluster_member.get_cluster_nodes().await;
+                assert!((bucket as usize) < cluster_nodes.len());
             }
         }
     }

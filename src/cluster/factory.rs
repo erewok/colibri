@@ -3,11 +3,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::cluster::{ClusterMember, NoOpClusterMember, UdpClusterMember};
+use crate::cluster::{ClusterMember, NoOpClusterMember, TcpClusterMember, UdpClusterMember};
 use crate::error::Result;
 use crate::node::NodeId;
 use crate::settings::Settings;
-use crate::transport::UdpTransport;
+use crate::transport::{TcpTransport, UdpTransport};
 
 /// Factory for creating cluster members from configuration
 pub struct ClusterFactory;
@@ -17,7 +17,8 @@ impl ClusterFactory {
     ///
     /// This is the path from configuration to cluster membership:
     /// 1. Empty topology → NoOpClusterMember (single nodes)
-    /// 2. Non-empty topology → UdpClusterMember (gossip + hashring both use UDP)
+    /// 2. Gossip mode → UdpClusterMember (fire-and-forget communication)
+    /// 3. Hashring mode → TcpClusterMember (request-response communication)
     pub async fn create_from_settings(
         node_id: NodeId,
         settings: &Settings,
@@ -26,28 +27,40 @@ impl ClusterFactory {
             // Single node - no cluster operations
             Ok(Arc::new(NoOpClusterMember))
         } else {
-            // Cluster node - use UDP transport for everything
-            let transport_config = settings.transport_config();
-            let udp_transport = Arc::new(UdpTransport::new(node_id, &transport_config).await?);
+            match settings.run_mode {
+                crate::settings::RunMode::Hashring => {
+                    // Hashring needs TCP for request-response patterns
+                    Self::create_tcp_from_settings(node_id, settings).await
+                }
+                crate::settings::RunMode::Gossip => {
+                    // Gossip uses UDP for fire-and-forget communication
+                    let transport_config = settings.transport_config();
+                    let udp_transport =
+                        Arc::new(UdpTransport::new(node_id, &transport_config).await?);
 
-            // Convert topology strings to SocketAddr
-            let cluster_nodes: Vec<SocketAddr> = settings
-                .topology
-                .iter()
-                .filter_map(|addr_str| addr_str.parse().ok())
-                .collect();
+                    // Convert topology strings to SocketAddr
+                    let cluster_nodes: Vec<SocketAddr> = settings
+                        .topology
+                        .iter()
+                        .filter_map(|addr_str| addr_str.parse().ok())
+                        .collect();
 
-            if cluster_nodes.is_empty() {
-                // Invalid topology addresses - treat as single node
-                tracing::warn!(
-                    "Invalid cluster topology addresses, falling back to single node mode"
-                );
-                Ok(Arc::new(NoOpClusterMember))
-            } else {
-                Ok(Arc::new(UdpClusterMember::new(
-                    udp_transport,
-                    cluster_nodes,
-                )))
+                    if cluster_nodes.is_empty() {
+                        tracing::warn!(
+                            "Invalid cluster topology addresses, falling back to single node mode"
+                        );
+                        Ok(Arc::new(NoOpClusterMember))
+                    } else {
+                        Ok(Arc::new(UdpClusterMember::new(
+                            udp_transport,
+                            cluster_nodes,
+                        )))
+                    }
+                }
+                crate::settings::RunMode::Single => {
+                    // Single mode doesn't use cluster
+                    Ok(Arc::new(NoOpClusterMember))
+                }
             }
         }
     }
@@ -86,6 +99,52 @@ impl ClusterFactory {
             // Use any available port for testing
             let listen_addr = "127.0.0.1:0".parse().unwrap();
             Self::create_from_cli_params(node_id, listen_addr, cluster_nodes).await
+        }
+    }
+
+    /// Create TCP cluster member for hashring nodes that need request-response
+    pub async fn create_tcp_cluster_member(
+        node_id: NodeId,
+        cluster_nodes: Vec<SocketAddr>,
+        max_connections_per_peer: usize,
+    ) -> Result<Arc<dyn ClusterMember>> {
+        if cluster_nodes.is_empty() {
+            Ok(Arc::new(NoOpClusterMember))
+        } else {
+            let tcp_transport = Arc::new(
+                TcpTransport::new(node_id, cluster_nodes.clone(), max_connections_per_peer).await?,
+            );
+            Ok(Arc::new(TcpClusterMember::new(
+                tcp_transport,
+                cluster_nodes,
+            )))
+        }
+    }
+
+    /// Create TCP cluster member from settings (for hashring mode)
+    pub async fn create_tcp_from_settings(
+        node_id: NodeId,
+        settings: &Settings,
+    ) -> Result<Arc<dyn ClusterMember>> {
+        if settings.topology.is_empty() {
+            Ok(Arc::new(NoOpClusterMember))
+        } else {
+            // For hashring, topology addresses should be TCP addresses
+            let cluster_nodes: Vec<SocketAddr> = settings
+                .topology
+                .iter()
+                .filter_map(|addr_str| addr_str.parse().ok())
+                .collect();
+
+            if cluster_nodes.is_empty() {
+                tracing::warn!(
+                    "Invalid cluster topology addresses for TCP, falling back to single node mode"
+                );
+                Ok(Arc::new(NoOpClusterMember))
+            } else {
+                let max_connections = 5; // Default max connections per peer
+                Self::create_tcp_cluster_member(node_id, cluster_nodes, max_connections).await
+            }
         }
     }
 }

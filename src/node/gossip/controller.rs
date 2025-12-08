@@ -11,7 +11,6 @@ use crate::error::{ColibriError, Result};
 use crate::limiters::distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter};
 use crate::node::{CheckCallsResponse, NodeId};
 use crate::settings;
-use crate::transport::UdpTransport;
 
 /// A gossip-based node that maintains all client state locally
 /// and syncs with other nodes via gossip protocol.
@@ -27,10 +26,6 @@ pub struct GossipController {
     /// Named rate limiters for custom configurations
     pub named_rate_limiters:
         Arc<Mutex<std::collections::HashMap<String, DistributedBucketLimiter>>>,
-    /// transport_config
-    pub transport_config: settings::TransportConfig,
-    /// Transport layer for sending UDP unicast gossip messages
-    pub transport: Option<Arc<UdpTransport>>,
     pub response_addr: SocketAddr,
     /// Gossip configuration
     pub gossip_interval_ms: u64,
@@ -43,7 +38,6 @@ impl std::fmt::Debug for GossipController {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GossipController")
             .field("node_id", &self.node_id)
-            .field("has_transport", &self.transport.is_some())
             .field("gossip_interval_ms", &self.gossip_interval_ms)
             .field("gossip_fanout", &self.gossip_fanout)
             .finish()
@@ -61,31 +55,14 @@ impl GossipController {
         let rate_limiter = DistributedBucketLimiter::new(node_id, rl_settings.clone());
         let rl_settings_clone = rl_settings.clone();
 
-        // Build transport
-        let transport_config = settings.transport_config();
-        // cache this for repsonse-addr in messages we send
-        let response_addr = transport_config.listen_udp;
-        let transport = if !settings.topology.is_empty() {
-            info!(
-                "Initializing gossip transport at {} with {} peers: {:?}",
-                transport_config.listen_udp,
-                settings.topology.len(),
-                settings.topology
-            );
-            Some(Arc::new(
-                UdpTransport::new(node_id, &transport_config)
-                    .await
-                    .map_err(|e| {
-                        ColibriError::Transport(format!("Failed to create transport: {}", e))
-                    })?,
-            ))
-        } else {
-            None
-        };
-
         // Create cluster member using factory - unified UDP transport for cluster operations
         let cluster_member =
             crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+
+        // Use UDP listen address for response_addr in gossip messages
+        let response_addr = format!("{}:{}", settings.listen_address, settings.listen_port_udp)
+            .parse()
+            .map_err(|e| ColibriError::Config(format!("Invalid UDP address: {}", e)))?;
 
         Ok(Self {
             node_id,
@@ -95,8 +72,6 @@ impl GossipController {
                 rl_settings_clone,
             ))),
             named_rate_limiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            transport: transport.clone(),
-            transport_config,
             response_addr,
             gossip_interval_ms: settings.gossip_interval_ms,
             gossip_fanout: settings.gossip_fanout,
@@ -106,7 +81,8 @@ impl GossipController {
 
     /// Check if this node has gossip enabled
     pub fn has_gossip(&self) -> bool {
-        self.transport.is_some()
+        // For gossip mode, assume true since GossipController is only used in gossip mode
+        true
     }
 
     /// Log current statistics about the gossip node state for debugging
@@ -650,26 +626,44 @@ impl GossipController {
         }
     }
 
-    /// Send a gossip packet to a random peer
+    /// Send a gossip packet to random peers using cluster_member
     pub async fn send_gossip_packet(&self, packet: GossipPacket) -> Result<()> {
-        if self.transport.is_none() {
+        let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        if cluster_nodes.is_empty() {
             debug!(
-                "[{}] Gossip transport not configured, skipping packet send",
+                "[{}] No cluster nodes configured, skipping packet send",
                 self.node_id
             );
             return Ok(());
         }
+
         match packet.serialize() {
             Ok(data) => {
-                let _peer = self
-                    .transport
-                    .as_ref()
-                    .unwrap()
-                    .clone()
-                    .send_to_random_peers(&data, self.gossip_fanout)
-                    .await
-                    .map_err(|e| ColibriError::Transport(format!("Send failed: {}", e)))?;
-                Ok(())
+                // Send to multiple random peers up to gossip_fanout
+                let send_count = self.gossip_fanout.min(cluster_nodes.len());
+                let mut sent_count = 0;
+
+                for _ in 0..send_count {
+                    match self.cluster_member.send_to_random_node(&data).await {
+                        Ok(_) => sent_count += 1,
+                        Err(e) => debug!(
+                            "[{}] Failed to send gossip to random peer: {}",
+                            self.node_id, e
+                        ),
+                    }
+                }
+
+                if sent_count > 0 {
+                    debug!(
+                        "[{}] Sent gossip packet to {} peers",
+                        self.node_id, sent_count
+                    );
+                    Ok(())
+                } else {
+                    Err(ColibriError::Transport(
+                        "Failed to send to any peers".to_string(),
+                    ))
+                }
             }
             Err(e) => {
                 debug!("[{}] Failed to serialize packet: {}", self.node_id, e);

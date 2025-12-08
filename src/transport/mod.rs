@@ -5,6 +5,7 @@
 //! fire-and-forget patterns (for gossip protocols).
 pub mod common;
 pub mod receiver;
+pub mod socket_pool_tcp;
 pub mod socket_pool_udp;
 
 use std::net::SocketAddr;
@@ -17,11 +18,17 @@ use crate::node::NodeId;
 use crate::settings;
 pub use common::SocketPoolStats;
 pub use receiver::{ReceiverStats, UdpReceiver};
+pub use socket_pool_tcp::{TcpSocketPool, TcpSocketPoolStats};
 pub use socket_pool_udp::UdpSocketPool;
 
 #[derive(Clone, Debug)]
 pub struct UdpTransport {
     socket_pool: Arc<RwLock<UdpSocketPool>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TcpTransport {
+    socket_pool: Arc<RwLock<TcpSocketPool>>,
 }
 
 impl UdpTransport {
@@ -87,10 +94,116 @@ impl UdpTransport {
     }
 }
 
+impl TcpTransport {
+    /// Create a new TCP transport instance for request-response patterns
+    pub async fn new(
+        node_id: NodeId,
+        cluster_nodes: Vec<SocketAddr>,
+        max_connections_per_peer: usize,
+    ) -> Result<Self> {
+        let socket_pool =
+            TcpSocketPool::new(node_id, cluster_nodes, max_connections_per_peer).await?;
+
+        Ok(Self {
+            socket_pool: Arc::new(RwLock::new(socket_pool)),
+        })
+    }
+
+    /// Send request to specific peer and wait for response
+    pub async fn send_request_response(
+        &self,
+        target: SocketAddr,
+        request_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.socket_pool
+            .read()
+            .await
+            .send_request_response(target, request_data)
+            .await
+    }
+
+    /// Send request to random peer and wait for response
+    pub async fn send_request_response_random(
+        &self,
+        request_data: &[u8],
+    ) -> Result<(SocketAddr, Vec<u8>)> {
+        self.socket_pool
+            .read()
+            .await
+            .send_request_response_random(request_data)
+            .await
+    }
+
+    /// Add a new peer to the socket pool
+    pub async fn add_peer(&mut self, peer_addr: SocketAddr) -> Result<()> {
+        self.socket_pool.write().await.add_peer(peer_addr).await
+    }
+
+    /// Remove a peer from the socket pool
+    pub async fn remove_peer(&self, peer_addr: SocketAddr) -> Result<()> {
+        self.socket_pool.write().await.remove_peer(peer_addr).await
+    }
+
+    /// Get list of current peers
+    pub async fn get_peers(&self) -> Vec<SocketAddr> {
+        self.socket_pool.read().await.get_peers().await
+    }
+
+    /// Get TCP transport statistics
+    pub async fn get_stats(&self) -> TcpTransportStats {
+        let socket_pool = self.socket_pool.read().await;
+        let tcp_pool_stats = socket_pool.get_stats();
+        TcpTransportStats {
+            peer_count: tcp_pool_stats
+                .peer_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_connections: tcp_pool_stats
+                .total_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            active_connections: tcp_pool_stats
+                .active_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            requests_sent: tcp_pool_stats
+                .requests_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            responses_received: tcp_pool_stats
+                .responses_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            connection_errors: tcp_pool_stats
+                .connection_errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            timeout_errors: tcp_pool_stats
+                .timeout_errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Cleanup expired connections
+    pub async fn cleanup_expired_connections(&self) {
+        self.socket_pool
+            .read()
+            .await
+            .cleanup_expired_connections()
+            .await;
+    }
+}
+
 /// Transport statistics
 #[derive(Debug)]
 pub struct TransportStats {
     pub send_pool_stats: SocketPoolStats,
+}
+
+/// TCP Transport statistics
+#[derive(Debug)]
+pub struct TcpTransportStats {
+    pub peer_count: usize,
+    pub total_connections: usize,
+    pub active_connections: usize,
+    pub requests_sent: u64,
+    pub responses_received: u64,
+    pub connection_errors: u64,
+    pub timeout_errors: u64,
 }
 
 #[cfg(test)]

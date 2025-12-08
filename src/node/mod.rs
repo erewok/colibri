@@ -79,10 +79,7 @@ impl NodeWrapper {
                     SingleNode::new(node_id, settings).await?,
                 ))),
                 settings::RunMode::Gossip => {
-                    warn!(
-                        "[Node<{}>] Gossip mode is experimental and likely does not work correctly!",
-                        node_id
-                    );
+                    warn!("[Node<{}>] Gossip mode is experimental!", node_id);
                     // Use GossipNode instead of broken MultiNode
                     let gossip_node = Arc::new(GossipNode::new(node_id, settings).await?);
                     Ok(Self::Gossip(gossip_node))

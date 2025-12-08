@@ -65,43 +65,6 @@ impl ClusterFactory {
         }
     }
 
-    /// Create from CLI parameters directly (bypassing Settings)
-    pub async fn create_from_cli_params(
-        node_id: NodeId,
-        listen_udp: SocketAddr,
-        cluster_nodes: Vec<SocketAddr>,
-    ) -> Result<Arc<dyn ClusterMember>> {
-        if cluster_nodes.is_empty() {
-            Ok(Arc::new(NoOpClusterMember))
-        } else {
-            // Create minimal transport config from CLI params
-            let transport_config = crate::settings::TransportConfig {
-                listen_udp,
-                topology: cluster_nodes.iter().cloned().collect(),
-            };
-
-            let udp_transport = Arc::new(UdpTransport::new(node_id, &transport_config).await?);
-            Ok(Arc::new(UdpClusterMember::new(
-                udp_transport,
-                cluster_nodes,
-            )))
-        }
-    }
-
-    /// Create for testing with explicit nodes
-    pub async fn create_for_testing(
-        node_id: NodeId,
-        cluster_nodes: Vec<SocketAddr>,
-    ) -> Result<Arc<dyn ClusterMember>> {
-        if cluster_nodes.is_empty() {
-            Ok(Arc::new(NoOpClusterMember))
-        } else {
-            // Use any available port for testing
-            let listen_addr = "127.0.0.1:0".parse().unwrap();
-            Self::create_from_cli_params(node_id, listen_addr, cluster_nodes).await
-        }
-    }
-
     /// Create TCP cluster member for hashring nodes that need request-response
     pub async fn create_tcp_cluster_member(
         node_id: NodeId,
@@ -225,25 +188,6 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert!(nodes.contains(&"127.0.0.1:8001".parse().unwrap()));
         assert!(nodes.contains(&"127.0.0.1:8002".parse().unwrap()));
-    }
-
-    #[tokio::test]
-    async fn test_cli_params_cluster_member() {
-        let node_id = NodeId::new(1);
-        let listen_addr = "127.0.0.1:9000".parse().unwrap();
-        let cluster_nodes = vec![
-            "127.0.0.1:9001".parse().unwrap(),
-            "127.0.0.1:9002".parse().unwrap(),
-        ];
-
-        let cluster_member =
-            ClusterFactory::create_from_cli_params(node_id, listen_addr, cluster_nodes.clone())
-                .await
-                .unwrap();
-
-        let nodes = cluster_member.get_cluster_nodes().await;
-        assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes, cluster_nodes);
     }
 
     #[tokio::test]

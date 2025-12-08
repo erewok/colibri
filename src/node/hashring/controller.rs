@@ -223,21 +223,30 @@ impl HashringController {
         // If this is our bucket, handle locally
         if bucket == self.bucket {
             let result = local_check_limit(client_id.clone(), self.rate_limiter.clone()).await?;
-            info!("[RATE_CHECK] client:{} bucket:{} node:{} remaining:{}",
-                 client_id, bucket, self.node_id, result.calls_remaining);
+            info!(
+                "[RATE_CHECK] client:{} bucket:{} node:{} remaining:{}",
+                client_id, bucket, self.node_id, result.calls_remaining
+            );
             return Ok(result);
         }
 
         // Find the address for the owning bucket
         if let Some(&target_addr) = self.bucket_to_address.get(&bucket) {
             // Send rate limiting request via TCP and wait for response
-            let result = self.send_rate_limit_request(target_addr, &client_id, false).await?;
-            info!("[RATE_CHECK] client:{} bucket:{} target:{} remaining:{}",
-                 client_id, bucket, target_addr, result.calls_remaining);
+            let result = self
+                .send_rate_limit_request(target_addr, &client_id, false)
+                .await?;
+            info!(
+                "[RATE_CHECK] client:{} bucket:{} target:{} remaining:{}",
+                client_id, bucket, target_addr, result.calls_remaining
+            );
             Ok(result)
         } else {
             // No node found for bucket, fallback to local
-            warn!("[BUCKET_MISSING] client:{} bucket:{} -> local", client_id, bucket);
+            warn!(
+                "[BUCKET_MISSING] client:{} bucket:{} -> local",
+                client_id, bucket
+            );
             local_check_limit(client_id, self.rate_limiter.clone()).await
         }
     }
@@ -250,11 +259,15 @@ impl HashringController {
         if bucket == self.bucket {
             let result = local_rate_limit(client_id.clone(), self.rate_limiter.clone()).await?;
             if let Some(ref response) = result {
-                info!("[RATE_LIMIT] client:{} bucket:{} node:{} remaining:{} allowed:true",
-                     client_id, bucket, self.node_id, response.calls_remaining);
+                info!(
+                    "[RATE_LIMIT] client:{} bucket:{} node:{} remaining:{} allowed:true",
+                    client_id, bucket, self.node_id, response.calls_remaining
+                );
             } else {
-                info!("[RATE_LIMIT] client:{} bucket:{} node:{} allowed:false",
-                     client_id, bucket, self.node_id);
+                info!(
+                    "[RATE_LIMIT] client:{} bucket:{} node:{} allowed:false",
+                    client_id, bucket, self.node_id
+                );
             }
             return Ok(result);
         }
@@ -267,19 +280,26 @@ impl HashringController {
                 .await
             {
                 Ok(response) => {
-                    info!("[RATE_LIMIT] client:{} bucket:{} target:{} remaining:{} allowed:true",
-                         client_id, bucket, target_addr, response.calls_remaining);
+                    info!(
+                        "[RATE_LIMIT] client:{} bucket:{} target:{} remaining:{} allowed:true",
+                        client_id, bucket, target_addr, response.calls_remaining
+                    );
                     Ok(Some(response))
                 }
                 Err(e) => {
-                    warn!("[ROUTE_FALLBACK] client:{} bucket:{} target:{} error:{} -> local",
-                         client_id, bucket, target_addr, e);
+                    warn!(
+                        "[ROUTE_FALLBACK] client:{} bucket:{} target:{} error:{} -> local",
+                        client_id, bucket, target_addr, e
+                    );
                     local_rate_limit(client_id, self.rate_limiter.clone()).await
                 }
             }
         } else {
             // No node found for bucket, fallback to local
-            warn!("[BUCKET_MISSING] client:{} bucket:{} -> local", client_id, bucket);
+            warn!(
+                "[BUCKET_MISSING] client:{} bucket:{} -> local",
+                client_id, bucket
+            );
             local_rate_limit(client_id, self.rate_limiter.clone()).await
         }
     }
@@ -756,8 +776,10 @@ impl HashringController {
 
         // Log before creating response to avoid move issues
         let remaining_tokens = result.as_ref().map_or(0, |r| r.calls_remaining);
-        info!("[TCP_RESPONSE] peer:{} client:{} consume:{} remaining:{}",
-             peer_addr, request.client_id, request.consume_token, remaining_tokens);
+        info!(
+            "[TCP_RESPONSE] peer:{} client:{} consume:{} remaining:{}",
+            peer_addr, request.client_id, request.consume_token, remaining_tokens
+        );
 
         // Create response
         let response = messages::HashringResponse {

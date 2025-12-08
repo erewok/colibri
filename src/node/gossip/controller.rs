@@ -217,8 +217,10 @@ impl GossipController {
                     .lock()
                     .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))?;
                 let calls_remaining = rl.check_calls_remaining_for_client(&client_id);
-                info!("[GOSSIP_CHECK] node:{} client:{} remaining:{}",
-                     self.node_id, client_id, calls_remaining);
+                info!(
+                    "[GOSSIP_CHECK] node:{} client:{} remaining:{}",
+                    self.node_id, client_id, calls_remaining
+                );
 
                 if resp_chan
                     .send(Ok(CheckCallsResponse {
@@ -253,12 +255,16 @@ impl GossipController {
                             client_id: client_id.clone(),
                             calls_remaining,
                         });
-                        info!("[GOSSIP_LIMIT] node:{} client:{} remaining:{} allowed:true",
-                             self.node_id, client_id, calls_remaining);
+                        info!(
+                            "[GOSSIP_LIMIT] node:{} client:{} remaining:{} allowed:true",
+                            self.node_id, client_id, calls_remaining
+                        );
                     } else {
                         response = None;
-                        info!("[GOSSIP_LIMIT] node:{} client:{} allowed:false",
-                             self.node_id, client_id);
+                        info!(
+                            "[GOSSIP_LIMIT] node:{} client:{} allowed:false",
+                            self.node_id, client_id
+                        );
                     }
                     if resp_chan.send(Ok(response)).is_err() {
                         error!(
@@ -461,8 +467,12 @@ impl GossipController {
                             return Ok(());
                         }
 
-                        info!("[GOSSIP_SYNC] node:{} from:{} updates:{}",
-                             self.node_id, sender_node_id, updates.len());
+                        info!(
+                            "[GOSSIP_SYNC] node:{} from:{} updates:{}",
+                            self.node_id,
+                            sender_node_id,
+                            updates.len()
+                        );
                         self.merge_gossip_state(&updates).await;
                         // Propagate further if propagation_factor > 0
                         if propagation_factor > 0 {
@@ -486,8 +496,10 @@ impl GossipController {
                             return Ok(());
                         }
 
-                        info!("[GOSSIP_RESP] node:{} from:{} client:{}",
-                             self.node_id, responding_node_id, requested_data.client_id);
+                        info!(
+                            "[GOSSIP_RESP] node:{} from:{} client:{}",
+                            self.node_id, responding_node_id, requested_data.client_id
+                        );
                         let req = vec![requested_data];
                         // Merge each incoming update
                         self.merge_gossip_state(&req).await;

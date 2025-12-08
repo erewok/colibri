@@ -110,9 +110,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let node_id = NodeId::new(cli.node_id);
-
-    // This is the key separation: admin tool uses internal UDP transport
-    // Public clients can only access HTTP/REST API, not this internal transport
+    // This is the key separation: admin tool uses internal transport
     match cli.command {
         Commands::AddNode { address, cluster } => {
             let cluster_member =
@@ -153,7 +151,6 @@ async fn main() -> Result<()> {
             let cluster_member =
                 ClusterFactory::create_from_cli_params(node_id, cli.listen_addr, cluster).await?;
             let admin_dispatcher = AdminCommandDispatcher::new(cluster_member);
-
             admin_dispatcher
                 .change_cluster_topology(new_topology.clone())
                 .await?;

@@ -859,7 +859,7 @@ mod tests {
         let controller = GossipController::new(settings).await.unwrap();
 
         // Basic checks that controller is properly initialized
-        assert!(!controller.has_gossip()); // No peers in topology
+        assert!(controller.has_gossip()); // Always true for gossip mode
         assert_eq!(controller.gossip_interval_ms, 1000);
         assert_eq!(controller.gossip_fanout, 3);
     }

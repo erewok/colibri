@@ -23,6 +23,9 @@ mod udp_transport_tests {
     }
 
     fn test_settings_hashring(port_offset: u16) -> Settings {
+        let mut topology = HashSet::new();
+        topology.insert(format!("127.0.0.1:{}", 8512 + port_offset)); // Add this node's UDP address to topology
+
         Settings {
             listen_address: "127.0.0.1".to_string(),
             listen_port_api: 8510 + port_offset,
@@ -33,7 +36,7 @@ mod udp_transport_tests {
             run_mode: RunMode::Hashring,
             gossip_interval_ms: 100,
             gossip_fanout: 2,
-            topology: HashSet::new(),
+            topology,
             failure_timeout_secs: 5,
             hash_replication_factor: 1,
         }

@@ -371,6 +371,9 @@ mod tests {
     use std::collections::HashSet;
 
     fn test_settings() -> settings::Settings {
+        let mut topology = HashSet::new();
+        topology.insert("127.0.0.1:8422".to_string()); // Add this node's UDP address to topology
+
         settings::Settings {
             listen_address: "127.0.0.1".to_string(),
             listen_port_api: 8420,
@@ -381,7 +384,7 @@ mod tests {
             run_mode: settings::RunMode::Hashring,
             gossip_interval_ms: 1000,
             gossip_fanout: 3,
-            topology: HashSet::new(), // Empty topology for simple tests
+            topology,
             failure_timeout_secs: 30,
             hash_replication_factor: 1,
         }

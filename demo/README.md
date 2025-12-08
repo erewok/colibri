@@ -1,12 +1,10 @@
 # Demo and Validation Scripts
 
-This directory contains improved demo scripts and validation tools to help you verify that your distributed rate limiter is working correctly.
+Demo scripts and validation tools for testing distributed rate limiting behavior.
 
-## Key Improvements
+## Structured Logging
 
-### 1. Structured Logging
-
-The application uses structured debug messages with these prefixes:
+Structured debug messages use these prefixes:
 
 - `[RATE_CHECK]` - Rate limit check operations
 - `[RATE_LIMIT]` - Rate limit enforcement operations
@@ -15,39 +13,20 @@ The application uses structured debug messages with these prefixes:
 - `[TCP_RESPONSE]` - Hashring TCP communication
 - `[ROUTE_FALLBACK]` / `[BUCKET_MISSING]` - Routing issues
 
-### 2. Validation Scripts
+## Validation Scripts
 
-#### `rate-limit-validation.sh`
+**`rate-limit-validation.sh`** - Tests token consumption, exhaustion, recovery, and client isolation.
 
-Basic validation script that tests:
+**`timing-validation.sh`** - Validates token bucket refill timing and burst capacity.
 
-- Initial token state
-- Rate limit exhaustion
-- Cross-node consistency
-- Token refresh after interval
-- Client isolation
+**`consistency-validation.sh`** - Tests distributed state management across gossip and hashring modes.
 
-#### `timing-validation.sh`
+**`log-filter.sh`** - Filters logs to show essential rate limiting information with color coding.
 
-Timing tests that validate:
+## Requirements
 
-- Token bucket refill behavior
-- Burst capacity
-- Gradual vs. strict interval refills
-- Complete rate limit enforcement
-
-#### `consistency-validation.sh`
-
-Distributed system validation for:
-
-- Gossip mode: eventual consistency across nodes
-- Hashring mode: consistent request routing
-- Cross-node request distribution
-- Recovery behavior
-
-#### `log-filter.sh`
-
-Filters log output to show only essential rate limiting information with color coding.
+- `curl` - HTTP client for API requests
+- `jq` - JSON parsing (install with `brew install jq`)
 
 ## Usage
 

@@ -31,7 +31,7 @@ impl AdminCommandDispatcher {
             ColibriError::Serialization(crate::error::SerializationError::BinaryEncode(e))
         })?;
 
-        // Send via cluster member (UDP transport)
+        // Send via cluster member
         self.cluster_member
             .send_to_node(target, &serialized)
             .await?;

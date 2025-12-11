@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Parse args and env vars
-    let args = cli::Cli::parse();
+    let args = cli::Cli::parse_with_file();
     let settings = args.into_settings();
 
     // Socket server listen address setup

@@ -9,13 +9,14 @@ use tracing::{debug, error, info};
 use super::{GossipCommand, GossipMessage, GossipPacket};
 use crate::error::{ColibriError, Result};
 use crate::limiters::distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter};
-use crate::node::{CheckCallsResponse, NodeId};
+use crate::node::{CheckCallsResponse, NodeId, NodeName, node_id};
 use crate::settings;
 
 /// A gossip-based node that maintains all client state locally
 /// and syncs with other nodes via gossip protocol.
 #[derive(Clone)]
 pub struct GossipController {
+    node_name: NodeName,
     node_id: NodeId,
     // rate-limit settings
     pub rate_limit_settings: settings::RateLimitSettings,
@@ -46,25 +47,25 @@ impl std::fmt::Debug for GossipController {
 
 impl GossipController {
     pub async fn new(settings: settings::Settings) -> Result<Self> {
-        let node_id = settings.node_id();
+        let node_name = settings.node_name();
+        let node_id = node_name.node_id();
         info!(
-            "Created GossipNode with ID: {} (port: {})",
-            node_id, settings.listen_port_udp
+            "Created GossipNode {} <{}> (Peer address: {}:{})",
+            node_name.as_str(), node_id, settings.peer_listen_address, settings.peer_listen_port
         );
         let rl_settings = settings.rate_limit_settings();
-        let rate_limiter = DistributedBucketLimiter::new(node_id, rl_settings.clone());
+        let rate_limiter = DistributedBucketLimiter::new(node_name.node_id(), rl_settings.clone());
         let rl_settings_clone = rl_settings.clone();
 
         // Create cluster member using factory - unified UDP transport for cluster operations
         let cluster_member =
-            crate::cluster::ClusterFactory::create_from_settings(node_id, &settings).await?;
+            crate::cluster::ClusterFactory::create_from_settings(&settings).await?;
 
         // Use UDP listen address for response_addr in gossip messages
-        let response_addr = format!("{}:{}", settings.listen_address, settings.listen_port_udp)
-            .parse()
-            .map_err(|e| ColibriError::Config(format!("Invalid UDP address: {}", e)))?;
+        let response_addr = settings.transport_config().peer_listen_url();
 
         Ok(Self {
+            node_name,
             node_id,
             rate_limit_settings: rl_settings,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
@@ -90,7 +91,7 @@ impl GossipController {
         let bucket_count = self.rate_limiter.lock().map(|rl| rl.len()).unwrap_or(0);
         debug!(
             "[{}] Gossip node stats: {} active client buckets",
-            self.node_id, bucket_count
+            self.node_name.as_str(), bucket_count
         );
     }
 
@@ -98,11 +99,11 @@ impl GossipController {
     pub async fn start(&self, mut gossip_command_rx: mpsc::Receiver<GossipCommand>) {
         info!(
             "[{}] Starting central IO loop with {}ms gossip interval",
-            self.node_id, self.gossip_interval_ms
+            self.node_name.as_str(), self.gossip_interval_ms
         );
 
         let mut gossip_timer = time::interval(time::Duration::from_millis(self.gossip_interval_ms));
-        let node_id = self.node_id;
+        let node_id = self.node_name.node_id();
         // We are taking a single reference to this mutex here
         loop {
             tokio::select! {
@@ -232,7 +233,7 @@ impl GossipController {
                             calls_remaining,
                         });
                         info!(
-                            "[GOSSIP_LIMIT] node:{} client:{} remaining:{} allowed:true",
+                            "[GOSSIP_LIMIT] node: {} client:{} remaining:{} allowed:true",
                             self.node_id, client_id, calls_remaining
                         );
                     } else {
@@ -832,30 +833,13 @@ mod tests {
     //! Simple tests for GossipController to verify core functionality
 
     use super::*;
-    use std::collections::HashSet;
     use tokio::sync::oneshot;
 
-    /// Create a test settings instance for gossip controller
-    fn create_test_settings() -> settings::Settings {
-        settings::Settings {
-            listen_address: "127.0.0.1".to_string(),
-            listen_port_api: 8410,
-            listen_port_tcp: 8411,
-            listen_port_udp: 8412,
-            rate_limit_max_calls_allowed: 100,
-            rate_limit_interval_seconds: 60,
-            run_mode: settings::RunMode::Gossip,
-            gossip_interval_ms: 1000,
-            gossip_fanout: 3,
-            topology: HashSet::new(), // Empty topology for simple tests
-            failure_timeout_secs: 30,
-            hash_replication_factor: 1,
-        }
-    }
+    use crate::node::NodeName;
 
     #[tokio::test]
     async fn test_controller_creation() {
-        let settings = create_test_settings();
+        let settings = settings::tests::sample();
         let controller = GossipController::new(settings).await.unwrap();
 
         // Basic checks that controller is properly initialized
@@ -866,7 +850,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_command() {
-        let settings = create_test_settings();
+        let settings = settings::tests::sample();
         let controller = GossipController::new(settings).await.unwrap();
         let (tx, rx) = oneshot::channel();
 
@@ -888,7 +872,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_limit_command() {
-        let settings = create_test_settings();
+        let settings = settings::tests::sample();
         let controller = GossipController::new(settings).await.unwrap();
         let (tx, rx) = oneshot::channel();
 
@@ -909,7 +893,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expire_keys_command() {
-        let settings = create_test_settings();
+        let settings = settings::tests::sample();
         let controller = GossipController::new(settings).await.unwrap();
 
         let cmd = GossipCommand::ExpireKeys;
@@ -920,12 +904,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_gossip_message_processing() {
-        let settings = create_test_settings();
+        let settings = settings::tests::sample();
         let controller = GossipController::new(settings).await.unwrap();
 
         // Create a heartbeat message
         let message = GossipMessage::Heartbeat {
-            node_id: NodeId::new(999), // Different node ID
+            node_id: NodeName::from("z").node_id(), // Different node ID
             timestamp: 1234567890,
             vclock: crdts::VClock::new(),
             response_addr: "127.0.0.1:8412".parse().unwrap(),
@@ -945,7 +929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_self_message_filtering() {
-        let settings = create_test_settings();
+        let settings = settings::tests::sample();
         let controller = GossipController::new(settings).await.unwrap();
         let our_node_id = controller.node_id;
 
@@ -971,7 +955,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_exhaustion() {
-        let mut settings = create_test_settings();
+        let mut settings = settings::tests::sample();
         settings.rate_limit_max_calls_allowed = 3; // Very small limit
 
         let controller = GossipController::new(settings).await.unwrap();
@@ -1012,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_malformed_gossip_message() {
-        let settings = create_test_settings();
+        let settings = settings::tests::sample();
         let controller = GossipController::new(settings).await.unwrap();
 
         // Send garbage data

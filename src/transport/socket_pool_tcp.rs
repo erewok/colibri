@@ -1,23 +1,22 @@
 //! TCP Socket Pool for Request-Response Communication
 //!
 //! Manages TCP connections for request-response patterns required by hashring nodes.
-//! Unlike UDP sockets, TCP connections need to be managed more carefully with
-//! connection pooling, timeouts, and graceful connection handling.
-
 use rand::Rng;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::error::{ColibriError, Result};
-use crate::node::NodeId;
 use indexmap::IndexMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::debug;
+
+use super::common::SocketPoolStats;
+use crate::error::{ColibriError, Result};
+use crate::node::NodeId;
 
 /// TCP connection with metadata
 #[derive(Debug)]
@@ -53,33 +52,7 @@ pub struct TcpSocketPool {
     connection_timeout: Duration,
     idle_timeout: Duration,
     // Statistics
-    stats: Arc<TcpSocketPoolStats>,
-}
-
-/// TCP-specific statistics
-#[derive(Debug)]
-pub struct TcpSocketPoolStats {
-    pub peer_count: AtomicUsize,
-    pub total_connections: AtomicUsize,
-    pub active_connections: AtomicUsize,
-    pub requests_sent: AtomicU64,
-    pub responses_received: AtomicU64,
-    pub connection_errors: AtomicU64,
-    pub timeout_errors: AtomicU64,
-}
-
-impl TcpSocketPoolStats {
-    fn new(peer_count: usize) -> Self {
-        Self {
-            peer_count: AtomicUsize::new(peer_count),
-            total_connections: AtomicUsize::new(0),
-            active_connections: AtomicUsize::new(0),
-            requests_sent: AtomicU64::new(0),
-            responses_received: AtomicU64::new(0),
-            connection_errors: AtomicU64::new(0),
-            timeout_errors: AtomicU64::new(0),
-        }
-    }
+    stats: Arc<SocketPoolStats>,
 }
 
 impl TcpSocketPool {
@@ -96,7 +69,7 @@ impl TcpSocketPool {
             peer_connections.insert(*peer_addr, Arc::new(Mutex::new(Vec::new())));
         }
 
-        let stats = Arc::new(TcpSocketPoolStats::new(peer_addrs.len()));
+        let stats = Arc::new(SocketPoolStats::new(peer_addrs.len()));
 
         Ok(Self {
             peer_connections,
@@ -114,7 +87,7 @@ impl TcpSocketPool {
         target: SocketAddr,
         request_data: &[u8],
     ) -> Result<Vec<u8>> {
-        self.stats.requests_sent.fetch_add(1, Ordering::Relaxed);
+        self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
 
         // Get or create connection
         let mut connection = self.get_or_create_connection(target).await?;
@@ -130,7 +103,10 @@ impl TcpSocketPool {
         })
         .await
         .map_err(|_| {
-            self.stats.timeout_errors.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .errors
+                .timeout_errors
+                .fetch_add(1, Ordering::Relaxed);
             ColibriError::Transport("Request send timeout".to_string())
         })??;
 
@@ -141,7 +117,10 @@ impl TcpSocketPool {
         })
         .await
         .map_err(|_| {
-            self.stats.timeout_errors.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .errors
+                .timeout_errors
+                .fetch_add(1, Ordering::Relaxed);
             ColibriError::Transport("Response length read timeout".to_string())
         })?
         .map_err(|e| ColibriError::Transport(format!("Failed to read response length: {}", e)))?;
@@ -159,7 +138,10 @@ impl TcpSocketPool {
         })
         .await
         .map_err(|_| {
-            self.stats.timeout_errors.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .errors
+                .timeout_errors
+                .fetch_add(1, Ordering::Relaxed);
             ColibriError::Transport("Response data read timeout".to_string())
         })?
         .map_err(|e| ColibriError::Transport(format!("Failed to read response data: {}", e)))?;
@@ -232,14 +214,20 @@ impl TcpSocketPool {
                     return Ok(conn);
                 }
                 Ok(Err(e)) => {
-                    self.stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .errors
+                        .connection_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(ColibriError::Transport(format!(
                         "Failed to connect to {}: {}",
                         target, e
                     )));
                 }
                 Err(_) => {
-                    self.stats.timeout_errors.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .errors
+                        .timeout_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(ColibriError::Transport(format!(
                         "Connection timeout to {}",
                         target
@@ -311,7 +299,7 @@ impl TcpSocketPool {
     }
 
     /// Get statistics
-    pub fn get_stats(&self) -> &TcpSocketPoolStats {
+    pub fn get_stats(&self) -> &SocketPoolStats {
         &self.stats
     }
 

@@ -11,6 +11,3 @@ pub mod messages;
 pub use controller::GossipController;
 pub use gossip_node::GossipNode;
 pub use messages::{GossipCommand, GossipMessage, GossipPacket};
-
-// Additional modules will be added as we implement them:
-// pub mod membership_manager;

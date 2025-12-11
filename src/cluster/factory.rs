@@ -20,7 +20,6 @@ impl ClusterFactory {
     /// 2. Gossip mode → UdpClusterMember (fire-and-forget communication)
     /// 3. Hashring mode → TcpClusterMember (request-response communication)
     pub async fn create_from_settings(
-        node_id: NodeId,
         settings: &Settings,
     ) -> Result<Arc<dyn ClusterMember>> {
         if settings.topology.is_empty() {
@@ -30,13 +29,13 @@ impl ClusterFactory {
             match settings.run_mode {
                 crate::settings::RunMode::Hashring => {
                     // Hashring needs TCP for request-response patterns
-                    Self::create_tcp_from_settings(node_id, settings).await
+                    Self::create_tcp_from_settings(settings).await
                 }
                 crate::settings::RunMode::Gossip => {
                     // Gossip uses UDP for fire-and-forget communication
                     let transport_config = settings.transport_config();
                     let udp_transport =
-                        Arc::new(UdpTransport::new(node_id, &transport_config).await?);
+                        Arc::new(UdpTransport::new(&transport_config).await?);
 
                     // Convert topology strings to SocketAddr
                     let cluster_nodes: Vec<SocketAddr> = settings
@@ -133,6 +132,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_node_cluster_member() {
         let settings = Settings {
+            config_file: None,
             listen_address: "127.0.0.1".to_string(),
             listen_port_api: 8080,
             listen_port_tcp: 8081,
@@ -143,7 +143,6 @@ mod tests {
             gossip_interval_ms: 1000,
             gossip_fanout: 3,
             topology: HashSet::new(), // Empty = single node
-            failure_timeout_secs: 30,
             hash_replication_factor: 1,
         };
 
@@ -164,6 +163,7 @@ mod tests {
         topology.insert("127.0.0.1:8002".to_string());
 
         let settings = Settings {
+            config_file: None,
             listen_address: "127.0.0.1".to_string(),
             listen_port_api: 8080,
             listen_port_tcp: 8081,
@@ -174,7 +174,6 @@ mod tests {
             gossip_interval_ms: 1000,
             gossip_fanout: 3,
             topology,
-            failure_timeout_secs: 30,
             hash_replication_factor: 1,
         };
 
@@ -196,6 +195,7 @@ mod tests {
         topology.insert("127.0.0.1:8001".to_string());
 
         let settings = Settings {
+            config_file: None,
             listen_address: "127.0.0.1".to_string(),
             listen_port_api: 8080,
             listen_port_tcp: 8081,
@@ -206,7 +206,6 @@ mod tests {
             gossip_interval_ms: 1000,
             gossip_fanout: 3,
             topology,
-            failure_timeout_secs: 30,
             hash_replication_factor: 1,
         };
 

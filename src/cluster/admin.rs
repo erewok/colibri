@@ -6,8 +6,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::cluster::{AdminCommand, AdminResponse, ClusterMember};
+use crate::cluster::ClusterMember;
 use crate::error::{ColibriError, Result};
+use crate::transport::SendReceiveStats;
 
 /// Administrative command dispatcher
 /// Sends commands to cluster nodes using internal transport
@@ -36,8 +37,6 @@ impl AdminCommandDispatcher {
             .send_to_node(target, &serialized)
             .await?;
 
-        // For now, return Ack - in a full implementation we'd wait for response
-        // This would require implementing a request/response pattern over UDP
         Ok(AdminResponse::Ack)
     }
 
@@ -54,8 +53,6 @@ impl AdminCommandDispatcher {
                 Ok(response) => responses.push(response),
                 Err(e) => {
                     warn!("Failed to send admin command to {}: {}", node, e);
-                    // Mark node as unresponsive if command fails
-                    self.cluster_member.mark_unresponsive(node).await;
                 }
             }
         }
@@ -89,65 +86,14 @@ impl AdminCommandDispatcher {
         Ok(())
     }
 
-    /// Mark a node as unresponsive (automatic or operator command)
-    pub async fn mark_node_unresponsive(&self, address: SocketAddr) -> Result<()> {
-        debug!("Admin: Marking node {} as unresponsive", address);
-        self.cluster_member.mark_unresponsive(address).await;
-
-        // Notify other nodes
-        let command = AdminCommand::MarkUnresponsive { address };
-        let _responses = self.broadcast_admin_command(command).await?;
-
-        Ok(())
-    }
-
-    /// Mark a node as responsive (operator command)
-    pub async fn mark_node_responsive(&self, address: SocketAddr) -> Result<()> {
-        debug!("Admin: Marking node {} as responsive", address);
-        self.cluster_member.mark_responsive(address).await;
-
-        // Notify other nodes
-        let command = AdminCommand::MarkResponsive { address };
-        let _responses = self.broadcast_admin_command(command).await?;
-
-        Ok(())
-    }
-
-    /// Perform cluster topology change (replaces hashring export/restart/import cycle)
-    pub async fn change_cluster_topology(&self, new_topology: Vec<SocketAddr>) -> Result<()> {
-        debug!(
-            "Admin: Changing cluster topology to {} nodes",
-            new_topology.len()
-        );
-
-        // Send PrepareTopologyChange to all current nodes
-        let command = AdminCommand::PrepareTopologyChange {
-            new_topology: new_topology.clone(),
-        };
-        let _responses = self.broadcast_admin_command(command).await?;
-
-        // Update our own cluster membership
-        let current_nodes = self.cluster_member.get_cluster_nodes().await;
-        let new_nodes_set: std::collections::HashSet<_> = new_topology.iter().cloned().collect();
-        let current_nodes_set: std::collections::HashSet<_> =
-            current_nodes.iter().cloned().collect();
-
-        // Add new nodes
-        for addr in new_nodes_set.difference(&current_nodes_set) {
-            self.cluster_member.add_node(*addr).await;
-        }
-
-        // Remove nodes that are no longer in topology
-        for addr in current_nodes_set.difference(&new_nodes_set) {
-            self.cluster_member.remove_node(*addr).await;
-        }
-
-        Ok(())
-    }
-
     /// Get current cluster topology
     pub async fn get_cluster_topology(&self) -> Vec<SocketAddr> {
         self.cluster_member.get_cluster_nodes().await
+    }
+
+    /// Get current cluster topology
+    pub async fn get_cluster_stats(&self) -> SendReceiveStats {
+        self.cluster_member.get_cluster_stats().await
     }
 }
 

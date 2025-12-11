@@ -19,6 +19,7 @@ fn setup() {
 fn single_node_settings() -> Settings {
     setup();
     Settings {
+        config_file: None,
         listen_address: "127.0.0.1".to_string(),
         listen_port_api: 8410,
         listen_port_tcp: 8411,
@@ -29,7 +30,6 @@ fn single_node_settings() -> Settings {
         gossip_interval_ms: 1000,
         gossip_fanout: 3,
         topology: HashSet::new(),
-        failure_timeout_secs: 30,
         hash_replication_factor: 1,
     }
 }
@@ -41,6 +41,7 @@ fn gossip_node_settings() -> Settings {
     topology.insert("127.0.0.1:8410".to_string());
 
     Settings {
+        config_file: None,
         listen_address: "127.0.0.1".to_string(),
         listen_port_api: 8410,
         listen_port_tcp: 8411,
@@ -51,7 +52,6 @@ fn gossip_node_settings() -> Settings {
         gossip_interval_ms: 1000,
         gossip_fanout: 3,
         topology,
-        failure_timeout_secs: 30,
         hash_replication_factor: 1,
     }
 }
@@ -63,6 +63,7 @@ fn hashring_node_settings() -> Settings {
     topology.insert("127.0.0.1:8410".to_string());
 
     Settings {
+        config_file: None,
         listen_address: "127.0.0.1".to_string(),
         listen_port_api: 8410,
         listen_port_tcp: 8411,
@@ -73,7 +74,6 @@ fn hashring_node_settings() -> Settings {
         gossip_interval_ms: 1000,
         gossip_fanout: 3,
         topology,
-        failure_timeout_secs: 30,
         hash_replication_factor: 2,
     }
 }

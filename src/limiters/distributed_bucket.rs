@@ -243,7 +243,7 @@ impl DistributedBucket {
 }
 
 impl Bucket for DistributedBucket {
-    fn new(node_id: NodeId, max_calls: u32) -> Self {
+    fn new(max_calls: u32, node_id: NodeId) -> Self {
         let mut instance = Self {
             node_id,
             counter: DistributedRequestCounter::new(node_id),
@@ -388,8 +388,8 @@ impl DistributedBucketLimiter {
             || {
                 debug!("Creating new bucket for client {}", key);
                 DistributedBucket::new(
-                    self.node_id,
                     self.rate_limit_settings.rate_limit_max_calls_allowed,
+                    self.node_id,
                 )
             },
         );
@@ -476,13 +476,13 @@ impl DistributedBucketLimiter {
 
 #[cfg(test)]
 mod tests {
-    //! Minimal test suite demonstrating core distributed token bucket functionality
-
     use super::*;
     use crdts::CvRDT;
     use num_bigint::BigInt;
     use std::thread;
     use std::time::Duration;
+
+    use crate::node::NodeName;
 
     fn test_settings() -> settings::RateLimitSettings {
         settings::RateLimitSettings {
@@ -491,9 +491,13 @@ mod tests {
         }
     }
 
+    fn node_id() -> NodeId {
+        NodeName::from("a").node_id()
+    }
+
     #[test]
     fn test_counter_basic_operations() {
-        let node_id = NodeId::new(1);
+        let node_id = node_id();
         let mut counter = DistributedRequestCounter::new(node_id);
 
         // Should start with 0 tokens
@@ -509,8 +513,8 @@ mod tests {
 
     #[test]
     fn test_counter_crdt_merge() {
-        let node1 = NodeId::new(1);
-        let node2 = NodeId::new(2);
+        let node1 = node_id();
+        let node2 = NodeName::from("b").node_id();
 
         let mut counter1 = DistributedRequestCounter::new(node1);
         let mut counter2 = DistributedRequestCounter::new(node2);
@@ -536,8 +540,8 @@ mod tests {
 
     #[test]
     fn test_bucket_rate_limiting() {
-        let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id, 1);
+        let node_id = node_id();
+        let mut bucket = DistributedBucket::new(1, node_id);
 
         // Start with 1 token - should be allowed
         assert!(bucket.check_if_allowed());
@@ -556,8 +560,8 @@ mod tests {
 
     #[test]
     fn test_bucket_token_replenishment() {
-        let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id, 1000);
+        let node_id = node_id();
+        let mut bucket = DistributedBucket::new(1000, node_id);
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 1000,
             rate_limit_interval_seconds: 1,
@@ -576,8 +580,8 @@ mod tests {
 
     #[test]
     fn test_bucket_expiration() {
-        let node_id = NodeId::new(1);
-        let mut bucket = DistributedBucket::new(node_id, 1000);
+        let node_id = node_id();
+        let mut bucket = DistributedBucket::new(1000, node_id);
 
         // Add entries with different ages
         bucket.requests.push(InternalRequestEntry {
@@ -601,7 +605,7 @@ mod tests {
         assert_eq!(bucket.requests.len(), 1);
 
         // Empty bucket should be expirable
-        let empty_bucket = DistributedBucket::new(node_id, 1000);
+        let empty_bucket = DistributedBucket::new(1000, node_id);
         assert!(empty_bucket.can_expire(1000));
 
         // Bucket with recent activity should not be expirable
@@ -612,7 +616,7 @@ mod tests {
 
     #[test]
     fn test_limiter_basic_rate_limiting() {
-        let node_id = NodeId::new(1);
+        let node_id = node_id();
         let settings = test_settings();
         let mut limiter = DistributedBucketLimiter::new(node_id, settings);
 
@@ -634,8 +638,8 @@ mod tests {
 
     #[test]
     fn test_limiter_gossip_protocol() {
-        let node1 = NodeId::new(1);
-        let node2 = NodeId::new(2);
+        let node1 = node_id();
+        let node2 = NodeName::from("b").node_id();
         let settings = test_settings();
 
         let mut limiter1 = DistributedBucketLimiter::new(node1, settings.clone());
@@ -660,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_limiter_key_expiration() {
-        let node_id = NodeId::new(1);
+        let node_id = node_id();
         let settings = settings::RateLimitSettings {
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 1, // Short interval for testing
@@ -684,7 +688,7 @@ mod tests {
         assert_eq!(limiter.len(), 1);
 
         // Add foreign node data via gossip
-        let foreign_node = NodeId::new(999);
+        let foreign_node = NodeName::from("z").node_id();
         let mut foreign_limiter = DistributedBucketLimiter::new(foreign_node, settings.clone());
         foreign_limiter.limit_calls_for_client("foreign_client".to_string());
 
@@ -700,8 +704,8 @@ mod tests {
 
     #[test]
     fn test_crdt_properties() {
-        let node1 = NodeId::new(1);
-        let node2 = NodeId::new(2);
+        let node1 = node_id();
+        let node2 = NodeName::from("b").node_id();
 
         let mut counter_a = DistributedRequestCounter::new(node1);
         let mut counter_b = DistributedRequestCounter::new(node2);
@@ -728,9 +732,10 @@ mod tests {
     fn test_multi_node_convergence() {
         // Test that multiple nodes converge to same state after gossip
         let settings = test_settings();
-        let mut limiter1 = DistributedBucketLimiter::new(NodeId::new(1), settings.clone());
-        let mut limiter2 = DistributedBucketLimiter::new(NodeId::new(2), settings.clone());
-        let mut limiter3 = DistributedBucketLimiter::new(NodeId::new(3), settings);
+
+        let mut limiter1 = DistributedBucketLimiter::new(node_id(), settings.clone());
+        let mut limiter2 = DistributedBucketLimiter::new(NodeName::from("b").node_id(), settings.clone());
+        let mut limiter3 = DistributedBucketLimiter::new(NodeName::from("c").node_id(), settings);
 
         let client_id = "shared_client".to_string();
 
@@ -766,8 +771,8 @@ mod tests {
 
     #[test]
     fn test_external_serialization() {
-        let node_id = NodeId::new(1);
-        let bucket = DistributedBucket::new(node_id, 10);
+        let node_id = node_id();
+        let bucket = DistributedBucket::new(10, node_id);
 
         // Convert to external format (for gossip)
         let external = bucket.to_external("test_client");

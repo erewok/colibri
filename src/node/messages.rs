@@ -1,47 +1,16 @@
-use bincode::{Decode, Encode};
 /// Cluster administration messages - sent over internal transport only
 /// These are NOT part of the public API - they are for admin tools and internal cluster management
-use serde::{Deserialize, Serialize};
-
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
-/// Administrative command types sent to cluster nodes
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub enum AdminCommand {
-    /// Add a new node to cluster membership
-    AddNode { address: SocketAddr },
-    /// Remove a node from cluster membership
-    RemoveNode { address: SocketAddr },
-    /// Mark a node as unresponsive (stop sending to it)
-    MarkUnresponsive { address: SocketAddr },
-    /// Mark a node as responsive (resume sending to it)
-    MarkResponsive { address: SocketAddr },
-    /// Export all rate limiting data (for cluster migration)
-    ExportBuckets,
-    /// Import rate limiting data (for cluster migration)
-    ImportBuckets { data: BucketExport },
-    /// Get cluster health status
-    GetClusterHealth,
-    /// Get current topology information
-    GetTopology,
-    /// Prepare for topology change (hashring nodes need this)
-    PrepareTopologyChange { new_topology: Vec<SocketAddr> },
-}
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
-/// Response from administrative commands
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub enum AdminResponse {
-    /// Simple acknowledgment
-    Ack,
-    /// Error response
-    Error { message: String },
-    /// Bucket export data
-    BucketExport(BucketExport),
-    /// Health status response
-    ClusterHealth(StatusResponse),
-    /// Topology information
-    Topology(TopologyResponse),
-}
+use crate::error::Result;
+use crate::node::{CheckCallsResponse, NodeName};
+use crate::settings::{NamedRateLimitRule, RateLimitSettings, RunMode};
+
 
 /// Rate limiting bucket export/import format
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -60,49 +29,143 @@ pub struct ClientBucketData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ExportMetadata {
-    pub node_id: String,
+    pub node_name: NodeName,
+    pub node_type: RunMode,
     pub export_timestamp: u64,
-    pub node_type: String, // "gossip", "hashring", "single"
     pub bucket_count: usize,
 }
 
 /// Cluster health and status information
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct StatusResponse {
-    pub node_id: String,
-    pub node_type: String,
-    pub status: ClusterStatus,
+    pub node_name: NodeName,
+    pub node_type: RunMode,
+    pub status: Status,
     pub active_clients: usize,
     pub last_topology_change: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub enum ClusterStatus {
+pub enum Status {
     Healthy,
-    Degraded,
-    Offline,
+    Unhealthy(String), // reason
 }
 
 /// Topology information and node assignments
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct TopologyResponse {
-    pub node_id: String,
-    pub node_type: String,
+    pub node_name: NodeName,
+    pub node_type: RunMode,
+    pub cluster_nodes: HashMap<String, String>, // all known cluster members
+    pub errors: Option<Vec<String>>,
     pub owned_bucket: Option<u32>,      // for hashring nodes
     pub replica_buckets: Vec<u32>,      // for hashring nodes
-    pub cluster_nodes: Vec<SocketAddr>, // all known cluster members
-    pub peer_nodes: Vec<String>,        // peer addresses as strings
-    pub errors: Option<Vec<String>>,
 }
-
-/// Legacy type aliases for compatibility with existing API endpoints
-/// These will be moved to admin-only transport later
-pub type TopologyChangeRequest = PrepareTopologyChangeRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct PrepareTopologyChangeRequest {
-    pub new_topology: Vec<SocketAddr>,
+pub struct TopologyChangeRequest {
+    pub new_topology: HashMap<String, String>,
 }
+
+/// Administrative command types sent to cluster nodes
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub enum AdminCommand {
+    /// Add a new node to cluster membership
+    AddNode { address: SocketAddr },
+    /// Remove a node from cluster membership
+    RemoveNode { address: SocketAddr },
+    /// Export all rate limiting data (for cluster migration)
+    ExportBuckets,
+    /// Import rate limiting data (for cluster migration)
+    ImportBuckets { data: BucketExport },
+    /// Get cluster health status
+    HealthCheck,
+    /// Get current topology information
+    GetTopology,
+    /// Get Status
+    GetStatus,
+}
+
+/// Response from administrative commands
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub enum AdminResponse {
+    /// Simple acknowledgment
+    Ack,
+    /// Error response
+    Error { message: String },
+    /// Bucket export data
+    BucketExport(BucketExport),
+    /// Health status response
+    ClusterHealth(Status),
+    /// Topology information
+    Topology(TopologyResponse),
+    /// Status information
+    Status(StatusResponse),
+}
+
+/// Commands that can be sent to the HashringController
+#[derive(Debug)]
+pub enum ClusterMessage {
+    /// Check remaining calls for a client
+    CheckLimit {
+        client_id: String,
+        resp_chan: oneshot::Sender<Result<CheckCallsResponse>>,
+    },
+    /// Apply rate limiting for a client
+    RateLimit {
+        client_id: String,
+        resp_chan: oneshot::Sender<Result<Option<CheckCallsResponse>>>,
+    },
+    /// Heartbeat
+    Heartbeat,
+    /// Expire old keys
+    ExpireKeys,
+
+    /// Create a named rate limiting rule
+    CreateNamedRule {
+        rule_name: String,
+        settings: RateLimitSettings,
+        resp_chan: oneshot::Sender<Result<()>>,
+    },
+    /// Delete a named rate limiting rule
+    DeleteNamedRule {
+        rule_name: String,
+        resp_chan: oneshot::Sender<Result<()>>,
+    },
+    /// List all named rate limiting rules
+    ListNamedRules {
+        resp_chan: oneshot::Sender<Result<Vec<NamedRateLimitRule>>>,
+    },
+    /// Get a specific named rule
+    GetNamedRule {
+        rule_name: String,
+        resp_chan: oneshot::Sender<Result<Option<NamedRateLimitRule>>>,
+    },
+    /// Apply custom rate limiting with a named rule
+    RateLimitCustom {
+        rule_name: String,
+        key: String,
+        resp_chan: oneshot::Sender<Result<Option<CheckCallsResponse>>>,
+    },
+    /// Check custom rate limiting with a named rule
+    CheckLimitCustom {
+        rule_name: String,
+        key: String,
+        resp_chan: oneshot::Sender<Result<CheckCallsResponse>>,
+    },
+    /// Custom (protocol-specific) message received from peer
+    Other {
+        data: bytes::Bytes,
+        peer_addr: SocketAddr,
+    },
+    /// Handle admin commands from cluster
+    AdminCommand {
+        command: AdminCommand,
+        source: SocketAddr,
+        resp_chan: oneshot::Sender<Result<AdminResponse>>,
+    },
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -162,9 +225,9 @@ mod tests {
     #[test]
     fn test_status_response() {
         let status = StatusResponse {
-            node_id: "test-node".to_string(),
+            node_name: "test-node".to_string(),
             node_type: "gossip".to_string(),
-            status: ClusterStatus::Healthy,
+            status: Status::Healthy,
             active_clients: 42,
             last_topology_change: Some(1234567890),
         };
@@ -175,10 +238,10 @@ mod tests {
         let (deserialized, _): (StatusResponse, _) =
             bincode::decode_from_slice(&serialized, config).unwrap();
 
-        assert_eq!(deserialized.node_id, "test-node");
+        assert_eq!(deserialized.node_name, "test-node");
         assert_eq!(deserialized.active_clients, 42);
         match deserialized.status {
-            ClusterStatus::Healthy => {}
+            Status::Healthy => {}
             _ => panic!("Wrong status"),
         }
     }
@@ -193,7 +256,7 @@ mod tests {
                 bucket_id: Some(0),
             }],
             metadata: ExportMetadata {
-                node_id: "test-node".to_string(),
+                node_name: "test-node".to_string(),
                 export_timestamp: 1234567890,
                 node_type: "single".to_string(),
                 bucket_count: 1,
@@ -208,6 +271,6 @@ mod tests {
 
         assert_eq!(deserialized.client_data.len(), 1);
         assert_eq!(deserialized.client_data[0].client_id, "test-client");
-        assert_eq!(deserialized.metadata.node_id, "test-node");
+        assert_eq!(deserialized.metadata.node_name, "test-node");
     }
 }

@@ -1,38 +1,31 @@
-//! UDP Receiver
+//! TCP Receiver
 //!
-//! Handles incoming UDP messages with support for both callback-based
-//! and channel-based message handling patterns.
+//! Handles incoming TCP messages.
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use tokio::net::UdpSocket;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+use super::common::{FrozenReceiverStats, ReceiverStats};
 use crate::error::{ColibriError, Result};
 
-/// UDP message receiver with flexible handling patterns
-pub struct UdpReceiver {
+/// TCP message receiver with flexible handling patterns
+pub struct TcpReceiver {
     pub local_addr: SocketAddr,
-    socket: Arc<UdpSocket>,
+    socket: Arc<TcpListener>,
     stats: Arc<ReceiverStats>,
     message_tx: Arc<mpsc::Sender<(bytes::Bytes, SocketAddr)>>,
 }
 
-/// Statistics for the receiver
-#[derive(Debug, Default)]
-pub struct ReceiverStats {
-    pub messages_received: AtomicU64,
-    pub receive_errors: AtomicU64,
-}
-
-impl UdpReceiver {
-    /// Create a new UDP receiver
+impl TcpReceiver {
+    /// Create a new TCP receiver
     pub async fn new(
         bind_addr: SocketAddr,
         message_tx: Arc<mpsc::Sender<(bytes::Bytes, SocketAddr)>>,
     ) -> Result<Self> {
-        let socket = UdpSocket::bind(bind_addr)
+        let socket = TcpListener::bind(bind_addr)
             .await
             .map_err(|e| ColibriError::Transport(format!("Socket creation failed: {}", e)))?;
 
@@ -56,14 +49,18 @@ impl UdpReceiver {
         let tx_clone = self.message_tx.clone();
 
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536]; // 64KB buffer
-
             loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, addr)) => {
+                let (_socket, send_addr) = socket.accept().await.unwrap_or_else(|e| {
+                    panic!("TCP accept failed: {}", e);
+                });
+                // Wait for the socket to be readable
+                _socket.readable().await;
+                let mut buf = vec![0u8; 65536]; // 64KB buffer
+                match _socket.try_read_buf(&mut buf) {
+                    Ok(len) => {
                         let data = buf[..len].to_vec();
                         stats.messages_received.fetch_add(1, Ordering::Relaxed);
-                        let message = (bytes::Bytes::from(data), addr);
+                        let message = (bytes::Bytes::from(data), send_addr);
                         // Send to channel
                         if tx_clone.send(message).await.is_err() {
                             // Receiver dropped, exit the task
@@ -72,7 +69,7 @@ impl UdpReceiver {
                     }
                     Err(e) => {
                         stats.receive_errors.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("UDP receive error: {}", e);
+                        eprintln!("TCP receive error: {}", e);
                         // Continue receiving despite errors
                     }
                 }
@@ -81,20 +78,17 @@ impl UdpReceiver {
     }
 
     /// Get receiver statistics
-    pub fn get_stats(&self) -> ReceiverStats {
-        ReceiverStats {
-            messages_received: AtomicU64::new(self.stats.messages_received.load(Ordering::Relaxed)),
-            receive_errors: AtomicU64::new(self.stats.receive_errors.load(Ordering::Relaxed)),
-        }
+    pub fn get_stats(&self) -> FrozenReceiverStats {
+        self.stats.freeze()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
-
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
     use tokio::time::{sleep, timeout, Duration};
 
     use super::*;
@@ -103,22 +97,16 @@ mod tests {
     async fn test_receiver_creation() {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
         let (tx, _rx) = mpsc::channel(1000);
-        let receiver = UdpReceiver::new(bind_addr, Arc::new(tx)).await.unwrap();
+        let receiver = TcpReceiver::new(bind_addr, Arc::new(tx)).await.unwrap();
 
-        assert_eq!(
-            receiver
-                .get_stats()
-                .messages_received
-                .load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(receiver.get_stats().messages_received, 0);
     }
 
     #[tokio::test]
     async fn test_receiver_start_receive() {
         let (send_chan, mut recv_chan) = mpsc::channel(1000);
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
-        let receiver = UdpReceiver::new(bind_addr, Arc::new(send_chan))
+        let receiver = TcpReceiver::new(bind_addr, Arc::new(send_chan))
             .await
             .unwrap();
 
@@ -127,12 +115,9 @@ mod tests {
         sleep(Duration::from_millis(10)).await;
 
         // Send a test message
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sender = TcpStream::connect(receiver.local_addr).await.unwrap();
         let sender_addr = sender.local_addr().unwrap();
-        sender
-            .send_to(b"test message", receiver.local_addr)
-            .await
-            .unwrap();
+        sender.write_all(b"test message").await.unwrap();
 
         // Receive the message
         match timeout(Duration::from_millis(100), recv_chan.recv()).await {
@@ -145,6 +130,6 @@ mod tests {
         }
 
         let stats = receiver.get_stats();
-        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.messages_received, 1);
     }
 }

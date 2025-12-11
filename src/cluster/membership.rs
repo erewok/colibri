@@ -1,12 +1,15 @@
 /// ClusterMember trait - separate concern from being a Node
 /// Only gossip and hashring nodes implement this, single nodes do not
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::error::Result;
-use crate::transport::{TcpTransport, UdpTransport};
+use crate::transport::{
+    FrozenReceiverStats, FrozenSocketPoolStats, SendReceiveStats, TcpTransport, UdpTransport,
+};
 
 #[async_trait]
 pub trait ClusterMember: Send + Sync {
@@ -19,11 +22,8 @@ pub trait ClusterMember: Send + Sync {
     /// Get list of all cluster node addresses
     async fn get_cluster_nodes(&self) -> Vec<SocketAddr>;
 
-    /// Mark a node as unresponsive (stop sending to it)
-    async fn mark_unresponsive(&self, address: SocketAddr);
-
-    /// Mark a node as responsive (resume sending to it)
-    async fn mark_responsive(&self, address: SocketAddr);
+    /// Get list of all cluster node addresses
+    async fn get_cluster_stats(&self) -> SendReceiveStats;
 
     /// Add a node address to the cluster (human operator)
     async fn add_node(&self, address: SocketAddr);
@@ -43,60 +43,32 @@ pub trait ClusterMember: Send + Sync {
 /// Simple cluster membership tracking
 #[derive(Debug, Clone)]
 struct ClusterNodes {
-    responsive_nodes: Vec<SocketAddr>,
-    unresponsive_nodes: Vec<SocketAddr>,
+    nodes: HashSet<SocketAddr>,
 }
 
 impl ClusterNodes {
     fn new(all_nodes: Vec<SocketAddr>) -> Self {
         Self {
-            responsive_nodes: all_nodes,
-            unresponsive_nodes: Vec::new(),
-        }
-    }
-
-    fn mark_unresponsive(&mut self, address: SocketAddr) {
-        if let Some(pos) = self
-            .responsive_nodes
-            .iter()
-            .position(|&addr| addr == address)
-        {
-            let node = self.responsive_nodes.remove(pos);
-            if !self.unresponsive_nodes.contains(&node) {
-                self.unresponsive_nodes.push(node);
-            }
-        }
-    }
-
-    fn mark_responsive(&mut self, address: SocketAddr) {
-        if let Some(pos) = self
-            .unresponsive_nodes
-            .iter()
-            .position(|&addr| addr == address)
-        {
-            let node = self.unresponsive_nodes.remove(pos);
-            if !self.responsive_nodes.contains(&node) {
-                self.responsive_nodes.push(node);
-            }
+            nodes: all_nodes.into_iter().collect(),
         }
     }
 
     fn add_node(&mut self, address: SocketAddr) {
-        if !self.responsive_nodes.contains(&address) && !self.unresponsive_nodes.contains(&address)
-        {
-            self.responsive_nodes.push(address);
+        if !self.nodes.contains(&address) {
+            self.nodes.insert(address);
         }
     }
 
+    fn has_node(&self, address: SocketAddr) -> bool {
+        self.nodes.contains(&address)
+    }
+
     fn remove_node(&mut self, address: SocketAddr) {
-        self.responsive_nodes.retain(|&addr| addr != address);
-        self.unresponsive_nodes.retain(|&addr| addr != address);
+        self.nodes.remove(&address);
     }
 
     fn all_nodes(&self) -> Vec<SocketAddr> {
-        let mut all = self.responsive_nodes.clone();
-        all.extend_from_slice(&self.unresponsive_nodes);
-        all
+        self.nodes.clone().into_iter().collect()
     }
 }
 
@@ -121,12 +93,11 @@ impl ClusterMember for NoOpClusterMember {
         vec![]
     }
 
-    async fn mark_unresponsive(&self, _address: SocketAddr) {
-        // No-op
-    }
-
-    async fn mark_responsive(&self, _address: SocketAddr) {
-        // No-op
+    async fn get_cluster_stats(&self) -> SendReceiveStats {
+        SendReceiveStats {
+            sent: FrozenSocketPoolStats::default(),
+            received: FrozenReceiverStats::default(),
+        }
     }
 
     async fn add_node(&self, _address: SocketAddr) {
@@ -168,13 +139,11 @@ impl UdpClusterMember {
 impl ClusterMember for UdpClusterMember {
     async fn send_to_node(&self, target: SocketAddr, data: &[u8]) -> Result<()> {
         let nodes = self.nodes.read().await;
-        if nodes.responsive_nodes.contains(&target) {
+        if nodes.has_node(target) {
             match self.transport.send_to_peer(target, data).await {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     drop(nodes);
-                    // Mark as unresponsive if send fails
-                    self.mark_unresponsive(target).await;
                     Err(e)
                 }
             }
@@ -186,19 +155,9 @@ impl ClusterMember for UdpClusterMember {
     }
 
     async fn send_to_random_node(&self, data: &[u8]) -> Result<()> {
-        let nodes = self.nodes.read().await;
-        if nodes.responsive_nodes.is_empty() {
-            return Err(crate::error::ColibriError::Transport(
-                "No responsive nodes available".to_string(),
-            ));
-        }
-
         match self.transport.send_to_random_peer(data).await {
             Ok(_) => Ok(()),
-            Err(e) => {
-                // Could mark the random node as unresponsive, but we don't know which one failed
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -206,12 +165,12 @@ impl ClusterMember for UdpClusterMember {
         self.nodes.read().await.all_nodes()
     }
 
-    async fn mark_unresponsive(&self, address: SocketAddr) {
-        self.nodes.write().await.mark_unresponsive(address);
-    }
-
-    async fn mark_responsive(&self, address: SocketAddr) {
-        self.nodes.write().await.mark_responsive(address);
+    async fn get_cluster_stats(&self) -> SendReceiveStats {
+        let stats = self.transport.get_stats().await;
+        SendReceiveStats {
+            sent: stats,
+            received: FrozenReceiverStats::default(), // UDP receiver stats can be added later
+        }
     }
 
     async fn add_node(&self, address: SocketAddr) {
@@ -232,8 +191,7 @@ impl ClusterMember for UdpClusterMember {
     }
 }
 
-/// Implementation for nodes that need request-response patterns (hashring)
-/// Uses TCP transport for reliable request-response communication
+/// Implementation for nodes that need sync responses (hashring)
 pub struct TcpClusterMember {
     transport: Arc<TcpTransport>,
     nodes: Arc<RwLock<ClusterNodes>>,
@@ -271,13 +229,12 @@ impl ClusterMember for TcpClusterMember {
     async fn get_cluster_nodes(&self) -> Vec<SocketAddr> {
         self.nodes.read().await.all_nodes()
     }
-
-    async fn mark_unresponsive(&self, address: SocketAddr) {
-        self.nodes.write().await.mark_unresponsive(address);
-    }
-
-    async fn mark_responsive(&self, address: SocketAddr) {
-        self.nodes.write().await.mark_responsive(address);
+    async fn get_cluster_stats(&self) -> SendReceiveStats {
+        let stats = self.transport.get_stats().await;
+        SendReceiveStats {
+            sent: stats,
+            received: FrozenReceiverStats::default(), // TCP receiver stats can be added later
+        }
     }
 
     async fn add_node(&self, address: SocketAddr) {
@@ -307,22 +264,10 @@ impl ClusterMember for TcpClusterMember {
         target: SocketAddr,
         request: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        let nodes = self.nodes.read().await;
-        if !nodes.responsive_nodes.contains(&target) {
-            return Err(crate::error::ColibriError::Transport(
-                "Node is marked as unresponsive".to_string(),
-            ));
-        }
-        drop(nodes);
-
-        match self.transport.send_request_response(target, request).await {
-            Ok(response) => Ok(Some(response)),
-            Err(e) => {
-                // Mark as unresponsive if request fails
-                self.mark_unresponsive(target).await;
-                Err(e)
-            }
-        }
+        self.transport
+            .send_request_response(target, request)
+            .await
+            .map(Some)
     }
 }
 
@@ -354,13 +299,6 @@ mod tests {
         let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
 
         let mut nodes = ClusterNodes::new(vec![addr1, addr2]);
-        assert_eq!(nodes.all_nodes().len(), 2);
-
-        // Test marking unresponsive/responsive
-        nodes.mark_unresponsive(addr1);
-        assert_eq!(nodes.all_nodes().len(), 2); // Still there
-
-        nodes.mark_responsive(addr1);
         assert_eq!(nodes.all_nodes().len(), 2);
 
         // Test removal

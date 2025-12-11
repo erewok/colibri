@@ -20,60 +20,56 @@ Colibri supports three distinct operational modes:
 
 After cloning this repo, you can quickly launch Colibri using the provided justfile recipes:
 
-### Single-Node Mode
-
 ```sh
 # Start a single node on port 8000
 ❯ just run
 ```
 
-### Multi-Node Clusters
+## Demo Scripts & Validation
+
+The `demo/` directory contains various demo scenarios along with vallidation to test all three operational modes:
 
 ```sh
 # Gossip mode: 3-node cluster with eventual consistency
 ❯ just demo gossip
 
-# Hashring mode: 3-node cluster with consistent hashing
+# Hashring mode: 3-node cluster using consistent hashing
 ❯ just demo hashring
 
-# Single node with comprehensive validation
+# Single node
 ❯ just demo single
 ```
 
-### Quick Manual Test
+### Demo Validation Scripts
 
-```sh
-# Test rate limiting (consumes tokens)
-❯ curl -XPOST -i http://localhost:8001/rl/test-client
-
-# Check remaining tokens (doesn't consume)
-❯ curl -XGET -i http://localhost:8001/rl-check/test-client
-```
-
-## Demo Scripts & Validation
-
-The `demo/` directory contains comprehensive validation scripts that test all three operational modes:
-
-### Interactive Demo
-
-```sh
-# Choose between single, gossip, or hashring mode
-❯ ./demo/quick-validation-demo.sh
-```
-
-### Validation Features
+The demos include validation scripts to try to quickly determine of Colibri is functioning properly:
 
 - **Rate Limiting**: Token consumption, exhaustion, and recovery
 - **Timing**: Token bucket refill and burst capacity
 - **Consistency**: Distributed state management across nodes
-- **Logging**: Filtered output with essential information only
 
-### Manual Commands
+### Quick Manual Test
 
 ```sh
-❯ just demo single     # Single node validation
-❯ just demo gossip     # 3-node gossip cluster
-❯ just demo hashring   # 3-node hashring cluster
+❯ just run
+
+# Test rate limiting (consumes tokens)
+❯ curl -XPOST -i http://localhost:8410/rl/test-client
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 49
+date: Tue, 09 Dec 2025 21:44:44 GMT
+
+{"client_id":"test-client","calls_remaining":999}
+
+# Check remaining tokens (doesn't consume)
+❯ curl -XGET -i http://localhost:8410/rl-check/test-client
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 49
+date: Tue, 09 Dec 2025 21:44:57 GMT
+
+{"client_id":"test-client","calls_remaining":999}
 ```
 
 ### Available Development Recipes
@@ -125,8 +121,9 @@ Key command-line options for running Colibri:
 - `--rate-limit-max-calls-allowed`: Token bucket size (default: 1000)
 - `--rate-limit-interval-seconds`: Refill interval (default: 60)
 - `--topology`: Other nodes in cluster (for distributed modes)
-- `--listen-port`: HTTP port (default: 8000)
-- `--listen-port-udp`: UDP port for gossip communication
+- `--listen-port`: HTTP port (default: 8410)
+- `--listen-port-udp`: TCP port for hashring communication (default: 8411)
+- `--listen-port-udp`: UDP port for gossip communication (default: 8412)
 
 Use `cargo run -- --help` for complete options list.
 
@@ -135,9 +132,3 @@ Use `cargo run -- --help` for complete options list.
 - **Single Mode**: Each node maintains independent rate limits
 - **Gossip Mode**: Nodes eventually converge to consistent token counts (~3s)
 - **Hashring Mode**: Requests route to consistent bucket owners
-
-## Performance Notes
-
-- In-memory storage provides microsecond response times
-- Token bucket refills occur at configured intervals
-- UDP gossip minimizes network overhead

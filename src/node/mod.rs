@@ -6,6 +6,7 @@ use tracing::warn;
 
 pub mod gossip;
 pub mod hashring;
+pub mod messages;
 pub mod node_id;
 pub mod single_node;
 
@@ -13,10 +14,7 @@ use crate::error::Result;
 use crate::settings;
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;
-pub use node_id::{
-    generate_node_id, generate_node_id_from_socket_addr, generate_node_id_from_url,
-    validate_node_id, NodeId,
-};
+pub use node_id::{NodeId, NodeName};
 pub use single_node::SingleNode;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27,7 +25,7 @@ pub struct CheckCallsResponse {
 
 #[async_trait]
 pub trait Node {
-    async fn new(node_id: NodeId, settings: settings::Settings) -> Result<Self>
+    async fn new(settings: settings::Settings) -> Result<Self>
     where
         Self: Sized;
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse>;
@@ -67,30 +65,25 @@ pub enum NodeWrapper {
 
 impl NodeWrapper {
     pub async fn new(settings: settings::Settings) -> Result<Self> {
-        let node_id = settings.node_id();
         // A rate_limiter holds all rate-limiting data in memory: no data persisted to disk!
         if settings.topology.is_empty() {
             Ok(Self::Single(Arc::new(
-                SingleNode::new(node_id, settings).await?,
+                SingleNode::new(settings).await?,
             )))
         } else {
             match settings.run_mode {
                 settings::RunMode::Single => Ok(Self::Single(Arc::new(
-                    SingleNode::new(node_id, settings).await?,
+                    SingleNode::new(settings).await?,
                 ))),
                 settings::RunMode::Gossip => {
-                    warn!("[Node<{}>] Gossip mode is experimental!", node_id);
-                    // Use GossipNode instead of broken MultiNode
-                    let gossip_node = Arc::new(GossipNode::new(node_id, settings).await?);
+                    warn!("Gossip mode is experimental!");
+                    let gossip_node = Arc::new(GossipNode::new(settings).await?);
                     Ok(Self::Gossip(gossip_node))
                 }
                 settings::RunMode::Hashring => {
                     // Build hashring node
-                    let hashring_node = HashringNode::new(node_id, settings).await?;
+                    let hashring_node = HashringNode::new(settings).await?;
                     let hashring_arc = Arc::new(hashring_node);
-
-                    // Background replication sync is now handled by the controller
-
                     Ok(Self::Hashring(hashring_arc))
                 }
             }
@@ -166,7 +159,7 @@ impl NodeWrapper {
     }
 
     // Cluster-specific methods (only for gossip and hashring nodes)
-    pub async fn handle_export_buckets(&self) -> Result<crate::cluster::BucketExport> {
+    pub async fn handle_export_buckets(&self) -> Result<messages::BucketExport> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't support bucket export".to_string(),
@@ -178,7 +171,7 @@ impl NodeWrapper {
 
     pub async fn handle_import_buckets(
         &self,
-        import_data: crate::cluster::BucketExport,
+        import_data: messages::BucketExport,
     ) -> Result<()> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
@@ -189,7 +182,7 @@ impl NodeWrapper {
         }
     }
 
-    pub async fn handle_cluster_health(&self) -> Result<crate::cluster::StatusResponse> {
+    pub async fn handle_cluster_health(&self) -> Result<messages::StatusResponse> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't provide cluster health".to_string(),
@@ -199,7 +192,7 @@ impl NodeWrapper {
         }
     }
 
-    pub async fn handle_get_topology(&self) -> Result<crate::cluster::TopologyResponse> {
+    pub async fn handle_get_topology(&self) -> Result<messages::TopologyResponse> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't have topology".to_string(),
@@ -211,8 +204,8 @@ impl NodeWrapper {
 
     pub async fn handle_new_topology(
         &self,
-        request: crate::cluster::TopologyChangeRequest,
-    ) -> Result<crate::cluster::TopologyResponse> {
+        request: messages::TopologyChangeRequest,
+    ) -> Result<messages::TopologyResponse> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't support topology changes".to_string(),

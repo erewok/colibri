@@ -1,11 +1,10 @@
 //! UDP Socket Pool
 //!
 //! Manages a pool of UDP sockets for each peer in the cluster.
-//! Provides load balancing and fault tolerance through socket rotation.
 use rand::Rng;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -47,12 +46,7 @@ impl UdpSocketPool {
             peers.insert(*peer_addr, Arc::new(Mutex::new(socket)));
         }
 
-        let stats = Arc::new(SocketPoolStats {
-            peer_count: AtomicUsize::new(peers.len()),
-            total_sockets: AtomicUsize::new(peers.len()),
-            messages_sent: AtomicU64::new(0),
-            send_errors: AtomicU64::new(0),
-        });
+        let stats = Arc::new(SocketPoolStats::new(peers.len()));
 
         Ok(Self {
             node_id,
@@ -74,7 +68,10 @@ impl UdpSocketPool {
                 Ok(target)
             }
             Err(e) => {
-                self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .errors
+                    .send_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 error!("[{}] Failed to send UDP data: {}", target, e);
                 Err(ColibriError::Io(e))
             }
@@ -137,7 +134,7 @@ impl UdpSocketPool {
             .peer_count
             .store(self.peers.len(), Ordering::Relaxed);
         self.stats
-            .total_sockets
+            .total_connections
             .fetch_add(pool_size, Ordering::Relaxed);
         Ok(())
     }
@@ -154,13 +151,8 @@ impl UdpSocketPool {
     }
 
     /// Get socket pool statistics
-    pub fn get_stats(&self) -> SocketPoolStats {
-        SocketPoolStats {
-            peer_count: AtomicUsize::new(self.stats.peer_count.load(Ordering::Relaxed)),
-            total_sockets: AtomicUsize::new(self.stats.total_sockets.load(Ordering::Relaxed)),
-            messages_sent: AtomicU64::new(self.stats.messages_sent.load(Ordering::Relaxed)),
-            send_errors: AtomicU64::new(self.stats.send_errors.load(Ordering::Relaxed)),
-        }
+    pub fn get_stats(&self) -> &SocketPoolStats {
+        &self.stats
     }
 }
 

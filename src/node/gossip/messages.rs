@@ -13,7 +13,7 @@ use crdts::VClock;
 use tokio::sync::oneshot;
 
 use crate::limiters::distributed_bucket::DistributedBucketExternal;
-use crate::node::{CheckCallsResponse, NodeId};
+use crate::node::NodeId;
 
 /// Gossip message types for production delta-state protocol
 #[derive(Debug, Clone, Decode, Encode)]
@@ -125,77 +125,22 @@ impl GossipPacket {
     }
 }
 
-pub enum GossipCommand {
-    ExpireKeys,
-    CheckLimit {
-        client_id: String,
-        resp_chan: oneshot::Sender<crate::error::Result<CheckCallsResponse>>,
-    },
-    RateLimit {
-        client_id: String,
-        resp_chan: oneshot::Sender<crate::error::Result<Option<CheckCallsResponse>>>,
-    },
-    GossipMessageReceived {
-        data: bytes::Bytes,
-        peer_addr: SocketAddr,
-    },
 
-    // Rate limit configuration commands
-    CreateNamedRule {
-        rule_name: String,
-        settings: crate::settings::RateLimitSettings,
-        resp_chan: oneshot::Sender<crate::error::Result<()>>,
-    },
-    DeleteNamedRule {
-        rule_name: String,
-        resp_chan: oneshot::Sender<crate::error::Result<()>>,
-    },
-    GetNamedRule {
-        rule_name: String,
-        resp_chan:
-            oneshot::Sender<crate::error::Result<Option<crate::settings::NamedRateLimitRule>>>,
-    },
-    ListNamedRules {
-        resp_chan: oneshot::Sender<crate::error::Result<Vec<crate::settings::NamedRateLimitRule>>>,
-    },
-    RateLimitCustom {
-        rule_name: String,
-        key: String,
-        resp_chan: oneshot::Sender<crate::error::Result<Option<CheckCallsResponse>>>,
-    },
-    CheckLimitCustom {
-        rule_name: String,
-        key: String,
-        resp_chan: oneshot::Sender<crate::error::Result<CheckCallsResponse>>,
-    },
-    // Cluster management commands
-    GetClusterNodes {
-        resp_chan: oneshot::Sender<crate::error::Result<Vec<SocketAddr>>>,
-    },
-    AddClusterNode {
-        address: SocketAddr,
-        resp_chan: oneshot::Sender<crate::error::Result<()>>,
-    },
-    RemoveClusterNode {
-        address: SocketAddr,
-        resp_chan: oneshot::Sender<crate::error::Result<()>>,
-    },
-}
-
-impl GossipCommand {
-    pub fn from_incoming_message(data: bytes::Bytes, peer_addr: SocketAddr) -> Self {
-        GossipCommand::GossipMessageReceived { data, peer_addr }
-    }
-}
+// impl GossipCommand {
+//     pub fn from_incoming_message(data: bytes::Bytes, peer_addr: SocketAddr) -> Self {
+//         GossipCommand::GossipMessageReceived { data, peer_addr }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::NodeName;
 
     #[test]
     fn test_gossip_packet_serialization() {
         let message = GossipMessage::StateRequest {
-            requesting_node_id: NodeId::new(1),
+            requesting_node_id: NodeName::from("node-1").node_id(),
             missing_keys: None,
             response_addr: "127.0.0.1:8410".parse().unwrap(),
         };
@@ -212,7 +157,7 @@ mod tests {
                 missing_keys,
                 response_addr,
             } => {
-                assert_eq!(requesting_node_id, NodeId::new(1));
+                assert_eq!(requesting_node_id, NodeName::from("node-1").node_id());
                 assert!(missing_keys.is_none());
                 assert_eq!(response_addr, "127.0.0.1:8410".parse().unwrap());
             }

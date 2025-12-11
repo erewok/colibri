@@ -1,20 +1,20 @@
 //! Colibri application settings
-use std::collections::{HashMap, HashSet};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::node::node_id::{generate_node_id, NodeId};
+use crate::node::NodeName;
+
 
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const STANDARD_PORT_HTTP: u16 = 8410;
-pub const DEFAULT_PORT_HTTP: &str = "8410";
-pub const STANDARD_PORT_TCP: u16 = 8411;
-pub const DEFAULT_PORT_TCP: &str = "8411";
-pub const STANDARD_PORT_UDP: u16 = 8412;
-pub const DEFAULT_PORT_UDP: &str = "8412";
+pub const STANDARD_PORT_HTTP: u16 = 8411;
+pub const DEFAULT_PORT_HTTP: &str = "8411";
+pub const STANDARD_PORT_PEERS: u16 = 8412;
+pub const DEFAULT_PORT_PEERS: &str = "8412";
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Hash)]
 pub struct RateLimitSettings {
@@ -39,21 +39,19 @@ pub struct RateLimitConfig {
 
 #[derive(Clone, Debug)]
 pub struct TransportConfig {
-    pub listen_udp: SocketAddr,
-    pub topology: HashSet<SocketAddr>,
+    pub node_name: NodeName,
+    pub peer_listen_address: String,
+    pub peer_listen_port: u16,
+    pub topology: HashMap<String, String>,
 }
 
-/// Unified cluster configuration for the new architecture
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClusterConfig {
-    pub node_id: Option<NodeId>,
-    pub listen_address: String,
-    pub bootstrap_nodes: Vec<String>,
-    pub failure_timeout_seconds: Option<u64>,
-    pub health_check_interval_seconds: Option<u64>,
+impl TransportConfig {
+    pub fn peer_listen_url(&self) -> SocketAddr {
+        format!("{}:{}", self.peer_listen_address, self.peer_listen_port).parse().expect("Invalid socket address")
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub enum RunMode {
     Gossip,
     Hashring,
@@ -142,17 +140,22 @@ impl RateLimitConfig {
 
 #[derive(Clone, Debug)]
 pub struct Settings {
+    pub server_name: String,
+
+    // Config file path
+    pub config_file: Option<PathBuf>,
+
     // Server listen address
-    pub listen_address: String,
+    pub client_listen_address: String,
 
     // HTTP API listen port
-    pub listen_port_api: u16,
+    pub client_listen_port: u16,
 
-    // TCP Hashring listen port
-    pub listen_port_tcp: u16,
+    // Listen URL for Peer communcation
+    pub peer_listen_address: String,
 
-    // UDP listen port for Gossip
-    pub listen_port_udp: u16,
+    // Listen Port for Peer communication
+    pub peer_listen_port: u16,
 
     // Rate limit settings: max calls (over interval)
     pub rate_limit_max_calls_allowed: u32,
@@ -163,38 +166,28 @@ pub struct Settings {
     // Mode of multi-node operation
     pub run_mode: RunMode,
 
+    // Cluster configuration information: topology
+    pub topology: HashMap<String, String>,
+
     // Gossip Configuration
     pub gossip_interval_ms: u64, // Regular gossip interval (default: 25)
     pub gossip_fanout: usize,    // Number of peers per gossip round (default: 4)
 
-    // Cluster configuration information: topology
-    pub topology: HashSet<String>,
-    // Cluster Configuration
-    pub failure_timeout_secs: u64, // Node failure detection timeout (default: 30)
     // Hashring replication factor
     pub hash_replication_factor: usize,
 }
 
 impl Settings {
-    pub fn node_id(&self) -> NodeId {
-        generate_node_id(&self.listen_address, self.listen_port_api)
+    pub fn node_name(&self) -> NodeName {
+        self.server_name.clone().into()
     }
 
     pub fn transport_config(&self) -> TransportConfig {
-        let listen_udp = format!("{}:{}", self.listen_address, self.listen_port_udp)
-            .to_socket_addrs()
-            .unwrap()
-            .next()
-            .unwrap();
-        let topology: HashSet<SocketAddr> = self
-            .topology
-            .iter()
-            .filter_map(|addr_str| addr_str.to_socket_addrs().ok())
-            .flatten()
-            .collect();
         TransportConfig {
-            listen_udp,
-            topology,
+            node_name: self.node_name(),
+            peer_listen_address: self.peer_listen_address.clone(),
+            peer_listen_port: self.peer_listen_port,
+            topology: self.topology.clone(),
         }
     }
 
@@ -203,5 +196,39 @@ impl Settings {
             rate_limit_max_calls_allowed: self.rate_limit_max_calls_allowed,
             rate_limit_interval_seconds: self.rate_limit_interval_seconds,
         }
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    pub fn sample() -> Settings {
+        Settings {
+            config_file: None,
+            server_name: "test-node".to_string(),
+            client_listen_address: "127.0.0.1".to_string(),
+            client_listen_port: 8411,
+            peer_listen_address: "127.0.0.1".to_string(),
+            peer_listen_port: 8412,
+            rate_limit_max_calls_allowed: 100,
+            rate_limit_interval_seconds: 60,
+            run_mode: RunMode::Gossip,
+            gossip_interval_ms: 1000, // Longer for testing
+            gossip_fanout: 3,
+            topology: HashMap::new(), // Empty topology for simple tests
+            hash_replication_factor: 1,
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_token_rate() {
+        let settings = RateLimitSettings {
+            rate_limit_max_calls_allowed: 120,
+            rate_limit_interval_seconds: 60,
+        };
+
+        assert_eq!(settings.token_rate_seconds(), 2.0);
+        assert_eq!(settings.token_rate_milliseconds(), 0.002);
     }
 }

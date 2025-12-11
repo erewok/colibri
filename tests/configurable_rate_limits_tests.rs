@@ -26,6 +26,7 @@ fn setup() {
 fn create_test_settings() -> Settings {
     setup();
     Settings {
+        config_file: None,
         listen_address: "127.0.0.1".to_string(),
         listen_port_api: 8410,
         listen_port_tcp: 8411,
@@ -36,7 +37,6 @@ fn create_test_settings() -> Settings {
         gossip_interval_ms: 1000,
         gossip_fanout: 3,
         topology: HashSet::new(), // Empty topology for single node
-        failure_timeout_secs: 30,
         hash_replication_factor: 1,
     }
 }

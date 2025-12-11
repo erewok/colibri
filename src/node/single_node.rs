@@ -6,13 +6,13 @@ use tracing::info;
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::token_bucket;
-use crate::node::{CheckCallsResponse, Node, NodeId};
+use crate::node::{CheckCallsResponse, Node, NodeName};
 use crate::settings::{NamedRateLimitRule, RateLimitConfig, RateLimitSettings, Settings};
 
 /// Standalone rate limiter node
 #[derive(Clone, Debug)]
 pub struct SingleNode {
-    pub node_id: NodeId,
+    pub node_name: NodeName,
     pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
     pub rate_limit_config: Arc<RwLock<RateLimitConfig>>,
     pub named_rate_limiters:
@@ -21,20 +21,21 @@ pub struct SingleNode {
 
 #[async_trait]
 impl Node for SingleNode {
-    async fn new(node_id: NodeId, settings: Settings) -> Result<Self>
+    async fn new(settings: Settings) -> Result<Self>
     where
         Self: Sized,
     {
-        let listen_api = format!("{}:{}", settings.listen_address, settings.listen_port_api);
+        let node_name: NodeName = settings.server_name.clone().into();
+        let listen_api = format!("{}:{}", settings.client_listen_address, settings.client_listen_port);
         info!(
             "[Node<{}>] Starting at {} in single-node mode",
-            node_id, listen_api
+            node_name, listen_api
         );
         let rate_limiter: token_bucket::TokenBucketLimiter =
-            token_bucket::TokenBucketLimiter::new(node_id, settings.rate_limit_settings());
+            token_bucket::TokenBucketLimiter::new(settings.rate_limit_settings());
         let rate_limit_config = RateLimitConfig::new(settings.rate_limit_settings());
         Ok(Self {
-            node_id,
+            node_name,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(RwLock::new(rate_limit_config)),
             named_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
@@ -84,12 +85,12 @@ impl Node for SingleNode {
         }
 
         // Create a new rate limiter for this rule
-        let limiter = token_bucket::TokenBucketLimiter::new(self.node_id, settings);
+        let limiter = token_bucket::TokenBucketLimiter::new(settings);
 
         let mut limiters = self.named_rate_limiters.write().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
         })?;
-        limiters.insert(rule_name, Arc::new(Mutex::new(limiter)));
+        limiters.insert(rule_name.clone(), Arc::new(Mutex::new(limiter)));
 
         Ok(())
     }

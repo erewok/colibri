@@ -7,6 +7,7 @@ mod udp_transport_tests {
 
     fn test_settings_gossip(port_offset: u16) -> Settings {
         Settings {
+            config_file: None,
             listen_address: "127.0.0.1".to_string(),
             listen_port_api: 8500 + port_offset,
             listen_port_tcp: 8501 + port_offset,
@@ -17,7 +18,6 @@ mod udp_transport_tests {
             gossip_interval_ms: 100,
             gossip_fanout: 2,
             topology: HashSet::new(),
-            failure_timeout_secs: 5,
             hash_replication_factor: 1,
         }
     }
@@ -27,6 +27,7 @@ mod udp_transport_tests {
         topology.insert(format!("127.0.0.1:{}", 8512 + port_offset)); // Add this node's UDP address to topology
 
         Settings {
+            config_file: None,
             listen_address: "127.0.0.1".to_string(),
             listen_port_api: 8510 + port_offset,
             listen_port_tcp: 8511 + port_offset,
@@ -37,7 +38,6 @@ mod udp_transport_tests {
             gossip_interval_ms: 100,
             gossip_fanout: 2,
             topology,
-            failure_timeout_secs: 5,
             hash_replication_factor: 1,
         }
     }

@@ -10,4 +10,4 @@ pub mod messages;
 
 pub use controller::GossipController;
 pub use gossip_node::GossipNode;
-pub use messages::{GossipCommand, GossipMessage, GossipPacket};
+pub use messages::{GossipMessage, GossipPacket};

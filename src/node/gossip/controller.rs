@@ -6,10 +6,10 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{debug, error, info};
 
-use super::{GossipCommand, GossipMessage, GossipPacket};
+use super::{GossipMessage, GossipPacket};
 use crate::error::{ColibriError, Result};
 use crate::limiters::distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter};
-use crate::node::{CheckCallsResponse, NodeId, NodeName, node_id};
+use crate::node::{CheckCallsResponse, NodeId, NodeName, commands::ClusterCommand};
 use crate::settings;
 
 /// A gossip-based node that maintains all client state locally
@@ -96,7 +96,7 @@ impl GossipController {
     }
 
     /// Handle messages and periodic gossip in an async loop
-    pub async fn start(&self, mut gossip_command_rx: mpsc::Receiver<GossipCommand>) {
+    pub async fn start(&self, mut gossip_command_rx: mpsc::Receiver<ClusterMessage>) {
         info!(
             "[{}] Starting central IO loop with {}ms gossip interval",
             self.node_name.as_str(), self.gossip_interval_ms
@@ -173,16 +173,16 @@ impl GossipController {
             .map(|rl| rl.gossip_delta_state())
     }
     /// Handle incoming gossip cmd from our channel
-    pub async fn handle_command(&self, cmd: GossipCommand) -> Result<()> {
+    pub async fn handle_command(&self, cmd: ClusterMessage) -> Result<()> {
         match cmd {
-            GossipCommand::ExpireKeys => {
+            ClusterMessage::ExpireKeys => {
                 self.rate_limiter
                     .lock()
                     .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))
                     .map(|mut rl| rl.expire_keys())?;
                 Ok(())
             }
-            GossipCommand::GossipMessageReceived { data, peer_addr } => {
+            ClusterMessage:: { data, peer_addr } => {
                 self.process_gossip_packet(data, peer_addr).await
             }
             GossipCommand::CheckLimit {

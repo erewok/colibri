@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 use crate::cluster::ClusterMember;
 use crate::error::{ColibriError, Result};
+use crate::node::commands::{AdminCommand, AdminResponse};
 use crate::transport::SendReceiveStats;
 
 /// Administrative command dispatcher

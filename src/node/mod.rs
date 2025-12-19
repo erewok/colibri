@@ -1,35 +1,32 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 pub mod gossip;
 pub mod hashring;
+pub mod commands;
 pub mod messages;
 pub mod node_id;
 pub mod single_node;
 
-use crate::error::Result;
+use crate::{error::Result, node::commands::AdminResponse};
 use crate::settings;
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;
+pub use commands::ClusterCommand;
+pub use messages::{CheckCallsResponse, StatusResponse, TopologyChangeRequest, TopologyResponse};
 pub use node_id::{NodeId, NodeName};
 pub use single_node::SingleNode;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CheckCallsResponse {
-    pub client_id: String,
-    pub calls_remaining: u32,
-}
 
 #[async_trait]
 pub trait Node {
     async fn new(settings: settings::Settings) -> Result<Self>
     where
         Self: Sized;
-    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse>;
-    async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>>;
+    async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>>;
+    async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>>;
     async fn expire_keys(&self) -> Result<()>;
 
     // New methods for named rules
@@ -46,14 +43,16 @@ pub trait Node {
     ) -> Result<Option<settings::NamedRateLimitRule>>;
     async fn rate_limit_custom(
         &self,
+        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<CheckCallsResponse>>;
     async fn check_limit_custom(
         &self,
+        request_id: u64,
         rule_name: String,
         key: String,
-    ) -> Result<CheckCallsResponse>;
+    ) -> Result<Option<CheckCallsResponse>>;
 }
 
 #[derive(Clone, Debug)]
@@ -109,12 +108,12 @@ impl NodeWrapper {
         self.get_node_ref().expire_keys().await
     }
 
-    pub async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
-        self.get_node_ref().check_limit(client_id).await
+    pub async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+        self.get_node_ref().check_limit(request_id, client_id).await
     }
 
-    pub async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        self.get_node_ref().rate_limit(client_id).await
+    pub async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+        self.get_node_ref().rate_limit(request_id, client_id).await
     }
 
     pub async fn create_named_rule(
@@ -144,22 +143,24 @@ impl NodeWrapper {
 
     pub async fn rate_limit_custom(
         &self,
+        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
-        self.get_node_ref().rate_limit_custom(rule_name, key).await
+        self.get_node_ref().rate_limit_custom(request_id, rule_name, key).await
     }
 
     pub async fn check_limit_custom(
         &self,
+        request_id: u64,
         rule_name: String,
         key: String,
-    ) -> Result<CheckCallsResponse> {
-        self.get_node_ref().check_limit_custom(rule_name, key).await
+    ) -> Result<Option<CheckCallsResponse>> {
+        self.get_node_ref().check_limit_custom(request_id, rule_name, key).await
     }
 
     // Cluster-specific methods (only for gossip and hashring nodes)
-    pub async fn handle_export_buckets(&self) -> Result<messages::BucketExport> {
+    pub async fn handle_export_buckets(&self) -> Result<commands::BucketExport> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't support bucket export".to_string(),
@@ -171,7 +172,7 @@ impl NodeWrapper {
 
     pub async fn handle_import_buckets(
         &self,
-        import_data: messages::BucketExport,
+        import_data: commands::BucketExport,
     ) -> Result<()> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
@@ -182,7 +183,7 @@ impl NodeWrapper {
         }
     }
 
-    pub async fn handle_cluster_health(&self) -> Result<messages::StatusResponse> {
+    pub async fn handle_cluster_health(&self) -> Result<StatusResponse> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't provide cluster health".to_string(),
@@ -192,7 +193,7 @@ impl NodeWrapper {
         }
     }
 
-    pub async fn handle_get_topology(&self) -> Result<messages::TopologyResponse> {
+    pub async fn handle_get_topology(&self) -> Result<TopologyResponse> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't have topology".to_string(),
@@ -204,8 +205,8 @@ impl NodeWrapper {
 
     pub async fn handle_new_topology(
         &self,
-        request: messages::TopologyChangeRequest,
-    ) -> Result<messages::TopologyResponse> {
+        request: TopologyChangeRequest,
+    ) -> Result<TopologyResponse> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't support topology changes".to_string(),

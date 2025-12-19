@@ -6,7 +6,8 @@ use tracing::{error, info};
 
 use super::HashringController;
 use crate::error::{ColibriError, Result};
-use crate::node::{CheckCallsResponse, Node, NodeName, messages::{BucketExport, ClusterMessage}};
+use crate::node::commands::AdminCommand;
+use crate::node::{CheckCallsResponse, Node, NodeName, commands::{BucketExport, ClusterCommand, TopologyChangeRequest, TopologyResponse, StatusResponse}};
 use crate::{settings, transport};
 
 /// Replication factor for data distribution
@@ -24,7 +25,7 @@ pub struct HashringNode {
     pub node_name: NodeName,
 
     /// Command sender to the controller
-    pub hashring_command_tx: Arc<tokio::sync::mpsc::Sender<ClusterMessage>>,
+    pub hashring_command_tx: Arc<tokio::sync::mpsc::Sender<ClusterCommand>>,
 
     /// Controller handle
     pub controller_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -37,7 +38,7 @@ impl HashringNode {
     /// Run the TCP Receiver
     async fn run_receiver(
         listen_tcp: std::net::SocketAddr,
-        hashring_command_tx: Arc<tokio::sync::mpsc::Sender<ClusterMessage>>,
+        hashring_command_tx: Arc<tokio::sync::mpsc::Sender<ClusterCommand>>,
     ) -> Result<()> {
         let (tcp_send, mut tcp_recv) = tokio::sync::mpsc::channel(1000);
         let receiver = transport::TcpReceiver::new(listen_tcp, Arc::new(tcp_send)).await?;
@@ -50,8 +51,8 @@ impl HashringNode {
             // Handle incoming messages from network
             if let Some((data, peer_addr)) = tcp_recv.recv().await {
                 todo!();
-                // // Turn into ClusterMessage and send to main loop
-                // let cmd = ClusterMessage::from_incoming_message(data, peer_addr);
+                // // Turn into ClusterCommand and send to main loop
+                // let cmd = ClusterCommand::from_incoming_message(data, peer_addr);
                 // if let Err(e) = hashring_command_tx.send(cmd).await {
                 //     debug!("Failed to send incoming message to main loop: {}", e);
                 // }
@@ -129,8 +130,8 @@ impl Node for HashringNode {
 
         // Set up command channel
         let (hashring_command_tx, hashring_command_rx): (
-            tokio::sync::mpsc::Sender<ClusterMessage>,
-            tokio::sync::mpsc::Receiver<ClusterMessage>,
+            tokio::sync::mpsc::Sender<ClusterCommand>,
+            tokio::sync::mpsc::Receiver<ClusterCommand>,
         ) = tokio::sync::mpsc::channel(1000);
 
         let hashring_command_tx = Arc::new(hashring_command_tx);
@@ -164,7 +165,7 @@ impl Node for HashringNode {
     async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::CheckLimit {
+            .send(ClusterCommand::CheckLimit {
                 client_id,
                 resp_chan: tx,
             })
@@ -182,7 +183,7 @@ impl Node for HashringNode {
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::RateLimit {
+            .send(ClusterCommand::RateLimit {
                 client_id,
                 resp_chan: tx,
             })
@@ -199,7 +200,7 @@ impl Node for HashringNode {
 
     async fn expire_keys(&self) -> Result<()> {
         self.hashring_command_tx
-            .send(ClusterMessage::ExpireKeys)
+            .send(ClusterCommand::ExpireKeys)
             .await
             .map_err(|e| ColibriError::Transport(format!("Failed expiring keys {}", e)))?;
         Ok(())
@@ -212,7 +213,7 @@ impl Node for HashringNode {
     ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::CreateNamedRule {
+            .send(ClusterCommand::CreateNamedRule {
                 rule_name,
                 settings,
                 resp_chan: tx,
@@ -232,7 +233,7 @@ impl Node for HashringNode {
     async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::DeleteNamedRule {
+            .send(ClusterCommand::DeleteNamedRule {
                 rule_name,
                 resp_chan: tx,
             })
@@ -251,7 +252,7 @@ impl Node for HashringNode {
     async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::ListNamedRules { resp_chan: tx })
+            .send(ClusterCommand::ListNamedRules { resp_chan: tx })
             .await
             .map_err(|e| {
                 ColibriError::Transport(format!("Failed sending list_named_rules command {}", e))
@@ -270,7 +271,7 @@ impl Node for HashringNode {
     ) -> Result<Option<settings::NamedRateLimitRule>> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::GetNamedRule {
+            .send(ClusterCommand::GetNamedRule {
                 rule_name,
                 resp_chan: tx,
             })
@@ -293,7 +294,7 @@ impl Node for HashringNode {
     ) -> Result<Option<CheckCallsResponse>> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::RateLimitCustom {
+            .send(ClusterCommand::RateLimitCustom {
                 rule_name,
                 key,
                 resp_chan: tx,
@@ -317,7 +318,7 @@ impl Node for HashringNode {
     ) -> Result<CheckCallsResponse> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::CheckLimitCustom {
+            .send(ClusterCommand::CheckLimitCustom {
                 rule_name,
                 key,
                 resp_chan: tx,
@@ -340,7 +341,7 @@ impl HashringNode {
     pub async fn handle_export_buckets(&self) -> Result<BucketExport> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::ExportBuckets { resp_chan: tx })
+            .send(AdminCommand::ExportBuckets)
             .await
             .map_err(|e| {
                 ColibriError::Transport(format!("Failed sending export_buckets command {}", e))
@@ -359,8 +360,8 @@ impl HashringNode {
     ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::ImportBuckets {
-                import_data,
+            .send(AdminCommand::ImportBuckets {
+                data: import_data,
                 resp_chan: tx,
             })
             .await
@@ -378,7 +379,7 @@ impl HashringNode {
     pub async fn handle_cluster_health(&self) -> Result<StatusResponse> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::ClusterHealth { resp_chan: tx })
+            .send(ClusterCommand::ClusterHealth { resp_chan: tx })
             .await
             .map_err(|e| {
                 ColibriError::Transport(format!("Failed sending cluster_health command {}", e))
@@ -394,7 +395,7 @@ impl HashringNode {
     pub async fn handle_get_topology(&self) -> Result<TopologyResponse> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::GetTopology { resp_chan: tx })
+            .send(ClusterCommand::GetTopology { resp_chan: tx })
             .await
             .map_err(|e| {
                 ColibriError::Transport(format!("Failed sending get_topology command {}", e))
@@ -409,11 +410,11 @@ impl HashringNode {
 
     pub async fn handle_new_topology(
         &self,
-        request: crate::cluster::TopologyChangeRequest,
-    ) -> Result<crate::cluster::TopologyResponse> {
+        request: TopologyChangeRequest,
+    ) -> Result<TopologyResponse> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
-            .send(ClusterMessage::NewTopology {
+            .send(ClusterCommand::NewTopology {
                 request,
                 resp_chan: tx,
             })

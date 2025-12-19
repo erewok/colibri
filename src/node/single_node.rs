@@ -41,20 +41,74 @@ impl Node for SingleNode {
             named_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
         })
     }
-    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
-        local_check_limit(client_id, self.rate_limiter.clone()).await
+    async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+        local_check_limit(request_id, None, client_id, self.rate_limiter.clone()).await
     }
 
-    async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        local_rate_limit(client_id, self.rate_limiter.clone()).await
+    async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+        local_rate_limit(request_id, client_id, self.rate_limiter.clone()).await
     }
 
-    async fn expire_keys(&self) -> Result<()> {
-        let mut rate_limiter = self.rate_limiter.lock().map_err(|e| {
-            ColibriError::Concurrency(format!("Failed to acquire rate_limiter lock: {}", e))
-        })?;
-        rate_limiter.expire_keys();
-        Ok(())
+    async fn rate_limit_custom(
+        &self,
+        request_id: u64,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
+        // Get the settings for this rule
+        let settings = {
+            let config = self.rate_limit_config.read().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            match config.get_named_rule_settings(&rule_name) {
+                Some(settings) => settings.clone(),
+                None => return Err(ColibriError::Api(format!("Rule '{}' not found", rule_name))),
+            }
+        };
+
+        // Get the limiter for this rule
+        let rate_limiter = {
+            let limiters = self.named_rate_limiters.read().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            match limiters.get(&rule_name) {
+                Some(limiter) => limiter.clone(),
+                None => {
+                    return Err(ColibriError::Api(format!(
+                        "Limiter for rule '{}' not found",
+                        rule_name
+                    )))
+                }
+            }
+        };
+
+        // Use the custom limiter with custom settings
+        local_rate_limit_with_settings(request_id, key, rule_name, rate_limiter, &settings).await
+    }
+
+    async fn check_limit_custom(
+        &self,
+        request_id: u64,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
+        // Get the limiter for this rule
+        let rate_limiter = {
+            let limiters = self.named_rate_limiters.read().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            match limiters.get(&rule_name) {
+                Some(limiter) => limiter.clone(),
+                None => {
+                    return Err(ColibriError::Api(format!(
+                        "Limiter for rule '{}' not found",
+                        rule_name
+                    )))
+                }
+            }
+        };
+
+        local_check_limit(request_id, Some(rule_name), key, rate_limiter).await
     }
 
     async fn create_named_rule(
@@ -135,71 +189,22 @@ impl Node for SingleNode {
         Ok(config.list_named_rules())
     }
 
-    async fn rate_limit_custom(
-        &self,
-        rule_name: String,
-        key: String,
-    ) -> Result<Option<CheckCallsResponse>> {
-        // Get the settings for this rule
-        let settings = {
-            let config = self.rate_limit_config.read().map_err(|e| {
-                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
-            })?;
-            match config.get_named_rule_settings(&rule_name) {
-                Some(settings) => settings.clone(),
-                None => return Err(ColibriError::Api(format!("Rule '{}' not found", rule_name))),
-            }
-        };
-
-        // Get the limiter for this rule
-        let rate_limiter = {
-            let limiters = self.named_rate_limiters.read().map_err(|e| {
-                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
-            })?;
-            match limiters.get(&rule_name) {
-                Some(limiter) => limiter.clone(),
-                None => {
-                    return Err(ColibriError::Api(format!(
-                        "Limiter for rule '{}' not found",
-                        rule_name
-                    )))
-                }
-            }
-        };
-
-        // Use the custom limiter with custom settings
-        local_rate_limit_with_settings(key, rate_limiter, &settings).await
+    async fn expire_keys(&self) -> Result<()> {
+        let mut rate_limiter = self.rate_limiter.lock().map_err(|e| {
+            ColibriError::Concurrency(format!("Failed to acquire rate_limiter lock: {}", e))
+        })?;
+        rate_limiter.expire_keys();
+        Ok(())
     }
 
-    async fn check_limit_custom(
-        &self,
-        rule_name: String,
-        key: String,
-    ) -> Result<CheckCallsResponse> {
-        // Get the limiter for this rule
-        let rate_limiter = {
-            let limiters = self.named_rate_limiters.read().map_err(|e| {
-                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
-            })?;
-            match limiters.get(&rule_name) {
-                Some(limiter) => limiter.clone(),
-                None => {
-                    return Err(ColibriError::Api(format!(
-                        "Limiter for rule '{}' not found",
-                        rule_name
-                    )))
-                }
-            }
-        };
-
-        local_check_limit(key, rate_limiter).await
-    }
 }
 
 pub async fn local_check_limit(
+    request_id: u64,
+    rule_name: Option<String>,
     client_id: String,
     rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
-) -> Result<CheckCallsResponse> {
+) -> Result<Option<CheckCallsResponse>> {
     match rate_limiter.lock() {
         Err(e) => {
             tracing::error!("Failed to acquire rate_limiter lock: {}", e);
@@ -209,15 +214,18 @@ pub async fn local_check_limit(
         }
         Ok(rate_limiter) => {
             let calls_remaining = rate_limiter.check_calls_remaining_for_client(client_id.as_str());
-            Ok(CheckCallsResponse {
+            Ok(Some(CheckCallsResponse {
+                request_id,
                 client_id,
                 calls_remaining,
-            })
+                rule_name,
+            }))
         }
     }
 }
 
 pub async fn local_rate_limit(
+    request_id: u64,
     client_id: String,
     rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
 ) -> Result<Option<CheckCallsResponse>> {
@@ -235,8 +243,10 @@ pub async fn local_rate_limit(
                     Ok(None)
                 } else {
                     Ok(Some(CheckCallsResponse {
+                        request_id,
                         client_id,
                         calls_remaining,
+                        rule_name: None,
                     }))
                 }
             } else {
@@ -247,7 +257,9 @@ pub async fn local_rate_limit(
 }
 
 pub async fn local_rate_limit_with_settings(
+    request_id: u64,
     client_id: String,
+    rule_name: String,
     rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
     settings: &RateLimitSettings,
 ) -> Result<Option<CheckCallsResponse>> {
@@ -263,8 +275,10 @@ pub async fn local_rate_limit_with_settings(
                 rate_limiter.limit_calls_for_client_with_settings(client_id.to_string(), settings);
             if let Some(calls_remaining) = calls_left {
                 Ok(Some(CheckCallsResponse {
-                    client_id,
+                    request_id,
                     calls_remaining,
+                    client_id,
+                    rule_name: Some(rule_name),
                 }))
             } else {
                 Ok(None)

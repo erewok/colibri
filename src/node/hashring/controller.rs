@@ -5,14 +5,16 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use super::consistent_hashing;
-use super::messages;
+use crate::cluster::ClusterMember;
 use crate::error::{ColibriError, Result};
 use crate::limiters::token_bucket::TokenBucketLimiter;
+use crate::node::commands::{AdminCommand, AdminResponse, BucketExport, ExportMetadata, Status, StatusResponse, TopologyChangeRequest, TopologyResponse};
 use crate::node::{
-    single_node::local_check_limit, single_node::local_rate_limit, CheckCallsResponse, NodeName,
+    single_node::local_check_limit, single_node::local_rate_limit, CheckCallsResponse, ClusterCommand, NodeName,
 };
-use crate::settings;
+use crate::settings::{self, RunMode};
+
+use super::consistent_hashing;
 
 /// Controller for consistent hash ring distributed rate limiter
 /// Handles all communication and cluster coordination
@@ -78,7 +80,7 @@ impl HashringController {
     }
 
     /// Start the main controller loop
-    pub async fn start(self, mut command_rx: mpsc::Receiver<messages::HashringCommand>) {
+    pub async fn start(self, mut command_rx: mpsc::Receiver<ClusterCommand>) {
         info!("HashringController started for node {}", self.node_name);
 
         while let Some(command) = command_rx.recv().await {
@@ -93,26 +95,26 @@ impl HashringController {
         info!("HashringController stopped for node {}", self.node_name);
     }
 
-    async fn handle_command(&self, command: messages::HashringCommand) -> Result<()> {
+    async fn handle_command(&self, command: ClusterCommand) -> Result<()> {
         match command {
-            messages::HashringCommand::CheckLimit {
-                client_id,
+            ClusterCommand::CheckLimit {
+                request,
                 resp_chan,
             } => {
-                let result = self.handle_check_limit(client_id).await;
+                let result = self.handle_check_limit(request.client_id).await;
                 let _ = resp_chan.send(result);
             }
-            messages::HashringCommand::RateLimit {
-                client_id,
+            ClusterCommand::RateLimit {
+                request,
                 resp_chan,
             } => {
-                let result = self.handle_rate_limit(client_id).await;
+                let result = self.handle_rate_limit(request.client_id).await;
                 let _ = resp_chan.send(result);
             }
-            messages::HashringCommand::ExpireKeys => {
+            ClusterCommand::ExpireKeys => {
                 self.handle_expire_keys().await?;
             }
-            messages::HashringCommand::CreateNamedRule {
+            ClusterCommand::CreateNamedRule {
                 rule_name,
                 settings,
                 resp_chan,
@@ -120,41 +122,25 @@ impl HashringController {
                 let result = self.handle_create_named_rule(rule_name, settings).await;
                 let _ = resp_chan.send(result);
             }
-            messages::HashringCommand::DeleteNamedRule {
+            ClusterCommand::DeleteNamedRule {
                 rule_name,
                 resp_chan,
             } => {
                 let result = self.handle_delete_named_rule(rule_name).await;
                 let _ = resp_chan.send(result);
             }
-            messages::HashringCommand::ListNamedRules { resp_chan } => {
+            ClusterCommand::ListNamedRules { resp_chan } => {
                 let result = self.handle_list_named_rules().await;
                 let _ = resp_chan.send(result);
             }
-            messages::HashringCommand::GetNamedRule {
+            ClusterCommand::GetNamedRule {
                 rule_name,
                 resp_chan,
             } => {
                 let result = self.handle_get_named_rule(rule_name).await;
                 let _ = resp_chan.send(result);
             }
-            messages::HashringCommand::RateLimitCustom {
-                rule_name,
-                key,
-                resp_chan,
-            } => {
-                let result = self.handle_rate_limit_custom(rule_name, key).await;
-                let _ = resp_chan.send(result);
-            }
-            messages::HashringCommand::CheckLimitCustom {
-                rule_name,
-                key,
-                resp_chan,
-            } => {
-                let result = self.handle_check_limit_custom(rule_name, key).await;
-                let _ = resp_chan.send(result);
-            }
-            messages::HashringCommand::AdminCommand {
+            ClusterCommand::AdminCommand {
                 command,
                 source,
                 resp_chan,
@@ -162,43 +148,20 @@ impl HashringController {
                 let result = self.handle_admin_command(command, source).await;
                 let _ = resp_chan.send(result);
             }
-            messages::HashringCommand::ExportBuckets { resp_chan } => {
-                let result = self.handle_export_buckets().await;
-                let _ = resp_chan.send(result);
-            }
-            messages::HashringCommand::ImportBuckets {
-                import_data,
-                resp_chan,
-            } => {
-                let result = self.handle_import_buckets(import_data).await;
-                let _ = resp_chan.send(result);
-            }
-            messages::HashringCommand::ClusterHealth { resp_chan } => {
-                let result = self.handle_cluster_health().await;
-                let _ = resp_chan.send(result);
-            }
-            messages::HashringCommand::GetTopology { resp_chan } => {
-                let result = self.handle_get_topology().await;
-                let _ = resp_chan.send(result);
-            }
-            messages::HashringCommand::NewTopology { request, resp_chan } => {
-                let result = self.handle_new_topology(request).await;
-                let _ = resp_chan.send(result);
-            }
         }
         Ok(())
     }
 
-    async fn handle_check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
+    async fn handle_check_limit(&self, request: CheckCallsRequest) -> Result<CheckCallsResponse> {
         // Calculate which bucket owns this client
-        let bucket = consistent_hashing::jump_consistent_hash(&client_id, self.number_of_buckets);
+        let bucket = consistent_hashing::jump_consistent_hash(&request.client_id, self.number_of_buckets);
 
         // If this is our bucket, handle locally
         if bucket == self.bucket {
-            let result = local_check_limit(client_id.clone(), self.rate_limiter.clone()).await?;
+            let result = local_check_limit(request.request_id, request.client_id.clone(), self.rate_limiter.clone()).await?;
             info!(
                 "[RATE_CHECK] client:{} bucket:{} node:{} remaining:{}",
-                client_id, bucket, self.node_name.as_str(), result.calls_remaining
+                request.client_id, bucket, self.node_name.as_str(), result.calls_remaining
             );
             return Ok(result);
         }
@@ -681,7 +644,7 @@ impl HashringController {
                 // TODO: Implement bucket import
                 Ok(AdminResponse::Ack)
             }
-            AdminCommand::GetClusterHealth => {
+            AdminCommand::HealthCheck => {
                 // TODO: Implement health check
                 Ok(AdminResponse::Error {
                     message: "Health check not yet implemented".to_string(),
@@ -696,19 +659,19 @@ impl HashringController {
         }
     }
 
-    async fn handle_export_buckets(&self) -> Result<crate::cluster::BucketExport> {
+    async fn handle_export_buckets(&self) -> Result<BucketExport> {
         // TODO: Implement actual bucket data export
         warn!("HashringController::handle_export_buckets not yet fully implemented");
 
         Ok(BucketExport {
             client_data: Vec::new(),
             metadata: ExportMetadata {
-                node_name: self.node_name.to_string(),
+                node_name: self.node_name.clone(),
                 export_timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                node_type: "hashring".to_string(),
+                node_type: RunMode::Hashring,
                 bucket_count: 1, // TODO: Get actual bucket count
             },
         })
@@ -716,31 +679,31 @@ impl HashringController {
 
     async fn handle_import_buckets(
         &self,
-        _import_data: crate::cluster::BucketExport,
+        _import_data: BucketExport,
     ) -> Result<()> {
         // TODO: Implement bucket import logic with UDP transport
         warn!("HashringController::handle_import_buckets not yet fully implemented");
         Ok(())
     }
 
-    async fn handle_cluster_health(&self) -> Result<crate::cluster::StatusResponse> {
+    async fn handle_cluster_health(&self) -> Result<StatusResponse> {
         // TODO: Implement actual health checks with UDP transport
         Ok(StatusResponse {
-            node_name: self.node_name.to_string(),
-            node_type: "hashring".to_string(),
-            status: ClusterStatus::Healthy,
+            node_name: self.node_name.clone(),
+            node_type: RunMode::Hashring,
+            status: Status::Healthy,
             active_clients: 0,          // TODO: implement client counting
             last_topology_change: None, // TODO: track topology changes
         })
     }
 
-    async fn handle_get_topology(&self) -> Result<crate::cluster::TopologyResponse> {
+    async fn handle_get_topology(&self) -> Result<TopologyResponse> {
         let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
         let peer_nodes: Vec<String> = cluster_nodes.iter().map(|addr| addr.to_string()).collect();
 
         Ok(TopologyResponse {
-            node_name: self.node_name.to_string(),
-            node_type: "hashring".to_string(),
+            node_name: self.node_name.clone(),
+            node_type: RunMode::Hashring,
             owned_bucket: Some(self.bucket),
             replica_buckets: vec![], // TODO: calculate replica buckets
             cluster_nodes,
@@ -751,8 +714,8 @@ impl HashringController {
 
     async fn handle_new_topology(
         &self,
-        _request: crate::cluster::TopologyChangeRequest,
-    ) -> Result<crate::cluster::TopologyResponse> {
+        _request: TopologyChangeRequest,
+    ) -> Result<TopologyResponse> {
         // TODO: Implement topology change with UDP cluster member
         warn!("HashringController::handle_new_topology not yet fully implemented");
         self.handle_get_topology().await
@@ -854,7 +817,7 @@ mod tests {
         let controller = HashringController::new(settings).await.unwrap();
         let (tx, rx) = oneshot::channel();
 
-        let cmd = messages::HashringCommand::CheckLimit {
+        let cmd = ClusterCommand::CheckLimit {
             client_id: "test_client".to_string(),
             resp_chan: tx,
         };
@@ -875,7 +838,7 @@ mod tests {
         let controller = HashringController::new(settings).await.unwrap();
         let (tx, rx) = oneshot::channel();
 
-        let cmd = messages::HashringCommand::RateLimit {
+        let cmd = ClusterCommand::RateLimit {
             client_id: "test_client".to_string(),
             resp_chan: tx,
         };
@@ -905,7 +868,7 @@ mod tests {
 
         for _i in 0..5 {
             let (tx, rx) = oneshot::channel();
-            let cmd = messages::HashringCommand::RateLimit {
+            let cmd = ClusterCommand::RateLimit {
                 client_id: client_id.clone(),
                 resp_chan: tx,
             };
@@ -937,7 +900,7 @@ mod tests {
         let settings = create_single_node_test_settings();
         let controller = HashringController::new(settings).await.unwrap();
 
-        let cmd = messages::HashringCommand::ExpireKeys;
+        let cmd = ClusterCommand::ExpireKeys;
 
         // Should not panic or error
         controller.handle_command(cmd).await.unwrap();
@@ -957,7 +920,7 @@ mod tests {
         // Test create named rule
         {
             let (tx, rx) = oneshot::channel();
-            let cmd = messages::HashringCommand::CreateNamedRule {
+            let cmd = ClusterCommand::CreateNamedRule {
                 rule_name: rule_name.clone(),
                 settings: rule_settings.clone(),
                 resp_chan: tx,
@@ -970,7 +933,7 @@ mod tests {
         // Test list named rules
         {
             let (tx, rx) = oneshot::channel();
-            let cmd = messages::HashringCommand::ListNamedRules { resp_chan: tx };
+            let cmd = ClusterCommand::ListNamedRules { resp_chan: tx };
             controller.handle_command(cmd).await.unwrap();
             let rules = rx.await.unwrap().unwrap();
             assert_eq!(rules.len(), 1);
@@ -980,7 +943,7 @@ mod tests {
         // Test get named rule
         {
             let (tx, rx) = oneshot::channel();
-            let cmd = messages::HashringCommand::GetNamedRule {
+            let cmd = ClusterCommand::GetNamedRule {
                 rule_name: rule_name.clone(),
                 resp_chan: tx,
             };
@@ -993,7 +956,7 @@ mod tests {
         // Test custom rate limiting with the rule
         {
             let (tx, rx) = oneshot::channel();
-            let cmd = messages::HashringCommand::RateLimitCustom {
+            let cmd = ClusterCommand::RateLimitCustom {
                 rule_name: rule_name.clone(),
                 key: "custom_key".to_string(),
                 resp_chan: tx,
@@ -1009,7 +972,7 @@ mod tests {
         // Test custom check limit with the rule
         {
             let (tx, rx) = oneshot::channel();
-            let cmd = messages::HashringCommand::CheckLimitCustom {
+            let cmd = ClusterCommand::CheckLimitCustom {
                 rule_name: rule_name.clone(),
                 key: "custom_key".to_string(),
                 resp_chan: tx,
@@ -1023,7 +986,7 @@ mod tests {
         // Test delete named rule
         {
             let (tx, rx) = oneshot::channel();
-            let cmd = messages::HashringCommand::DeleteNamedRule {
+            let cmd = ClusterCommand::DeleteNamedRule {
                 rule_name: rule_name.clone(),
                 resp_chan: tx,
             };
@@ -1035,7 +998,7 @@ mod tests {
         // Test that rule is gone
         {
             let (tx, rx) = oneshot::channel();
-            let cmd = messages::HashringCommand::ListNamedRules { resp_chan: tx };
+            let cmd = ClusterCommand::ListNamedRules { resp_chan: tx };
             controller.handle_command(cmd).await.unwrap();
             let rules = rx.await.unwrap().unwrap();
             assert_eq!(rules.len(), 0);
@@ -1048,7 +1011,7 @@ mod tests {
     //     let controller = HashringController::new(settings).await.unwrap();
     //     let (tx, rx) = oneshot::channel();
 
-    //     let cmd = messages::HashringCommand::ClusterHealth { resp_chan: tx };
+    //     let cmd = ClusterCommand::ClusterHealth { resp_chan: tx };
 
     //     controller.handle_command(cmd).await.unwrap();
     //     let response = rx.await.unwrap().unwrap();
@@ -1067,7 +1030,7 @@ mod tests {
         let controller = HashringController::new(settings).await.unwrap();
         let (tx, rx) = oneshot::channel();
 
-        let cmd = messages::HashringCommand::GetTopology { resp_chan: tx };
+        let cmd = ClusterCommand::GetTopology { resp_chan: tx };
 
         controller.handle_command(cmd).await.unwrap();
         let response = rx.await.unwrap().unwrap();
@@ -1085,7 +1048,7 @@ mod tests {
     //     // Test export
     //     {
     //         let (tx, rx) = oneshot::channel();
-    //         let cmd = messages::HashringCommand::ExportBuckets { resp_chan: tx };
+    //         let cmd = ClusterCommand::ExportBuckets { resp_chan: tx };
     //         controller.handle_command(cmd).await.unwrap();
     //         let export = rx.await.unwrap().unwrap();
 
@@ -1106,7 +1069,7 @@ mod tests {
     //         };
 
     //         let (tx, rx) = oneshot::channel();
-    //         let cmd = messages::HashringCommand::ImportBuckets {
+    //         let cmd = ClusterCommand::ImportBuckets {
     //             import_data,
     //             resp_chan: tx,
     //         };
@@ -1122,8 +1085,8 @@ mod tests {
         let controller = HashringController::new(settings).await.unwrap();
         let (tx, rx) = oneshot::channel();
 
-        let cmd = messages::HashringCommand::AdminCommand {
-            command: crate::cluster::AdminCommand::GetTopology,
+        let cmd = ClusterCommand::AdminCommand {
+            command: AdminCommand::GetTopology,
             source: "127.0.0.1:9999".parse().unwrap(),
             resp_chan: tx,
         };
@@ -1134,7 +1097,7 @@ mod tests {
         // Should handle admin commands (even if not fully implemented)
         assert!(matches!(
             response,
-            crate::cluster::AdminResponse::Error { .. }
+            AdminResponse::Error { .. }
         ));
     }
 
@@ -1221,7 +1184,7 @@ mod tests {
 
         // For a single-node setup, all requests should be handled locally
         let (tx, rx) = oneshot::channel();
-        let cmd = messages::HashringCommand::CheckLimit {
+        let cmd = ClusterCommand::CheckLimit {
             client_id: "any_client".to_string(),
             resp_chan: tx,
         };
@@ -1249,7 +1212,7 @@ mod tests {
 
             let handle = tokio::spawn(async move {
                 let (tx, rx) = oneshot::channel();
-                let cmd = messages::HashringCommand::RateLimit {
+                let cmd = ClusterCommand::RateLimit {
                     client_id,
                     resp_chan: tx,
                 };

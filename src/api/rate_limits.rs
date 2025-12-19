@@ -12,8 +12,9 @@ use crate::settings;
 pub async fn check_limit(
     Path(client_id): Path<String>,
     State(state): State<node::NodeWrapper>,
-) -> Result<axum::Json<node::CheckCallsResponse>> {
-    state.check_limit(client_id).await.map(axum::Json)
+) -> Result<axum::Json<Option<node::CheckCallsResponse>>> {
+    //
+    state.check_limit(0, client_id).await.map(axum::Json)
 }
 
 #[instrument(skip(state), level = "info")]
@@ -21,7 +22,7 @@ pub async fn rate_limit(
     Path(client_id): Path<String>,
     State(state): State<node::NodeWrapper>,
 ) -> Result<axum::Json<node::CheckCallsResponse>> {
-    let result = state.rate_limit(client_id).await?;
+    let result = state.rate_limit(0, client_id).await?;
 
     match result {
         Some(resp) => Ok(axum::Json(resp)),
@@ -83,7 +84,7 @@ pub async fn rate_limit_custom(
     Path((rule_name, key)): Path<(String, String)>,
     State(state): State<node::NodeWrapper>,
 ) -> Result<axum::Json<node::CheckCallsResponse>> {
-    let result = state.rate_limit_custom(rule_name, key).await?;
+    let result = state.rate_limit_custom(0, rule_name, key).await?;
 
     match result {
         Some(resp) => Ok(axum::Json(resp)),
@@ -95,9 +96,9 @@ pub async fn rate_limit_custom(
 pub async fn check_limit_custom(
     Path((rule_name, key)): Path<(String, String)>,
     State(state): State<node::NodeWrapper>,
-) -> Result<axum::Json<node::CheckCallsResponse>> {
+) -> Result<axum::Json<Option<node::CheckCallsResponse>>> {
     state
-        .check_limit_custom(rule_name, key)
+        .check_limit_custom(0, rule_name, key)
         .await
         .map(axum::Json)
 }

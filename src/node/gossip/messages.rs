@@ -1,16 +1,10 @@
 //! Gossip Message Protocol
 //!
-//! Defines all message types for cluster communication. All messages use serde traits
-//! for serialization but are serialized differently based on context:
-//!
-//! - INTERNAL cluster communication (UDP gossip): Uses bincode for compact binary format
-//! - EXTERNAL API communication (HTTP): Uses serde_json for human-readable format
-//!
+//! Defines all message types for cluster communication.
 use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
 use crdts::VClock;
-use tokio::sync::oneshot;
 
 use crate::limiters::distributed_bucket::DistributedBucketExternal;
 use crate::node::NodeId;

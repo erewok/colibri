@@ -1,5 +1,5 @@
 //! Token bucket rate limiting algorithm
-use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 use chrono::Utc;
 use papaya::HashMap;
 
@@ -19,7 +19,7 @@ pub trait Bucket {
 }
 
 /// Token bucket for rate limiting
-#[derive(Clone, Debug, Decode, Encode)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenBucket {
     pub tokens: f64,
     pub last_call: i64,

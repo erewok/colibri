@@ -1,7 +1,7 @@
 /// Cluster commands are within a single node.
 use std::net::SocketAddr;
 
-use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::error::Result;
@@ -12,13 +12,13 @@ use crate::node::{
 use crate::settings::{NamedRateLimitRule, RateLimitSettings, RunMode};
 
 /// Rate limiting bucket export/import format
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketExport {
     pub client_data: Vec<ClientBucketData>,
     pub metadata: ExportMetadata,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientBucketData {
     pub client_id: String,
     pub remaining_tokens: i64,
@@ -26,18 +26,16 @@ pub struct ClientBucketData {
     pub bucket_id: Option<u32>, // for hashring nodes
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportMetadata {
-    #[bincode(with_serde)]
     pub node_name: NodeName,
-    #[bincode(with_serde)]
     pub node_type: RunMode,
     pub export_timestamp: u64,
     pub bucket_count: usize,
 }
 
 /// Administrative command types sent to cluster nodes
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminCommand {
     /// Add a new node to cluster membership
     AddNode { name: String, address: SocketAddr },
@@ -56,7 +54,7 @@ pub enum AdminCommand {
 }
 
 /// Response from administrative commands
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminResponse {
     /// Simple acknowledgment
     Ack,
@@ -121,19 +119,17 @@ pub enum ClusterCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use postcard::{from_bytes, to_allocvec};
 
     #[test]
     fn test_admin_command_serialization() {
-        let config = bincode::config::standard();
-
         // Test AddNode command
         let cmd = AdminCommand::AddNode {
             name: "node-1".to_string(),
             address: "127.0.0.1:8080".parse().unwrap(),
         };
-        let serialized = bincode::encode_to_vec(&cmd, config).unwrap();
-        let (deserialized, _): (AdminCommand, _) =
-            bincode::decode_from_slice(&serialized, config).unwrap();
+        let serialized = to_allocvec(&cmd).unwrap();
+        let deserialized: AdminCommand = from_bytes(&serialized).unwrap();
 
         match deserialized {
             AdminCommand::AddNode { name, address } => {
@@ -146,13 +142,10 @@ mod tests {
 
     #[test]
     fn test_admin_response_serialization() {
-        let config = bincode::config::standard();
-
         // Test simple Ack
         let response = AdminResponse::Ack;
-        let serialized = bincode::encode_to_vec(&response, config).unwrap();
-        let (deserialized, _): (AdminResponse, _) =
-            bincode::decode_from_slice(&serialized, config).unwrap();
+        let serialized = to_allocvec(&response).unwrap();
+        let deserialized: AdminResponse = from_bytes(&serialized).unwrap();
 
         match deserialized {
             AdminResponse::Ack => {}
@@ -163,9 +156,8 @@ mod tests {
         let error_response = AdminResponse::Error {
             message: "Node not found".to_string(),
         };
-        let serialized = bincode::encode_to_vec(&error_response, config).unwrap();
-        let (deserialized, _): (AdminResponse, _) =
-            bincode::decode_from_slice(&serialized, config).unwrap();
+        let serialized = to_allocvec(&error_response).unwrap();
+        let deserialized: AdminResponse = from_bytes(&serialized).unwrap();
 
         match deserialized {
             AdminResponse::Error { message } => {
@@ -187,10 +179,8 @@ mod tests {
         };
 
         // Test serialization
-        let config = bincode::config::standard();
-        let serialized = bincode::encode_to_vec(&status, config).unwrap();
-        let (deserialized, _): (StatusResponse, _) =
-            bincode::decode_from_slice(&serialized, config).unwrap();
+        let serialized = to_allocvec(&status).unwrap();
+        let deserialized: StatusResponse = from_bytes(&serialized).unwrap();
 
         assert_eq!(deserialized.node_name.as_str(), "test-node");
         assert_eq!(deserialized.bucket_count, Some(42));
@@ -218,10 +208,8 @@ mod tests {
         };
 
         // Test that it serializes/deserializes
-        let config = bincode::config::standard();
-        let serialized = bincode::encode_to_vec(&export, config).unwrap();
-        let (deserialized, _): (BucketExport, _) =
-            bincode::decode_from_slice(&serialized, config).unwrap();
+        let serialized = to_allocvec(&export).unwrap();
+        let deserialized: BucketExport = from_bytes(&serialized).unwrap();
 
         assert_eq!(deserialized.client_data.len(), 1);
         assert_eq!(deserialized.client_data[0].client_id, "test-client");

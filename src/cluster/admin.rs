@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, warn};
+use postcard::{from_bytes, to_allocvec};
 
 use crate::cluster::ClusterMember;
 use crate::error::{ColibriError, Result};
@@ -28,9 +29,8 @@ impl AdminCommandDispatcher {
         target: SocketAddr,
         command: AdminCommand,
     ) -> Result<AdminResponse> {
-        let config = bincode::config::standard();
-        let serialized = bincode::encode_to_vec(&command, config).map_err(|e| {
-            ColibriError::Serialization(crate::error::SerializationError::BinaryEncode(e))
+        let serialized = to_allocvec(&command).map_err(|e| {
+            ColibriError::Serialization(crate::error::SerializationError::BinaryCodec(e))
         })?;
 
         // Send via cluster member
@@ -62,23 +62,23 @@ impl AdminCommandDispatcher {
     }
 
     /// Add a new node to cluster membership (operator command)
-    pub async fn add_cluster_node(&self, address: SocketAddr) -> Result<()> {
+    pub async fn add_cluster_node(&self, name: String, address: SocketAddr) -> Result<()> {
         debug!("Admin: Adding new cluster node {}", address);
         self.cluster_member.add_node(address).await;
 
         // Send AddNode command to existing nodes to notify them
-        let command = AdminCommand::AddNode { address };
+        let command = AdminCommand::AddNode { name, address };
         let _responses = self.broadcast_admin_command(command).await?;
 
         Ok(())
     }
 
     /// Remove a node from cluster membership (operator command)
-    pub async fn remove_cluster_node(&self, address: SocketAddr) -> Result<()> {
+    pub async fn remove_cluster_node(&self, name: String, address: SocketAddr) -> Result<()> {
         debug!("Admin: Removing cluster node {}", address);
 
         // Send RemoveNode command to other nodes first
-        let command = AdminCommand::RemoveNode { address };
+        let command = AdminCommand::RemoveNode { name, address };
         let _responses = self.broadcast_admin_command(command).await?;
 
         // Then remove from our own membership
@@ -108,17 +108,14 @@ pub trait AdminCommandHandler: Send + Sync {
 
 /// Parse an administrative command from UDP data
 pub fn parse_admin_command(data: &[u8]) -> Result<AdminCommand> {
-    let config = bincode::config::standard();
-    bincode::decode_from_slice(data, config)
-        .map(|(command, _)| command)
-        .map_err(|e| ColibriError::Serialization(crate::error::SerializationError::BinaryDecode(e)))
+    from_bytes(data)
+        .map_err(|e| ColibriError::Serialization(crate::error::SerializationError::BinaryCodec(e)))
 }
 
 /// Serialize an administrative response to UDP data
 pub fn serialize_admin_response(response: &AdminResponse) -> Result<Vec<u8>> {
-    let config = bincode::config::standard();
-    bincode::encode_to_vec(response, config)
-        .map_err(|e| ColibriError::Serialization(crate::error::SerializationError::BinaryEncode(e)))
+    to_allocvec(response)
+        .map_err(|e| ColibriError::Serialization(crate::error::SerializationError::BinaryCodec(e)))
 }
 
 #[cfg(test)]
@@ -128,15 +125,16 @@ mod tests {
     #[test]
     fn test_admin_command_parsing() {
         let command = AdminCommand::AddNode {
+            name: "test-node".to_string(),
             address: "127.0.0.1:8080".parse().unwrap(),
         };
 
-        let config = bincode::config::standard();
-        let serialized = bincode::encode_to_vec(&command, config).unwrap();
+        let serialized = to_allocvec(&command).unwrap();
 
         let parsed = parse_admin_command(&serialized).unwrap();
         match parsed {
-            AdminCommand::AddNode { address } => {
+            AdminCommand::AddNode { name, address } => {
+                assert_eq!(name, "test-node");
                 assert_eq!(address.to_string(), "127.0.0.1:8080");
             }
             _ => panic!("Wrong command type"),
@@ -148,9 +146,7 @@ mod tests {
         let response = AdminResponse::Ack;
         let serialized = serialize_admin_response(&response).unwrap();
 
-        let config = bincode::config::standard();
-        let (deserialized, _): (AdminResponse, _) =
-            bincode::decode_from_slice(&serialized, config).unwrap();
+        let deserialized: AdminResponse = from_bytes(&serialized).unwrap();
 
         match deserialized {
             AdminResponse::Ack => {}

@@ -1,36 +1,33 @@
 /// Cluster messages are sent over internal transport only.
 use std::collections::HashMap;
 
-use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
+use postcard::{from_bytes, to_allocvec};
 
 use crate::error::{ColibriError, Result};
 use crate::node::NodeName;
 use crate::settings::RunMode;
 
 
-/// Serialize using bincode
-pub fn serialize<T: Encode>(msg: &T) -> Result<bytes::Bytes> {
-    let config = bincode::config::standard().with_big_endian();
-    bincode::encode_to_vec(msg, config)
+/// Serialize using postcard
+pub fn serialize<T: Serialize>(msg: &T) -> Result<bytes::Bytes> {
+    to_allocvec(msg)
         .map(bytes::Bytes::from)
         .map_err(|e| {
             ColibriError::RateLimit(format!("Failed to serialize request: {}", e))
         })
 }
 
-/// Deserialize using bincode
-pub fn deserialize<T: Decode<()>>(data: &[u8]) -> Result<T> {
-    let config = bincode::config::standard().with_big_endian();
-    let (result, _) = bincode::decode_from_slice(data, config).map_err(|e| {
+/// Deserialize using postcard
+pub fn deserialize<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T> {
+    from_bytes(data).map_err(|e| {
         ColibriError::RateLimit(format!("Failed to deserialize request: {}", e))
-    })?;
-    Ok(result)
+    })
 }
 
 
 /// Request message for rate limiting over internal cluster transport
-#[derive(Debug, Clone, Decode, Encode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckCallsRequest {
     pub request_id: u64,
     pub client_id: String,  // key we rate limit against
@@ -49,11 +46,9 @@ pub struct CheckCallsResponse {
 }
 
 /// Cluster health and status information
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
-    #[bincode(with_serde)]
     pub node_name: NodeName,
-    #[bincode(with_serde)]
     pub node_type: RunMode,
     pub status: Status,
     pub bucket_count: Option<usize>,
@@ -61,14 +56,14 @@ pub struct StatusResponse {
     pub errors: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Status {
     Healthy,
     Unhealthy(String), // reason
 }
 
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyChangeRequest {
     pub request_id: u64,
     pub topology: HashMap<String, String>,
@@ -76,7 +71,7 @@ pub struct TopologyChangeRequest {
 
 
 /// Cluster health and status information
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyResponse {
     pub request_id: u64,
     pub status: StatusResponse,

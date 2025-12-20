@@ -3,21 +3,20 @@
 //! Defines all message types for cluster communication.
 use std::net::SocketAddr;
 
-use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
+use postcard::{from_bytes, to_allocvec};
 use crdts::VClock;
 
 use crate::limiters::distributed_bucket::DistributedBucketExternal;
 use crate::node::NodeId;
 
 /// Gossip message types for production delta-state protocol
-#[derive(Debug, Clone, Decode, Encode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GossipMessage {
     /// Delta-state synchronization - only recently updated keys
     DeltaStateSync {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         updates: Vec<DistributedBucketExternal>, // Only changed keys
-        #[bincode(with_serde)]
         sender_node_id: NodeId,
         propagation_factor: u8, // To limit spread
     },
@@ -26,16 +25,13 @@ pub enum GossipMessage {
     StateRequest {
         missing_keys: Option<Vec<String>>, // None = full sync
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         requesting_node_id: NodeId,
     },
 
     /// Response to state request with missing data
     StateResponse {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         responding_node_id: NodeId,
-        #[bincode(with_serde)]
         requested_data: DistributedBucketExternal,
     },
 
@@ -43,26 +39,21 @@ pub enum GossipMessage {
     Heartbeat {
         response_addr: SocketAddr,
         timestamp: u64,
-        #[bincode(with_serde)]
         node_id: NodeId,
-        #[bincode(with_serde)]
         vclock: VClock<NodeId>,
     },
 
     /// Rate limit configuration synchronization messages
     RateLimitConfigCreate {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         sender_node_id: NodeId,
         rule_name: String,
-        #[bincode(with_serde)]
         settings: crate::settings::RateLimitSettings,
         timestamp: u64,
     },
 
     RateLimitConfigDelete {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         sender_node_id: NodeId,
         rule_name: String,
         timestamp: u64,
@@ -70,22 +61,19 @@ pub enum GossipMessage {
 
     RateLimitConfigRequest {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         requesting_node_id: NodeId,
         rule_name: Option<String>, // None = request all rules
     },
 
     RateLimitConfigResponse {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         responding_node_id: NodeId,
-        #[bincode(with_serde)]
         rules: Vec<crate::settings::NamedRateLimitRule>,
     },
 }
 
 /// GossipPacket wraps messages for network transmission
-#[derive(Debug, Clone, Decode, Encode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipPacket {
     pub message: GossipMessage,
     pub packet_id: u64, // For deduplication
@@ -106,16 +94,13 @@ impl GossipPacket {
     }
 
     /// Serialize for INTERNAL cluster communication (UDP gossip)
-    pub fn serialize(&self) -> Result<bytes::Bytes, bincode::error::EncodeError> {
-        let config = bincode::config::standard().with_big_endian();
-        bincode::encode_to_vec(self, config).map(bytes::Bytes::from)
+    pub fn serialize(&self) -> Result<bytes::Bytes, postcard::Error> {
+        to_allocvec(self).map(bytes::Bytes::from)
     }
 
     /// Deserialize from INTERNAL cluster communication (UDP gossip)
-    pub fn deserialize(data: &[u8]) -> Result<Self, bincode::error::DecodeError> {
-        let config = bincode::config::standard().with_big_endian();
-        let (result, _) = bincode::decode_from_slice(data, config)?;
-        Ok(result)
+    pub fn deserialize(data: &[u8]) -> Result<Self, postcard::Error> {
+        from_bytes(data)
     }
 }
 
@@ -140,7 +125,7 @@ mod tests {
         };
         let packet = GossipPacket::new(message);
 
-        // Test bincode serialization (for internal cluster communication)
+        // Test postcard serialization (for internal cluster communication)
         let serialized = packet.serialize().expect("Failed to serialize packet");
         let deserialized =
             GossipPacket::deserialize(&serialized).expect("Failed to deserialize packet");

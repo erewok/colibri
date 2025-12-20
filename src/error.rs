@@ -60,8 +60,7 @@ pub enum SerializationError {
     Json(serde_json::Error),
 
     /// Binary serialization/deserialization errors
-    BinaryDecode(bincode::error::DecodeError),
-    BinaryEncode(bincode::error::EncodeError),
+    BinaryCodec(postcard::Error),
 }
 
 impl fmt::Display for ColibriError {
@@ -95,8 +94,7 @@ impl fmt::Display for SerializationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SerializationError::Json(err) => write!(f, "JSON: {}", err),
-            SerializationError::BinaryDecode(err) => write!(f, "Binary decode: {}", err),
-            SerializationError::BinaryEncode(err) => write!(f, "Binary encode: {}", err),
+            SerializationError::BinaryCodec(err) => write!(f, "Binary codec: {}", err),
         }
     }
 }
@@ -106,8 +104,7 @@ impl std::error::Error for ColibriError {
         match self {
             ColibriError::Io(err) => Some(err),
             ColibriError::Serialization(SerializationError::Json(err)) => Some(err),
-            ColibriError::Serialization(SerializationError::BinaryDecode(err)) => Some(err),
-            ColibriError::Serialization(SerializationError::BinaryEncode(err)) => Some(err),
+            ColibriError::Serialization(SerializationError::BinaryCodec(err)) => Some(err),
             _ => None,
         }
     }
@@ -118,8 +115,7 @@ impl std::error::Error for SerializationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             SerializationError::Json(err) => Some(err),
-            SerializationError::BinaryDecode(err) => Some(err),
-            SerializationError::BinaryEncode(err) => Some(err),
+            SerializationError::BinaryCodec(err) => Some(err),
         }
     }
 }
@@ -261,15 +257,9 @@ impl From<serde_json::Error> for ColibriError {
     }
 }
 
-impl From<bincode::error::DecodeError> for ColibriError {
-    fn from(err: bincode::error::DecodeError) -> Self {
-        ColibriError::Serialization(SerializationError::BinaryDecode(err))
-    }
-}
-
-impl From<bincode::error::EncodeError> for ColibriError {
-    fn from(err: bincode::error::EncodeError) -> Self {
-        ColibriError::Serialization(SerializationError::BinaryEncode(err))
+impl From<postcard::Error> for ColibriError {
+    fn from(err: postcard::Error) -> Self {
+        ColibriError::Serialization(SerializationError::BinaryCodec(err))
     }
 }
 impl From<GossipError> for ColibriError {
@@ -296,13 +286,9 @@ impl From<anyhow::Error> for ColibriError {
             ColibriError::Serialization(SerializationError::Json(serde_json::Error::io(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, err_str),
             )))
-        } else if err_str.contains("deserialize") {
-            ColibriError::Serialization(SerializationError::BinaryDecode(
-                bincode::error::DecodeError::Other("failed to decode"),
-            ))
-        } else if err_str.contains("serialize") {
-            ColibriError::Serialization(SerializationError::BinaryEncode(
-                bincode::error::EncodeError::Other("failed to encode"),
+        } else if err_str.contains("deserialize") || err_str.contains("serialize") {
+            ColibriError::Serialization(SerializationError::BinaryCodec(
+                postcard::Error::DeserializeUnexpectedEnd,
             ))
         } else {
             // Fall back to a generic node error

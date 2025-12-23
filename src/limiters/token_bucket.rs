@@ -8,13 +8,13 @@ use crate::settings;
 
 /// Rate limiter bucket interface
 pub trait Bucket {
-    fn new(max_calls: u32, node_id: NodeId) -> Self;
+    fn new(max_calls: u32, node_id: NodeId) -> Self where Self: Sized;
     fn add_tokens_to_bucket(
         &mut self,
         rate_limit_settings: &settings::RateLimitSettings,
-    ) -> &mut Self;
+    ) -> &mut Self where Self: Sized;
     fn check_if_allowed(&self) -> bool;
-    fn decrement(&mut self) -> &mut Self;
+    fn decrement(&mut self) -> &mut Self where Self: Sized;
     fn tokens_to_u32(&self) -> u32;
 }
 
@@ -84,7 +84,7 @@ impl Bucket for TokenBucket {
 /// Each rate-limited item will be stored in here.
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
 /// Rate limiter managing multiple token buckets
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenBucketLimiter {
     settings: settings::RateLimitSettings,
     cache: HashMap<String, TokenBucket>,

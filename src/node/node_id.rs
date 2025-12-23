@@ -1,4 +1,6 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::ToSocketAddrs;
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
@@ -56,4 +58,38 @@ impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+
+/// Node addressing information
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeAddress {
+    pub name: NodeName,
+    pub local_address: SocketAddr,
+    /// Network address for communication from other nodes
+    pub remote_address: SocketAddr,
+}
+
+impl NodeAddress {
+    pub fn new(name: impl Into<String>, local_address: impl ToSocketAddrs, remote_address: impl ToSocketAddrs) -> Self {
+        Self {
+            name: NodeName::new(name.into()),
+            local_address: local_address.to_socket_addrs().expect("Invalid local address").next().expect("No local address found"),
+            remote_address: remote_address.to_socket_addrs().expect("Invalid remote address").next().expect("No remote address found"),
+        }
+    }
+
+    pub fn peer_address(&self) -> PeerAddress {
+        PeerAddress {
+            name: self.name.clone(),
+            address: self.remote_address,
+        }
+    }
+}
+
+/// Peer addressing information
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PeerAddress {
+    pub name: NodeName,
+    pub address: SocketAddr,
 }

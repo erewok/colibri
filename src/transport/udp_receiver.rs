@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use super::common::{FrozenReceiverStats, ReceiverStats};
+use super::stats::{FrozenReceiverStats, ReceiverStats};
 use crate::error::{ColibriError, Result};
 
 /// UDP message receiver with flexible handling patterns

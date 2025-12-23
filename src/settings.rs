@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::node::NodeName;
-
+use crate::node::{NodeName, NodeId};
 
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -22,32 +22,21 @@ pub struct RateLimitSettings {
     pub rate_limit_interval_seconds: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct NamedRateLimitRule {
-    pub name: String,
-    pub settings: RateLimitSettings,
-}
-
-/// Alias for consistency with cluster protocol
-pub type NamedRule = NamedRateLimitRule;
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct RateLimitConfig {
-    pub default_settings: RateLimitSettings,
-    pub named_rules: HashMap<String, RateLimitSettings>,
-}
 
 #[derive(Clone, Debug)]
 pub struct TransportConfig {
     pub node_name: NodeName,
     pub peer_listen_address: String,
     pub peer_listen_port: u16,
-    pub topology: HashMap<String, String>,
+    // we use an IndexMap to preserve order so we can more easily pull a random peer
+    pub topology: IndexMap<NodeId, SocketAddr>,
 }
 
 impl TransportConfig {
     pub fn peer_listen_url(&self) -> SocketAddr {
-        format!("{}:{}", self.peer_listen_address, self.peer_listen_port).parse().expect("Invalid socket address")
+        format!("{}:{}", self.peer_listen_address, self.peer_listen_port)
+            .parse()
+            .expect("Invalid socket address")
     }
 }
 
@@ -102,42 +91,6 @@ impl RateLimitSettings {
     }
 }
 
-impl RateLimitConfig {
-    pub fn new(default_settings: RateLimitSettings) -> Self {
-        Self {
-            default_settings,
-            named_rules: HashMap::new(),
-        }
-    }
-
-    pub fn get_default_settings(&self) -> &RateLimitSettings {
-        &self.default_settings
-    }
-
-    pub fn get_named_rule_settings(&self, rule_name: &str) -> Option<&RateLimitSettings> {
-        self.named_rules.get(rule_name)
-    }
-
-    pub fn add_named_rule(&mut self, rule: &NamedRateLimitRule) {
-        self.named_rules
-            .insert(rule.name.clone(), rule.settings.clone());
-    }
-
-    pub fn remove_named_rule(&mut self, rule_name: &str) -> Option<RateLimitSettings> {
-        self.named_rules.remove(rule_name)
-    }
-
-    pub fn list_named_rules(&self) -> Vec<NamedRateLimitRule> {
-        self.named_rules
-            .iter()
-            .map(|(name, settings)| NamedRateLimitRule {
-                name: name.clone(),
-                settings: settings.clone(),
-            })
-            .collect()
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub server_name: String,
@@ -187,7 +140,16 @@ impl Settings {
             node_name: self.node_name(),
             peer_listen_address: self.peer_listen_address.clone(),
             peer_listen_port: self.peer_listen_port,
-            topology: self.topology.clone(),
+            topology: self
+                .topology
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        NodeName::new(k.into()).node_id(),
+                        v.parse().expect("Invalid socket address in topology"),
+                    )
+                })
+                .collect(),
         }
     }
 

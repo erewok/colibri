@@ -68,7 +68,7 @@ pub enum GossipMessage {
     RateLimitConfigResponse {
         response_addr: SocketAddr,
         responding_node_id: NodeId,
-        rules: Vec<crate::settings::NamedRateLimitRule>,
+        rules: Vec<NamedRateLimitRule>,
     },
 }
 

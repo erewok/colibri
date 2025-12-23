@@ -6,6 +6,7 @@ use tracing::{error, info};
 
 use super::HashringController;
 use crate::error::{ColibriError, Result};
+use crate::limiters::NamedRateLimitRule;
 use crate::node::commands::AdminCommand;
 use crate::node::{CheckCallsResponse, Node, NodeName, commands::{BucketExport, ClusterCommand, TopologyChangeRequest, TopologyResponse, StatusResponse}};
 use crate::{settings, transport};
@@ -249,7 +250,7 @@ impl Node for HashringNode {
         })
     }
 
-    async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+    async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
             .send(ClusterCommand::ListNamedRules { resp_chan: tx })
@@ -268,7 +269,7 @@ impl Node for HashringNode {
     async fn get_named_rule(
         &self,
         rule_name: String,
-    ) -> Result<Option<settings::NamedRateLimitRule>> {
+    ) -> Result<Option<NamedRateLimitRule>> {
         let (tx, rx) = oneshot::channel();
         self.hashring_command_tx
             .send(ClusterCommand::GetNamedRule {

@@ -1,18 +1,19 @@
-//! Generic UDP Transport Module
+//! UDP Transport Implementation
 //!
-//! Provides a pool of UDP unicast sockets for distributed communication.
-//! Implements fire-and-forget requests for gossip nodes to send gossip messages.
+//! Provides UDP-based transport implementing the Sender trait.
+//! Used primarily for fire-and-forget messaging in gossip protocols.
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-pub use super::common::{FrozenReceiverStats, FrozenSocketPoolStats};
-pub use super::socket_pool_udp::UdpSocketPool;
-pub use super::udp_receiver::UdpReceiver;
+use super::traits::Sender;
+use super::stats::FrozenSocketPoolStats;
+use super::socket_pool_udp::UdpSocketPool;
 use crate::error::Result;
 use crate::node::NodeId;
-use crate::settings;
+use crate::settings::TransportConfig;
 
 #[derive(Clone, Debug)]
 pub struct UdpTransport {
@@ -21,29 +22,30 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     /// Create a new UDP transport instance
-    pub async fn new(
-        node_id: NodeId,
-        transport_config: &settings::TransportConfig,
-    ) -> Result<Self> {
-        // Create socket pool
-        let socket_pool = UdpSocketPool::new(node_id, &transport_config.topology).await?;
+    pub async fn new(transport_config: &TransportConfig) -> Result<Self> {
+        let socket_pool = UdpSocketPool::new(transport_config).await?;
 
         Ok(Self {
             socket_pool: Arc::new(RwLock::new(socket_pool)),
         })
     }
-    /// Send data to a specific peer (for consistent hashing)
-    pub async fn send_to_peer(&self, target: SocketAddr, data: &[u8]) -> Result<SocketAddr> {
-        self.socket_pool.read().await.send_to(target, data).await
+}
+
+#[async_trait]
+impl Sender for UdpTransport {
+    /// Send data to a specific peer by NodeId
+    async fn send_to_peer(&self, target: NodeId, data: &[u8]) -> Result<()> {
+        self.socket_pool.read().await.send_to(target, data).await?;
+        Ok(())
     }
 
     /// Send data to a random peer (for gossip)
-    pub async fn send_to_random_peer(&self, data: &[u8]) -> Result<SocketAddr> {
+    async fn send_to_random_peer(&self, data: &[u8]) -> Result<NodeId> {
         self.socket_pool.read().await.send_to_random(data).await
     }
 
     /// Send data to multiple random peers (for gossip)
-    pub async fn send_to_random_peers(&self, data: &[u8], count: usize) -> Result<Vec<SocketAddr>> {
+    async fn send_to_random_peers(&self, data: &[u8], count: usize) -> Result<Vec<NodeId>> {
         self.socket_pool
             .read()
             .await
@@ -52,52 +54,60 @@ impl UdpTransport {
     }
 
     /// Add a new peer to the socket pool
-    pub async fn add_peer(&mut self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
+    async fn add_peer(&mut self, node_id: NodeId, addr: SocketAddr) -> Result<()> {
         self.socket_pool
             .write()
             .await
-            .add_peer(peer_addr, pool_size)
+            .add_peer(node_id, addr)
             .await
     }
 
     /// Remove a peer from the socket pool
-    pub async fn remove_peer(&self, peer_addr: SocketAddr) -> Result<()> {
-        self.socket_pool.write().await.remove_peer(peer_addr).await
+    async fn remove_peer(&self, node_id: NodeId) -> Result<()> {
+        self.socket_pool.write().await.remove_peer(node_id).await
     }
 
-    /// Get list of current peers
-    pub async fn get_peers(&self) -> Vec<SocketAddr> {
+    /// Get list of current peer NodeIds
+    async fn get_peers(&self) -> Vec<NodeId> {
         self.socket_pool.read().await.get_peers().await
     }
 
     /// Get transport statistics
-    pub async fn get_stats(&self) -> FrozenSocketPoolStats {
+    async fn get_stats(&self) -> FrozenSocketPoolStats {
         self.socket_pool.read().await.get_stats().freeze()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
+    use indexmap::IndexMap;
     use super::*;
+    use crate::node::NodeName;
+    use std::net::SocketAddr;
 
-    fn get_transport_config() -> settings::TransportConfig {
-        let mut cluster_urls = HashSet::new();
-        cluster_urls.insert("127.0.0.1:8001".parse().unwrap());
-        cluster_urls.insert("127.0.0.1:8002".parse().unwrap());
+    fn get_transport_config() -> TransportConfig {
+        let mut topology = IndexMap::new();
+        topology.insert(
+            NodeName::from("node_a").node_id(),
+            "127.0.0.1:8001".parse().unwrap(),
+        );
+        topology.insert(
+            NodeName::from("node_b").node_id(),
+            "127.0.0.1:8002".parse().unwrap(),
+        );
 
-        settings::TransportConfig {
-            listen_tcp: "127.0.0.1:0".parse().unwrap(),
-            listen_udp: "127.0.0.1:0".parse().unwrap(),
-            topology: cluster_urls,
+        TransportConfig {
+            node_name: NodeName::from("test_node"),
+            peer_listen_address: "127.0.0.1".to_string(),
+            peer_listen_port: 8000,
+            topology,
         }
     }
 
     #[tokio::test]
     async fn test_transport_creation() {
         let transport_config = get_transport_config();
-        let transport = UdpTransport::new(NodeId::new(0), &transport_config)
+        let transport = UdpTransport::new(&transport_config)
             .await
             .unwrap();
 

@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::cluster::ClusterMember;
 use crate::error::{ColibriError, Result};
-use crate::limiters::token_bucket::TokenBucketLimiter;
+use crate::limiters::{NamedRateLimitRule, token_bucket::TokenBucketLimiter};
 use crate::node::commands::{AdminCommand, AdminResponse, BucketExport, ExportMetadata, Status, StatusResponse, TopologyChangeRequest, TopologyResponse};
 use crate::node::{
     single_node::local_check_limit, single_node::local_rate_limit, CheckCallsResponse, ClusterCommand, NodeName,
@@ -342,7 +342,7 @@ impl HashringController {
             let mut config = self.rate_limit_config.lock().map_err(|e| {
                 ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
             })?;
-            let rule = settings::NamedRateLimitRule {
+            let rule = NamedRateLimitRule {
                 name: rule_name.clone(),
                 settings: settings.clone(),
             };
@@ -391,7 +391,7 @@ impl HashringController {
         Ok(())
     }
 
-    async fn handle_list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+    async fn handle_list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
         let config = self.rate_limit_config.lock().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
         })?;
@@ -401,12 +401,12 @@ impl HashringController {
     async fn handle_get_named_rule(
         &self,
         rule_name: String,
-    ) -> Result<Option<settings::NamedRateLimitRule>> {
+    ) -> Result<Option<NamedRateLimitRule>> {
         let config = self.rate_limit_config.lock().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
         })?;
         Ok(config.get_named_rule_settings(&rule_name).map(|settings| {
-            settings::NamedRateLimitRule {
+            NamedRateLimitRule {
                 name: rule_name,
                 settings: settings.clone(),
             }

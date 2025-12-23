@@ -5,18 +5,17 @@ use tracing::warn;
 
 pub mod gossip;
 pub mod hashring;
-pub mod commands;
+pub mod controller;
 pub mod messages;
 pub mod node_id;
 pub mod single_node;
 
-use crate::{error::Result, node::commands::AdminResponse};
+use crate::error::Result;
+use crate::limiters::NamedRateLimitRule;
 use crate::settings;
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;
-pub use commands::ClusterCommand;
-pub use messages::{CheckCallsResponse, StatusResponse, TopologyChangeRequest, TopologyResponse};
-pub use node_id::{NodeId, NodeName};
+pub use node_id::{NodeId, NodeName, NodeAddress};
 pub use single_node::SingleNode;
 
 
@@ -25,8 +24,8 @@ pub trait Node {
     async fn new(settings: settings::Settings) -> Result<Self>
     where
         Self: Sized;
-    async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>>;
-    async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>>;
+    async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<messages::CheckCallsResponse>>;
+    async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<messages::CheckCallsResponse>>;
     async fn expire_keys(&self) -> Result<()>;
 
     // New methods for named rules
@@ -35,24 +34,24 @@ pub trait Node {
         rule_name: String,
         settings: settings::RateLimitSettings,
     ) -> Result<()>;
-    async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>>;
+    async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>>;
     async fn delete_named_rule(&self, rule_name: String) -> Result<()>;
     async fn get_named_rule(
         &self,
         rule_name: String,
-    ) -> Result<Option<settings::NamedRateLimitRule>>;
+    ) -> Result<Option<NamedRateLimitRule>>;
     async fn rate_limit_custom(
         &self,
         request_id: u64,
         rule_name: String,
         key: String,
-    ) -> Result<Option<CheckCallsResponse>>;
+    ) -> Result<Option<messages::CheckCallsResponse>>;
     async fn check_limit_custom(
         &self,
         request_id: u64,
         rule_name: String,
         key: String,
-    ) -> Result<Option<CheckCallsResponse>>;
+    ) -> Result<Option<messages::CheckCallsResponse>>;
 }
 
 #[derive(Clone, Debug)]
@@ -108,11 +107,11 @@ impl NodeWrapper {
         self.get_node_ref().expire_keys().await
     }
 
-    pub async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+    pub async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<messages::CheckCallsResponse>> {
         self.get_node_ref().check_limit(request_id, client_id).await
     }
 
-    pub async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+    pub async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<messages::CheckCallsResponse>> {
         self.get_node_ref().rate_limit(request_id, client_id).await
     }
 
@@ -129,7 +128,7 @@ impl NodeWrapper {
     pub async fn get_named_rule(
         &self,
         rule_name: String,
-    ) -> Result<Option<settings::NamedRateLimitRule>> {
+    ) -> Result<Option<NamedRateLimitRule>> {
         self.get_node_ref().get_named_rule(rule_name).await
     }
 
@@ -137,7 +136,7 @@ impl NodeWrapper {
         self.get_node_ref().delete_named_rule(rule_name).await
     }
 
-    pub async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+    pub async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
         self.get_node_ref().list_named_rules().await
     }
 
@@ -146,7 +145,7 @@ impl NodeWrapper {
         request_id: u64,
         rule_name: String,
         key: String,
-    ) -> Result<Option<CheckCallsResponse>> {
+    ) -> Result<Option<messages::CheckCallsResponse>> {
         self.get_node_ref().rate_limit_custom(request_id, rule_name, key).await
     }
 
@@ -155,35 +154,11 @@ impl NodeWrapper {
         request_id: u64,
         rule_name: String,
         key: String,
-    ) -> Result<Option<CheckCallsResponse>> {
+    ) -> Result<Option<messages::CheckCallsResponse>> {
         self.get_node_ref().check_limit_custom(request_id, rule_name, key).await
     }
 
-    // Cluster-specific methods (only for gossip and hashring nodes)
-    pub async fn handle_export_buckets(&self) -> Result<commands::BucketExport> {
-        match self {
-            Self::Single(_) => Err(crate::error::ColibriError::Api(
-                "Single nodes don't support bucket export".to_string(),
-            )),
-            Self::Gossip(node) => node.handle_export_buckets().await,
-            Self::Hashring(node) => node.handle_export_buckets().await,
-        }
-    }
-
-    pub async fn handle_import_buckets(
-        &self,
-        import_data: commands::BucketExport,
-    ) -> Result<()> {
-        match self {
-            Self::Single(_) => Err(crate::error::ColibriError::Api(
-                "Single nodes don't support bucket import".to_string(),
-            )),
-            Self::Gossip(node) => node.handle_import_buckets(import_data).await,
-            Self::Hashring(node) => node.handle_import_buckets(import_data).await,
-        }
-    }
-
-    pub async fn handle_cluster_health(&self) -> Result<StatusResponse> {
+    pub async fn handle_cluster_health(&self) -> Result<messages::StatusResponse> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't provide cluster health".to_string(),
@@ -193,7 +168,7 @@ impl NodeWrapper {
         }
     }
 
-    pub async fn handle_get_topology(&self) -> Result<TopologyResponse> {
+    pub async fn handle_get_topology(&self) -> Result<messages::TopologyResponse> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't have topology".to_string(),
@@ -205,8 +180,8 @@ impl NodeWrapper {
 
     pub async fn handle_new_topology(
         &self,
-        request: TopologyChangeRequest,
-    ) -> Result<TopologyResponse> {
+        request: messages::TopologyChangeRequest,
+    ) -> Result<messages::TopologyResponse> {
         match self {
             Self::Single(_) => Err(crate::error::ColibriError::Api(
                 "Single nodes don't support topology changes".to_string(),

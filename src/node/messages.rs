@@ -1,12 +1,14 @@
 /// Cluster messages are sent over internal transport only.
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 use postcard::{from_bytes, to_allocvec};
 
 use crate::error::{ColibriError, Result};
-use crate::node::NodeName;
-use crate::settings::RunMode;
+use crate::limiters::{DistributedBucketExternal, NamedRateLimitRule, TokenBucketLimiter};
+use crate::node::{NodeName, NodeAddress};
+use crate::settings::{RateLimitSettings, RunMode};
 
 
 /// Serialize using postcard
@@ -20,16 +22,13 @@ pub fn serialize<T: Serialize>(msg: &T) -> Result<bytes::Bytes> {
 
 /// Deserialize using postcard
 pub fn deserialize<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T> {
-    from_bytes(data).map_err(|e| {
-        ColibriError::RateLimit(format!("Failed to deserialize request: {}", e))
-    })
+    from_bytes(data).map_err(|e| ColibriError::from(e))
 }
 
 
 /// Request message for rate limiting over internal cluster transport
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckCallsRequest {
-    pub request_id: u64,
     pub client_id: String,  // key we rate limit against
     pub rule_name: Option<String>, // None = default rule
     pub consume_token: bool, // true for rate_limit, false for check_limit
@@ -39,10 +38,15 @@ pub struct CheckCallsRequest {
 /// Serialized to API clients as JSON as well as used internally so derive Serialize/Deserialize.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckCallsResponse {
-    pub request_id: u64,
     pub client_id: String,  // key we rate limit against
     pub rule_name: Option<String>, // None = default rule
     pub calls_remaining: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Status {
+    Healthy,
+    Unhealthy(String), // reason
 }
 
 /// Cluster health and status information
@@ -57,23 +61,82 @@ pub struct StatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Status {
-    Healthy,
-    Unhealthy(String), // reason
-}
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopologyChangeRequest {
-    pub request_id: u64,
-    pub topology: HashMap<String, String>,
-}
-
+pub struct TopologyChangeRequest(pub HashMap<NodeName, NodeAddress>);
 
 /// Cluster health and status information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyResponse {
-    pub request_id: u64,
     pub status: StatusResponse,
-    pub topology: HashMap<String, String>,
+    pub topology: HashMap<NodeName, NodeAddress>,
+}
+
+/// Cluster health and status information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRateLimitRule{
+    pub rule_name: String,
+    pub settings: RateLimitSettings,
+}
+
+
+/// Administrative commands
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AdminCommand {
+    /// Add a new node to cluster membership
+    AddNode { name: String, address: SocketAddr },
+    /// Remove a node from cluster membership
+    RemoveNode { name: String, address: SocketAddr },
+    /// Export all rate limiting data (for cluster migration)
+    ExportBuckets,
+    /// Import rate limiting data (for cluster migration)
+    ImportBuckets { filename: String, run_mode: RunMode },
+    /// Get current topology information
+    GetTopology,
+}
+
+/// Gossip message types for production delta-state protocol
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClusterMessage {
+    AdminCommand(AdminCommand),
+    StatusRequest,
+    GetTopology,
+    TopologyChangeRequest(TopologyChangeRequest),
+    // Rate limit configuration synchronization messages
+    RateLimitConfigCreate(CreateRateLimitRule),
+    RateLimitConfigDelete(String), // rule name
+    RateLimitConfigGet(String), // rule name
+    RateLimitConfigList, // rule name
+    RateLimitRequest(CheckCallsRequest),
+    // Request for specific state
+    StateRequest(Vec<String>), // keys requested
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClusterMessageResponse {
+    // Node + cluster info
+    AdminResponse(StatusResponse),
+    StatusResponse(StatusResponse),
+    TopologyResponse(TopologyResponse),
+    // Rate limit responses
+    RateLimitResponse(CheckCallsResponse),
+    RateLimitConfigCreateResponse,
+    RateLimitConfigDeleteResponse,
+    RateLimitConfigGetResponse(Option<NamedRateLimitRule>),
+    RateLimitConfigListResponse(Vec<NamedRateLimitRule>),
+    /// Response to state request with missing data
+    TokenBucketStateResponse(Vec<TokenBucketLimiter>),
+    DistributedBucketStateResponse(Vec<DistributedBucketExternal>),
+}
+
+
+/// Message routing and delivery information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageEnvelope {
+    /// Who sent this message
+    pub from: NodeName,
+    /// Who should receive this message
+    pub to: NodeName,
+    /// The actual message
+    pub message: ClusterMessage,
+    /// Simple lamport-clock timestamp for ordering
+    pub request_id: u64,
 }

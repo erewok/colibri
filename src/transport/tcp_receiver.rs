@@ -8,10 +8,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use super::common::{FrozenReceiverStats, ReceiverStats};
+use super::stats::{FrozenReceiverStats, ReceiverStats};
 use crate::error::{ColibriError, Result};
 
-/// TCP message receiver with flexible handling patterns
+/// TCP message receiver
 pub struct TcpReceiver {
     pub local_addr: SocketAddr,
     socket: Arc<TcpListener>,

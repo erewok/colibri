@@ -8,7 +8,7 @@ use tracing::{debug, error, info};
 
 use super::{GossipMessage, GossipPacket};
 use crate::error::{ColibriError, Result};
-use crate::limiters::distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter};
+use crate::limiters::{NamedRateLimitRule, distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter}};
 use crate::node::{CheckCallsResponse, NodeId, NodeName, commands::ClusterCommand};
 use crate::settings;
 
@@ -707,7 +707,7 @@ impl GossipController {
             .rate_limit_config
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))?;
-        let rule = settings::NamedRateLimitRule {
+        let rule = NamedRateLimitRule {
             name: rule_name.clone(),
             settings: settings.clone(),
         };
@@ -728,7 +728,7 @@ impl GossipController {
     pub async fn get_named_rule_local(
         &self,
         rule_name: &str,
-    ) -> Result<Option<settings::NamedRateLimitRule>> {
+    ) -> Result<Option<NamedRateLimitRule>> {
         self.rate_limit_config
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Failed to lock config: {}", e)))
@@ -736,7 +736,7 @@ impl GossipController {
                 rlconf
                     .get_named_rule_settings(rule_name)
                     .cloned()
-                    .map(|rl_settings| settings::NamedRateLimitRule {
+                    .map(|rl_settings| NamedRateLimitRule {
                         name: rule_name.to_string(),
                         settings: rl_settings,
                     })
@@ -764,7 +764,7 @@ impl GossipController {
     }
 
     /// List all named rate limit rules locally
-    pub async fn list_named_rules_local(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
+    pub async fn list_named_rules_local(&self) -> Result<Vec<NamedRateLimitRule>> {
         let config = self
             .rate_limit_config
             .lock()

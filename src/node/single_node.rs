@@ -41,17 +41,16 @@ impl Node for SingleNode {
             named_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
         })
     }
-    async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+    async fn check_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
         local_check_limit(None, client_id, self.rate_limiter.clone()).await
     }
 
-    async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+    async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
         local_rate_limit(client_id, self.rate_limiter.clone()).await
     }
 
     async fn rate_limit_custom(
         &self,
-        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
@@ -88,7 +87,6 @@ impl Node for SingleNode {
 
     async fn check_limit_custom(
         &self,
-        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {

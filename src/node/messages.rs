@@ -4,12 +4,22 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 use postcard::{from_bytes, to_allocvec};
+use tokio::sync::oneshot;
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::{DistributedBucketExternal, NamedRateLimitRule, TokenBucketLimiter};
 use crate::node::{NodeName, NodeAddress};
 use crate::settings::{RateLimitSettings, RunMode};
 
+// Controllers and Nodes use queuable messages to send/receive messages internally.
+/// To receive a response, provide a oneshot sender along with the message.
+///
+pub type ClusterMessageResult = Result<ClusterMessageResponse>;
+
+pub struct Queueable {
+    pub envelope: MessageEnvelope,
+    pub response_tx: oneshot::Sender<ClusterMessageResult>,
+}
 
 /// Serialize using postcard
 pub fn serialize<T: Serialize>(msg: &T) -> Result<bytes::Bytes> {
@@ -127,7 +137,6 @@ pub enum ClusterMessageResponse {
     DistributedBucketStateResponse(Vec<DistributedBucketExternal>),
 }
 
-
 /// Message routing and delivery information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageEnvelope {
@@ -139,4 +148,19 @@ pub struct MessageEnvelope {
     pub message: ClusterMessage,
     /// Simple lamport-clock timestamp for ordering
     pub request_id: u64,
+}
+
+impl MessageEnvelope {
+    /// Create a new message envelope
+    pub fn new(from: NodeName, to: NodeName, message: ClusterMessage, request_id: u64) -> Self {
+        Self {
+            from,
+            to,
+            message,
+            request_id,
+        }
+    }
+    pub fn from_incoming_message(data: bytes::Bytes) -> Result<Self> {
+        deserialize(&data)
+    }
 }

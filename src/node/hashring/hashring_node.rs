@@ -7,8 +7,7 @@ use tracing::{error, info};
 use super::HashringController;
 use crate::error::{ColibriError, Result};
 use crate::limiters::NamedRateLimitRule;
-use crate::node::commands::AdminCommand;
-use crate::node::{CheckCallsResponse, Node, NodeName, commands::{BucketExport, ClusterCommand, TopologyChangeRequest, TopologyResponse, StatusResponse}};
+use crate::node::{Node, NodeName, messages};
 use crate::{settings, transport};
 
 /// Replication factor for data distribution
@@ -26,7 +25,7 @@ pub struct HashringNode {
     pub node_name: NodeName,
 
     /// Command sender to the controller
-    pub hashring_command_tx: Arc<tokio::sync::mpsc::Sender<ClusterCommand>>,
+    pub cluster_inbox_tx: Arc<tokio::sync::mpsc::Sender<messages::Queueable>>,
 
     /// Controller handle
     pub controller_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -39,7 +38,7 @@ impl HashringNode {
     /// Run the TCP Receiver
     async fn run_receiver(
         listen_tcp: std::net::SocketAddr,
-        hashring_command_tx: Arc<tokio::sync::mpsc::Sender<ClusterCommand>>,
+        cluster_inbox_tx: Arc<tokio::sync::mpsc::Sender<messages::Queueable>>,
     ) -> Result<()> {
         let (tcp_send, mut tcp_recv) = tokio::sync::mpsc::channel(1000);
         let receiver = transport::TcpReceiver::new(listen_tcp, Arc::new(tcp_send)).await?;
@@ -50,13 +49,17 @@ impl HashringNode {
 
         loop {
             // Handle incoming messages from network
-            if let Some((data, peer_addr)) = tcp_recv.recv().await {
-                todo!();
-                // // Turn into ClusterCommand and send to main loop
-                // let cmd = ClusterCommand::from_incoming_message(data, peer_addr);
-                // if let Err(e) = hashring_command_tx.send(cmd).await {
-                //     debug!("Failed to send incoming message to main loop: {}", e);
-                // }
+            if let Some((data, _peer_addr)) = tcp_recv.recv().await {
+                // Turn into ClusterCommand and send to main loop
+                let msg = messages::MessageEnvelope::from_incoming_message(data)?;
+                let (response_tx, response_rx) = oneshot::channel();
+                let queueable = messages::Queueable {
+                    envelope: msg,
+                    response_tx
+                };
+                if let Err(e) = cluster_inbox_tx.send(queueable).await {
+                    error!("Failed to send incoming message to main loop: {}", e);
+                }
             }
         }
     }
@@ -130,16 +133,16 @@ impl Node for HashringNode {
         );
 
         // Set up command channel
-        let (hashring_command_tx, hashring_command_rx): (
-            tokio::sync::mpsc::Sender<ClusterCommand>,
-            tokio::sync::mpsc::Receiver<ClusterCommand>,
+        let (cluster_inbox_tx, hashring_command_rx): (
+            tokio::sync::mpsc::Sender<messages::Queueable>,
+            tokio::sync::mpsc::Receiver<messages::Queueable>,
         ) = tokio::sync::mpsc::channel(1000);
 
-        let hashring_command_tx = Arc::new(hashring_command_tx);
+        let cluster_inbox_tx = Arc::new(cluster_inbox_tx);
 
         // Start the receiver to handle incoming gossip messages
         let receiver_addr = settings.transport_config().peer_listen_url();
-        let tx_clone = hashring_command_tx.clone();
+        let tx_clone = cluster_inbox_tx.clone();
         let receiver_handle = tokio::spawn(async move {
             if let Err(e) = HashringNode::run_receiver(receiver_addr, tx_clone).await {
                 error!(
@@ -157,18 +160,23 @@ impl Node for HashringNode {
 
         Ok(Self {
             node_name,
-            hashring_command_tx,
+            cluster_inbox_tx,
             controller_handle: Arc::new(Mutex::new(Some(controller_handle))),
             receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })
     }
 
-    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
+    async fn check_limit(&self, client_id: String) -> Result<messages::CheckCallsResponse> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
-            .send(ClusterCommand::CheckLimit {
-                client_id,
-                resp_chan: tx,
+        self.cluster_inbox_tx
+            .send(messages::Queueable {
+                envelope: messages::MessageEnvelope {
+                    message: messages::ClusterMessage::RateLimitRequest(
+                        messages::RateLimitRequest {
+                            client_id
+                    })
+                },
+                response_tx: tx,
             })
             .await
             .map_err(|e| ColibriError::Transport(format!("Failed checking rate limit {}", e)))?;
@@ -183,7 +191,7 @@ impl Node for HashringNode {
 
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::RateLimit {
                 client_id,
                 resp_chan: tx,
@@ -200,7 +208,7 @@ impl Node for HashringNode {
     }
 
     async fn expire_keys(&self) -> Result<()> {
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::ExpireKeys)
             .await
             .map_err(|e| ColibriError::Transport(format!("Failed expiring keys {}", e)))?;
@@ -213,7 +221,7 @@ impl Node for HashringNode {
         settings: settings::RateLimitSettings,
     ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::CreateNamedRule {
                 rule_name,
                 settings,
@@ -233,7 +241,7 @@ impl Node for HashringNode {
 
     async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::DeleteNamedRule {
                 rule_name,
                 resp_chan: tx,
@@ -252,7 +260,7 @@ impl Node for HashringNode {
 
     async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::ListNamedRules { resp_chan: tx })
             .await
             .map_err(|e| {
@@ -271,7 +279,7 @@ impl Node for HashringNode {
         rule_name: String,
     ) -> Result<Option<NamedRateLimitRule>> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::GetNamedRule {
                 rule_name,
                 resp_chan: tx,
@@ -294,7 +302,7 @@ impl Node for HashringNode {
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::RateLimitCustom {
                 rule_name,
                 key,
@@ -318,7 +326,7 @@ impl Node for HashringNode {
         key: String,
     ) -> Result<CheckCallsResponse> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::CheckLimitCustom {
                 rule_name,
                 key,
@@ -341,7 +349,7 @@ impl Node for HashringNode {
 impl HashringNode {
     pub async fn handle_export_buckets(&self) -> Result<BucketExport> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(AdminCommand::ExportBuckets)
             .await
             .map_err(|e| {
@@ -360,7 +368,7 @@ impl HashringNode {
         import_data: BucketExport,
     ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(AdminCommand::ImportBuckets {
                 data: import_data,
                 resp_chan: tx,
@@ -379,7 +387,7 @@ impl HashringNode {
 
     pub async fn handle_cluster_health(&self) -> Result<StatusResponse> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::ClusterHealth { resp_chan: tx })
             .await
             .map_err(|e| {
@@ -395,7 +403,7 @@ impl HashringNode {
 
     pub async fn handle_get_topology(&self) -> Result<TopologyResponse> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::GetTopology { resp_chan: tx })
             .await
             .map_err(|e| {
@@ -414,7 +422,7 @@ impl HashringNode {
         request: TopologyChangeRequest,
     ) -> Result<TopologyResponse> {
         let (tx, rx) = oneshot::channel();
-        self.hashring_command_tx
+        self.cluster_inbox_tx
             .send(ClusterCommand::NewTopology {
                 request,
                 resp_chan: tx,
@@ -456,7 +464,7 @@ impl HashringNode {
 //         let node = HashringNode::new(node_id, settings).await.unwrap();
 
 //         assert_eq!(node.node_id, node_id);
-//         assert!(node.hashring_command_tx.is_closed() == false);
+//         assert!(node.cluster_inbox_tx.is_closed() == false);
 //         assert!(node.controller_handle.lock().unwrap().is_some());
 //     }
 

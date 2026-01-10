@@ -167,12 +167,11 @@ impl Node for GossipNode {
     }
 
     /// Check remaining calls for a client using local state
-    async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+    async fn check_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
         let (tx, rx) = oneshot::channel();
         self.gossip_command_tx
             .send(ClusterCommand::CheckLimit {
                 request: CheckCallsRequest {
-                    request_id,
                     client_id: client_id,
                     rule_name: None,
                     consume_token: false,
@@ -191,12 +190,11 @@ impl Node for GossipNode {
     }
 
     /// Apply rate limiting using local state only
-    async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<CheckCallsResponse>> {
+    async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
         let (tx, rx) = oneshot::channel();
         self.gossip_command_tx
             .send(ClusterCommand::RateLimit {
                 request: CheckCallsRequest {
-                    request_id: request_id,
                     client_id: client_id,
                     rule_name: None,
                     consume_token: true,

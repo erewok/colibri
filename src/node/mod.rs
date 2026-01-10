@@ -5,7 +5,6 @@ use tracing::warn;
 
 pub mod gossip;
 pub mod hashring;
-pub mod controller;
 pub mod messages;
 pub mod node_id;
 pub mod single_node;
@@ -24,8 +23,8 @@ pub trait Node {
     async fn new(settings: settings::Settings) -> Result<Self>
     where
         Self: Sized;
-    async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<messages::CheckCallsResponse>>;
-    async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<messages::CheckCallsResponse>>;
+    async fn check_limit(&self, client_id: String) -> Result<Option<messages::CheckCallsResponse>>;
+    async fn rate_limit(&self, client_id: String) -> Result<Option<messages::CheckCallsResponse>>;
     async fn expire_keys(&self) -> Result<()>;
 
     // New methods for named rules
@@ -42,13 +41,11 @@ pub trait Node {
     ) -> Result<Option<NamedRateLimitRule>>;
     async fn rate_limit_custom(
         &self,
-        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<messages::CheckCallsResponse>>;
     async fn check_limit_custom(
         &self,
-        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<messages::CheckCallsResponse>>;
@@ -107,12 +104,12 @@ impl NodeWrapper {
         self.get_node_ref().expire_keys().await
     }
 
-    pub async fn check_limit(&self, request_id: u64, client_id: String) -> Result<Option<messages::CheckCallsResponse>> {
-        self.get_node_ref().check_limit(request_id, client_id).await
+    pub async fn check_limit(&self, client_id: String) -> Result<Option<messages::CheckCallsResponse>> {
+        self.get_node_ref().check_limit(client_id).await
     }
 
-    pub async fn rate_limit(&self, request_id: u64, client_id: String) -> Result<Option<messages::CheckCallsResponse>> {
-        self.get_node_ref().rate_limit(request_id, client_id).await
+    pub async fn rate_limit(&self, client_id: String) -> Result<Option<messages::CheckCallsResponse>> {
+        self.get_node_ref().rate_limit(client_id).await
     }
 
     pub async fn create_named_rule(
@@ -142,20 +139,18 @@ impl NodeWrapper {
 
     pub async fn rate_limit_custom(
         &self,
-        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<messages::CheckCallsResponse>> {
-        self.get_node_ref().rate_limit_custom(request_id, rule_name, key).await
+        self.get_node_ref().rate_limit_custom(rule_name, key).await
     }
 
     pub async fn check_limit_custom(
         &self,
-        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<messages::CheckCallsResponse>> {
-        self.get_node_ref().check_limit_custom(request_id, rule_name, key).await
+        self.get_node_ref().check_limit_custom(rule_name, key).await
     }
 
     pub async fn handle_cluster_health(&self) -> Result<messages::StatusResponse> {

@@ -7,23 +7,24 @@ use tracing::instrument;
 use crate::error::Result;
 use crate::limiters;
 use crate::node;
-use crate::settings;
+use crate::node::messages;
+
 
 #[instrument(skip(state), level = "info")]
 pub async fn check_limit(
     Path(client_id): Path<String>,
     State(state): State<node::NodeWrapper>,
-) -> Result<axum::Json<Option<node::CheckCallsResponse>>> {
+) -> Result<axum::Json<Option<messages::CheckCallsResponse>>> {
     //
-    state.check_limit(0, client_id).await.map(axum::Json)
+    state.check_limit(client_id).await.map(axum::Json)
 }
 
 #[instrument(skip(state), level = "info")]
 pub async fn rate_limit(
     Path(client_id): Path<String>,
     State(state): State<node::NodeWrapper>,
-) -> Result<axum::Json<node::CheckCallsResponse>> {
-    let result = state.rate_limit(0, client_id).await?;
+) -> Result<axum::Json<messages::CheckCallsResponse>> {
+    let result = state.rate_limit(client_id).await?;
 
     match result {
         Some(resp) => Ok(axum::Json(resp)),
@@ -84,8 +85,8 @@ pub async fn delete_named_rate_limit_rule(
 pub async fn rate_limit_custom(
     Path((rule_name, key)): Path<(String, String)>,
     State(state): State<node::NodeWrapper>,
-) -> Result<axum::Json<node::CheckCallsResponse>> {
-    let result = state.rate_limit_custom(0, rule_name, key).await?;
+) -> Result<axum::Json<messages::CheckCallsResponse>> {
+    let result = state.rate_limit_custom(rule_name, key).await?;
 
     match result {
         Some(resp) => Ok(axum::Json(resp)),
@@ -97,9 +98,9 @@ pub async fn rate_limit_custom(
 pub async fn check_limit_custom(
     Path((rule_name, key)): Path<(String, String)>,
     State(state): State<node::NodeWrapper>,
-) -> Result<axum::Json<Option<node::CheckCallsResponse>>> {
+) -> Result<axum::Json<Option<messages::CheckCallsResponse>>> {
     state
-        .check_limit_custom(0, rule_name, key)
+        .check_limit_custom(rule_name, key)
         .await
         .map(axum::Json)
 }

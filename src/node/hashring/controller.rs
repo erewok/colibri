@@ -7,10 +7,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::cluster::ClusterMember;
 use crate::error::{ColibriError, Result};
-use crate::limiters::{NamedRateLimitRule, token_bucket::TokenBucketLimiter};
-use crate::node::commands::{AdminCommand, AdminResponse, BucketExport, ExportMetadata, Status, StatusResponse, TopologyChangeRequest, TopologyResponse};
+use crate::limiters::{NamedRateLimitRule, RateLimitConfig, TokenBucketLimiter};
+use crate::node::messages::{AdminCommand, CheckCallsRequest, CheckCallsResponse, Queueable, Status, StatusResponse, TopologyChangeRequest, TopologyResponse};
 use crate::node::{
-    single_node::local_check_limit, single_node::local_rate_limit, CheckCallsResponse, ClusterCommand, NodeName,
+    single_node::local_check_limit, single_node::local_rate_limit,  NodeName,
 };
 use crate::settings::{self, RunMode};
 
@@ -25,7 +25,7 @@ pub struct HashringController {
     number_of_buckets: u32,
     // Rate limiting state
     pub rate_limiter: Arc<Mutex<TokenBucketLimiter>>,
-    pub rate_limit_config: Arc<Mutex<settings::RateLimitConfig>>,
+    pub rate_limit_config: Arc<Mutex<RateLimitConfig>>,
     pub named_rate_limiters: Arc<Mutex<HashMap<String, Arc<Mutex<TokenBucketLimiter>>>>>,
     /// Cluster membership management - handles transport
     pub cluster_member: Arc<dyn ClusterMember>,
@@ -66,7 +66,7 @@ impl HashringController {
         // Create rate limiter
         let rl_settings = settings.rate_limit_settings();
         let rate_limiter = TokenBucketLimiter::new( rl_settings);
-        let rate_limit_config = settings::RateLimitConfig::new(settings.rate_limit_settings());
+        let rate_limit_config = RateLimitConfig::new(settings.rate_limit_settings());
 
         Ok(Self {
             node_name,
@@ -80,7 +80,7 @@ impl HashringController {
     }
 
     /// Start the main controller loop
-    pub async fn start(self, mut command_rx: mpsc::Receiver<ClusterCommand>) {
+    pub async fn start(self, mut command_rx: mpsc::Receiver<Queueable>) {
         info!("HashringController started for node {}", self.node_name);
 
         while let Some(command) = command_rx.recv().await {
@@ -95,62 +95,62 @@ impl HashringController {
         info!("HashringController stopped for node {}", self.node_name);
     }
 
-    async fn handle_command(&self, command: ClusterCommand) -> Result<()> {
-        match command {
-            ClusterCommand::CheckLimit {
-                request,
-                resp_chan,
-            } => {
-                let result = self.handle_check_limit(request.client_id).await;
-                let _ = resp_chan.send(result);
-            }
-            ClusterCommand::RateLimit {
-                request,
-                resp_chan,
-            } => {
-                let result = self.handle_rate_limit(request.client_id).await;
-                let _ = resp_chan.send(result);
-            }
-            ClusterCommand::ExpireKeys => {
-                self.handle_expire_keys().await?;
-            }
-            ClusterCommand::CreateNamedRule {
-                rule_name,
-                settings,
-                resp_chan,
-            } => {
-                let result = self.handle_create_named_rule(rule_name, settings).await;
-                let _ = resp_chan.send(result);
-            }
-            ClusterCommand::DeleteNamedRule {
-                rule_name,
-                resp_chan,
-            } => {
-                let result = self.handle_delete_named_rule(rule_name).await;
-                let _ = resp_chan.send(result);
-            }
-            ClusterCommand::ListNamedRules { resp_chan } => {
-                let result = self.handle_list_named_rules().await;
-                let _ = resp_chan.send(result);
-            }
-            ClusterCommand::GetNamedRule {
-                rule_name,
-                resp_chan,
-            } => {
-                let result = self.handle_get_named_rule(rule_name).await;
-                let _ = resp_chan.send(result);
-            }
-            ClusterCommand::AdminCommand {
-                command,
-                source,
-                resp_chan,
-            } => {
-                let result = self.handle_admin_command(command, source).await;
-                let _ = resp_chan.send(result);
-            }
-        }
-        Ok(())
-    }
+    // async fn handle_command(&self, command: ClusterCommand) -> Result<()> {
+    //     match command {
+    //         ClusterCommand::CheckLimit {
+    //             request,
+    //             resp_chan,
+    //         } => {
+    //             let result = self.handle_check_limit(request.client_id).await;
+    //             let _ = resp_chan.send(result);
+    //         }
+    //         ClusterCommand::RateLimit {
+    //             request,
+    //             resp_chan,
+    //         } => {
+    //             let result = self.handle_rate_limit(request.client_id).await;
+    //             let _ = resp_chan.send(result);
+    //         }
+    //         ClusterCommand::ExpireKeys => {
+    //             self.handle_expire_keys().await?;
+    //         }
+    //         ClusterCommand::CreateNamedRule {
+    //             rule_name,
+    //             settings,
+    //             resp_chan,
+    //         } => {
+    //             let result = self.handle_create_named_rule(rule_name, settings).await;
+    //             let _ = resp_chan.send(result);
+    //         }
+    //         ClusterCommand::DeleteNamedRule {
+    //             rule_name,
+    //             resp_chan,
+    //         } => {
+    //             let result = self.handle_delete_named_rule(rule_name).await;
+    //             let _ = resp_chan.send(result);
+    //         }
+    //         ClusterCommand::ListNamedRules { resp_chan } => {
+    //             let result = self.handle_list_named_rules().await;
+    //             let _ = resp_chan.send(result);
+    //         }
+    //         ClusterCommand::GetNamedRule {
+    //             rule_name,
+    //             resp_chan,
+    //         } => {
+    //             let result = self.handle_get_named_rule(rule_name).await;
+    //             let _ = resp_chan.send(result);
+    //         }
+    //         ClusterCommand::AdminCommand {
+    //             command,
+    //             source,
+    //             resp_chan,
+    //         } => {
+    //             let result = self.handle_admin_command(command, source).await;
+    //             let _ = resp_chan.send(result);
+    //         }
+    //     }
+    //     Ok(())
+    // }
 
     async fn handle_check_limit(&self, request: CheckCallsRequest) -> Result<CheckCallsResponse> {
         // Calculate which bucket owns this client
@@ -158,18 +158,13 @@ impl HashringController {
 
         // If this is our bucket, handle locally
         if bucket == self.bucket {
-            let result = local_check_limit(request.request_id, request.client_id.clone(), self.rate_limiter.clone()).await?;
-            info!(
-                "[RATE_CHECK] client:{} bucket:{} node:{} remaining:{}",
-                request.client_id, bucket, self.node_name.as_str(), result.calls_remaining
-            );
-            return Ok(result);
+           return local_check_limit(None, request.client_id.clone(), self.rate_limiter.clone()).await?.ok_or_else(|| ColibriError::RateLimit("Local check limit failed".to_string()));
         }
 
         // Get cluster nodes and find the target for this bucket
         let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
         if cluster_nodes.is_empty() {
-            return local_check_limit(client_id, self.rate_limiter.clone()).await;
+            return local_check_limit(None, request.client_id.clone(), self.rate_limiter.clone()).await?.ok_or_else(|| ColibriError::RateLimit("Local check limit failed".to_string()));
         }
 
         // Sort nodes for consistent bucket assignment
@@ -197,7 +192,7 @@ impl HashringController {
                 .await?
             {
                 Some(response_data) => {
-                    let response = messages::HashringResponse::deserialize(&response_data)?;
+                    let response = messages::deserialize(&response_data)?;
                     let result = response.result.map_err(ColibriError::RateLimit)?;
                     info!(
                         "[RATE_CHECK] client:{} bucket:{} target:{} remaining:{}",
@@ -210,7 +205,7 @@ impl HashringController {
                         "[CLUSTER_UNSUPPORTED] client:{} bucket:{} -> local",
                         client_id, bucket
                     );
-                    local_check_limit(client_id, self.rate_limiter.clone()).await
+                    local_check_limit(None, client_id, self.rate_limiter.clone()).await
                 }
             }
         } else {
@@ -218,7 +213,7 @@ impl HashringController {
                 "[BUCKET_MISSING] client:{} bucket:{} -> local",
                 client_id, bucket
             );
-            local_check_limit(client_id, self.rate_limiter.clone()).await
+            local_check_limit(None, client_id, self.rate_limiter.clone()).await
         }
     }
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::warn;
 
+pub mod controller;
 pub mod gossip;
 pub mod hashring;
 pub mod messages;

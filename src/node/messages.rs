@@ -21,6 +21,56 @@ pub struct Queueable {
     pub response_tx: oneshot::Sender<ClusterMessageResult>,
 }
 
+// ============================================================================
+// UNIFIED COMMAND TYPE (Phase 1)
+// ============================================================================
+
+/// Unified command type for controller queues
+/// This replaces both Queueable and raw ClusterMessage in channels.
+/// Uses the new Message enum for type-safe communication.
+pub struct Command {
+    pub envelope: MessageEnvelopeV2,
+    pub response_tx: oneshot::Sender<Result<Message>>,
+}
+
+impl Command {
+    /// Create a new command with a Message
+    pub fn new(
+        from: NodeName,
+        to: NodeName,
+        message: Message,
+        request_id: u64,
+    ) -> (Self, oneshot::Receiver<Result<Message>>) {
+        let envelope = MessageEnvelopeV2 {
+            from,
+            to,
+            message,
+            request_id,
+        };
+
+        let (tx, rx) = oneshot::channel();
+
+        (
+            Self {
+                envelope,
+                response_tx: tx,
+            },
+            rx,
+        )
+    }
+
+    /// Convert from Queueable (for backward compatibility)
+    pub fn from_queueable(queueable: Queueable) -> Result<(Self, oneshot::Receiver<Result<Message>>)> {
+        let message = Message::from(queueable.envelope.message);
+        Ok(Self::new(
+            queueable.envelope.from,
+            queueable.envelope.to,
+            message,
+            queueable.envelope.request_id,
+        ))
+    }
+}
+
 /// Serialize using postcard
 pub fn serialize<T: Serialize>(msg: &T) -> Result<bytes::Bytes> {
     to_allocvec(msg)
@@ -162,6 +212,65 @@ impl MessageEnvelope {
     }
     pub fn from_incoming_message(data: bytes::Bytes) -> Result<Self> {
         deserialize(&data)
+    }
+}
+
+// ============================================================================
+// MESSAGE ENVELOPE V2 (Phase 1)
+// ============================================================================
+
+/// Message routing and delivery information using new Message enum
+/// This is the V2 envelope that uses the unified Message type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageEnvelopeV2 {
+    /// Who sent this message
+    pub from: NodeName,
+    /// Who should receive this message
+    pub to: NodeName,
+    /// The actual message (unified Message enum)
+    pub message: Message,
+    /// Lamport clock timestamp for ordering
+    pub request_id: u64,
+}
+
+impl MessageEnvelopeV2 {
+    /// Create a new message envelope
+    pub fn new(from: NodeName, to: NodeName, message: Message, request_id: u64) -> Self {
+        Self {
+            from,
+            to,
+            message,
+            request_id,
+        }
+    }
+
+    /// Deserialize from incoming bytes
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        deserialize(data)
+    }
+
+    /// Serialize for sending
+    pub fn to_bytes(&self) -> Result<bytes::Bytes> {
+        serialize(self)
+    }
+
+    /// Convert from old MessageEnvelope
+    pub fn from_v1(v1: MessageEnvelope) -> Self {
+        Self {
+            from: v1.from,
+            to: v1.to,
+            message: Message::from(v1.message),
+            request_id: v1.request_id,
+        }
+    }
+
+    /// Convert to old MessageEnvelope (for backward compatibility)
+    /// Returns None if the message cannot be converted back
+    pub fn to_v1(&self) -> Option<MessageEnvelope> {
+        // This is a simplified conversion - in practice you'd need
+        // to handle all Message variants and convert them back
+        // For Phase 1, we'll just return None for now
+        None
     }
 }
 
@@ -510,4 +619,123 @@ mod message_tests {
             _ => panic!("Expected RateLimitRequest variant"),
         }
     }
+
+    // ============================================================================
+    // COMMAND AND MESSAGE ENVELOPE V2 TESTS
+    // ============================================================================
+
+    #[test]
+    fn test_command_creation() {
+        let message = Message::GetStatus;
+        let (command, rx) = Command::new(
+            NodeName::from("node-a"),
+            NodeName::from("node-b"),
+            message,
+            42,
+        );
+
+        assert_eq!(command.envelope.from, NodeName::from("node-a"));
+        assert_eq!(command.envelope.to, NodeName::from("node-b"));
+        assert_eq!(command.envelope.request_id, 42);
+        assert!(matches!(command.envelope.message, Message::GetStatus));
+
+        // Receiver should be available
+        drop(rx); // Just verify it exists
+    }
+
+    #[test]
+    fn test_message_envelope_v2_creation() {
+        let message = Message::RateLimitRequest(CheckCallsRequest {
+            client_id: "test".to_string(),
+            rule_name: None,
+            consume_token: true,
+        });
+
+        let envelope = MessageEnvelopeV2::new(
+            NodeName::from("sender"),
+            NodeName::from("receiver"),
+            message.clone(),
+            100,
+        );
+
+        assert_eq!(envelope.from, NodeName::from("sender"));
+        assert_eq!(envelope.to, NodeName::from("receiver"));
+        assert_eq!(envelope.request_id, 100);
+        assert!(matches!(envelope.message, Message::RateLimitRequest(_)));
+    }
+
+    #[test]
+    fn test_message_envelope_v2_serialization() {
+        let message = Message::GetTopology;
+        let envelope = MessageEnvelopeV2::new(
+            NodeName::from("node-x"),
+            NodeName::from("node-y"),
+            message,
+            200,
+        );
+
+        let serialized = envelope.to_bytes();
+        assert!(serialized.is_ok());
+
+        let bytes = serialized.unwrap();
+        let deserialized = MessageEnvelopeV2::from_bytes(&bytes);
+        assert!(deserialized.is_ok());
+
+        let restored = deserialized.unwrap();
+        assert_eq!(restored.from, NodeName::from("node-x"));
+        assert_eq!(restored.to, NodeName::from("node-y"));
+        assert_eq!(restored.request_id, 200);
+        assert!(matches!(restored.message, Message::GetTopology));
+    }
+
+    #[test]
+    fn test_message_envelope_v2_from_v1() {
+        let old_envelope = MessageEnvelope::new(
+            NodeName::from("old-sender"),
+            NodeName::from("old-receiver"),
+            ClusterMessage::StatusRequest,
+            300,
+        );
+
+        let new_envelope = MessageEnvelopeV2::from_v1(old_envelope);
+
+        assert_eq!(new_envelope.from, NodeName::from("old-sender"));
+        assert_eq!(new_envelope.to, NodeName::from("old-receiver"));
+        assert_eq!(new_envelope.request_id, 300);
+        assert!(matches!(new_envelope.message, Message::GetStatus));
+    }
+
+    #[test]
+    fn test_command_with_response_channel() {
+        let message = Message::RateLimitRequest(CheckCallsRequest {
+            client_id: "test-key".to_string(),
+            rule_name: None,
+            consume_token: false,
+        });
+
+        let (command, mut rx) = Command::new(
+            NodeName::from("requester"),
+            NodeName::from("responder"),
+            message,
+            500,
+        );
+
+        // Simulate sending a response
+        let response = Message::RateLimitResponse(CheckCallsResponse {
+            client_id: "test-key".to_string(),
+            rule_name: None,
+            calls_remaining: 100,
+        });
+
+        command.response_tx.send(Ok(response)).unwrap();
+
+        // Verify we can receive the response
+        let received = rx.try_recv();
+        assert!(received.is_ok());
+        assert!(matches!(
+            received.unwrap().unwrap(),
+            Message::RateLimitResponse(_)
+        ));
+    }
 }
+

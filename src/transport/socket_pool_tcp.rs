@@ -230,6 +230,11 @@ impl TcpSocketPool {
         self.peer_connections.keys().cloned().collect()
     }
 
+    /// Get the socket address for a specific peer
+    pub fn get_peer_address(&self, node_id: NodeId) -> Option<SocketAddr> {
+        self.peer_connections.get(&node_id).map(|info| info.socket_addr)
+    }
+
     /// Cleanup expired connections (simplified for now)
     pub async fn cleanup_expired_connections(&self) {
         // In a full implementation, this would clean up expired connections

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-// Removed: use crate::cluster::ClusterMember; - module doesn't exist
+use crate::cluster::ClusterMember;
 use crate::error::{ColibriError, Result};
 use crate::limiters::{NamedRateLimitRule, RateLimitConfig, TokenBucketLimiter};
 use crate::node::messages::{AdminCommand, CheckCallsRequest, CheckCallsResponse, Queueable, Status, StatusResponse, TopologyChangeRequest, TopologyResponse};
@@ -152,26 +152,569 @@ impl HashringController {
     //     Ok(())
     // }
 
-    // ===== Legacy methods removed in Phase 3 Task 2 =====
-    // The following 14 methods were removed (lines 155-718):
-    // - handle_check_limit() - referenced non-existent messages module
-    // - handle_rate_limit() - referenced non-existent messages module
-    // - handle_expire_keys() - deferred to future phase
-    // - handle_create_named_rule() - replaced by handle_message()
-    // - handle_delete_named_rule() - replaced by handle_message()
-    // - handle_list_named_rules() - replaced by handle_message()
-    // - handle_get_named_rule() - replaced by handle_message()
-    // - handle_rate_limit_custom() - replaced by handle_message()
-    // - handle_check_limit_custom() - replaced by handle_message()
-    // - handle_admin_command() - referenced non-existent AdminResponse type
-    // - handle_export_buckets() - incomplete, deferred
-    // - handle_import_buckets() - incomplete, deferred
-    // - handle_cluster_health() - replaced by handle_message()
-    // - handle_get_topology() - replaced by handle_message()
-    // - handle_new_topology() - replaced by handle_message()
-    //
-    // Use the new handle_message() method from Phase 2 (lines 117-199) instead.
-    // These legacy methods contained ~22 compilation errors from missing types.
+    async fn handle_check_limit(&self, request: CheckCallsRequest) -> Result<CheckCallsResponse> {
+        // Calculate which bucket owns this client
+        let bucket = consistent_hashing::jump_consistent_hash(&request.client_id, self.number_of_buckets);
+
+        // If this is our bucket, handle locally
+        if bucket == self.bucket {
+           return local_check_limit(None, request.client_id.clone(), self.rate_limiter.clone()).await?.ok_or_else(|| ColibriError::RateLimit("Local check limit failed".to_string()));
+        }
+
+        // Get cluster nodes and find the target for this bucket
+        let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        if cluster_nodes.is_empty() {
+            return local_check_limit(None, request.client_id.clone(), self.rate_limiter.clone()).await?.ok_or_else(|| ColibriError::RateLimit("Local check limit failed".to_string()));
+        }
+
+        // Sort nodes for consistent bucket assignment
+        let mut sorted_nodes = cluster_nodes;
+        sorted_nodes.sort();
+
+        if let Some(&target_addr) = sorted_nodes.get(bucket as usize) {
+            // Create request message
+            let request = messages::HashringRequest {
+                request_id: format!(
+                    "check_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ),
+                client_id: client_id.clone(),
+                consume_token: false,
+            };
+
+            // Send via cluster member
+            match self
+                .cluster_member
+                .send_request_response(target_addr, &request.serialize()?)
+                .await?
+            {
+                Some(response_data) => {
+                    let response = messages::deserialize(&response_data)?;
+                    let result = response.result.map_err(ColibriError::RateLimit)?;
+                    info!(
+                        "[RATE_CHECK] client:{} bucket:{} target:{} remaining:{}",
+                        client_id, bucket, target_addr, result.calls_remaining
+                    );
+                    Ok(result)
+                }
+                None => {
+                    warn!(
+                        "[CLUSTER_UNSUPPORTED] client:{} bucket:{} -> local",
+                        client_id, bucket
+                    );
+                    local_check_limit(None, client_id, self.rate_limiter.clone()).await
+                }
+            }
+        } else {
+            warn!(
+                "[BUCKET_MISSING] client:{} bucket:{} -> local",
+                client_id, bucket
+            );
+            local_check_limit(None, client_id, self.rate_limiter.clone()).await
+        }
+    }
+
+    async fn handle_rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
+        // Calculate which bucket owns this client
+        let bucket = consistent_hashing::jump_consistent_hash(&client_id, self.number_of_buckets);
+
+        // If this is our bucket, handle locally
+        if bucket == self.bucket {
+            let result = local_rate_limit(client_id.clone(), self.rate_limiter.clone()).await?;
+            if let Some(ref response) = result {
+                info!(
+                    "[RATE_LIMIT] client:{} bucket:{} node:{} remaining:{} allowed:true",
+                    client_id, bucket, self.node_name.as_str(), response.calls_remaining
+                );
+            } else {
+                info!(
+                    "[RATE_LIMIT] client:{} bucket:{} node:{} allowed:false",
+                    client_id, bucket, self.node_name.as_str()
+                );
+            }
+            return Ok(result);
+        }
+
+        // Get cluster nodes and find the target for this bucket
+        let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        if cluster_nodes.is_empty() {
+            return local_rate_limit(client_id, self.rate_limiter.clone()).await;
+        }
+
+        // Sort nodes for consistent bucket assignment
+        let mut sorted_nodes = cluster_nodes;
+        sorted_nodes.sort();
+
+        if let Some(&target_addr) = sorted_nodes.get(bucket as usize) {
+            // Create request message
+            let request = messages::HashringRequest {
+                request_id: format!(
+                    "limit_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ),
+                client_id: client_id.clone(),
+                consume_token: true,
+            };
+
+            // Send via cluster member
+            match self
+                .cluster_member
+                .send_request_response(target_addr, &request.serialize()?)
+                .await
+            {
+                Ok(Some(response_data)) => {
+                    match messages::HashringResponse::deserialize(&response_data) {
+                        Ok(response) => match response.result {
+                            Ok(check_response) => {
+                                info!(
+                                        "[RATE_LIMIT] client:{} bucket:{} target:{} remaining:{} allowed:true",
+                                        client_id, bucket, target_addr, check_response.calls_remaining
+                                    );
+                                Ok(Some(check_response))
+                            }
+                            Err(_) => {
+                                info!(
+                                    "[RATE_LIMIT] client:{} bucket:{} target:{} allowed:false",
+                                    client_id, bucket, target_addr
+                                );
+                                Ok(None)
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                "[ROUTE_FALLBACK] client:{} bucket:{} target:{} decode_error:{} -> local",
+                                client_id, bucket, target_addr, e
+                            );
+                            local_rate_limit(client_id, self.rate_limiter.clone()).await
+                        }
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        "[CLUSTER_UNSUPPORTED] client:{} bucket:{} -> local",
+                        client_id, bucket
+                    );
+                    local_rate_limit(client_id, self.rate_limiter.clone()).await
+                }
+                Err(e) => {
+                    warn!(
+                        "[ROUTE_FALLBACK] client:{} bucket:{} target:{} error:{} -> local",
+                        client_id, bucket, target_addr, e
+                    );
+                    local_rate_limit(client_id, self.rate_limiter.clone()).await
+                }
+            }
+        } else {
+            warn!(
+                "[BUCKET_MISSING] client:{} bucket:{} -> local",
+                client_id, bucket
+            );
+            local_rate_limit(client_id, self.rate_limiter.clone()).await
+        }
+    }
+
+    async fn handle_expire_keys(&self) -> Result<()> {
+        let mut rate_limiter = self.rate_limiter.lock().map_err(|e| {
+            ColibriError::Concurrency(format!("Failed to acquire rate_limiter lock: {}", e))
+        })?;
+        rate_limiter.expire_keys();
+        Ok(())
+    }
+
+    async fn handle_create_named_rule(
+        &self,
+        rule_name: String,
+        settings: settings::RateLimitSettings,
+    ) -> Result<()> {
+        // Create the rule locally
+        {
+            let mut config = self.rate_limit_config.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            let rule = NamedRateLimitRule {
+                name: rule_name.clone(),
+                settings: settings.clone(),
+            };
+            config.add_named_rule(&rule);
+        }
+
+        // Create the rate limiter for this rule
+        {
+            let rate_limiter = TokenBucketLimiter::new(settings.clone());
+            let mut limiters = self.named_rate_limiters.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            limiters.insert(rule_name.clone(), Arc::new(Mutex::new(rate_limiter)));
+        }
+
+        // TODO: Synchronize the rule to all other nodes via extended AdminCommand protocol
+        debug!(
+            "Created named rule {} locally (cluster sync not yet implemented)",
+            rule_name
+        );
+        Ok(())
+    }
+
+    async fn handle_delete_named_rule(&self, rule_name: String) -> Result<()> {
+        // Delete the rule locally
+        {
+            let mut config = self.rate_limit_config.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+            })?;
+            config.remove_named_rule(&rule_name);
+        }
+
+        // Remove the rate limiter for this rule
+        {
+            let mut limiters = self.named_rate_limiters.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+            })?;
+            limiters.remove(&rule_name);
+        }
+
+        // TODO: Synchronize the deletion to all other nodes via extended AdminCommand protocol
+        debug!(
+            "Deleted named rule {} locally (cluster sync not yet implemented)",
+            rule_name
+        );
+        Ok(())
+    }
+
+    async fn handle_list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
+        let config = self.rate_limit_config.lock().map_err(|e| {
+            ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+        })?;
+        Ok(config.list_named_rules())
+    }
+
+    async fn handle_get_named_rule(
+        &self,
+        rule_name: String,
+    ) -> Result<Option<NamedRateLimitRule>> {
+        let config = self.rate_limit_config.lock().map_err(|e| {
+            ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+        })?;
+        Ok(config.get_named_rule_settings(&rule_name).map(|settings| {
+            NamedRateLimitRule {
+                name: rule_name,
+                settings: settings.clone(),
+            }
+        }))
+    }
+
+    async fn handle_rate_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
+        // Calculate which bucket owns this key
+        let bucket = consistent_hashing::jump_consistent_hash(&key, self.number_of_buckets);
+
+        // If this is our bucket, handle locally
+        if bucket == self.bucket {
+            // Get the named rate limiter
+            let limiter = {
+                let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                    ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                })?;
+                limiters.get(&rule_name).cloned()
+            };
+
+            if let Some(limiter) = limiter {
+                let mut rate_limiter = limiter.lock().map_err(|e| {
+                    ColibriError::Concurrency(format!("Failed to acquire rate limiter lock: {}", e))
+                })?;
+
+                // Apply rate limiting using correct API
+                if let Some(remaining) = rate_limiter.limit_calls_for_client(key.clone()) {
+                    Ok(Some(CheckCallsResponse {
+                        client_id: key,
+                        calls_remaining: remaining,
+                    }))
+                } else {
+                    Ok(Some(CheckCallsResponse {
+                        client_id: key,
+                        calls_remaining: 0,
+                    }))
+                }
+            } else {
+                Err(ColibriError::Config(format!(
+                    "Named rule '{}' not found",
+                    rule_name
+                )))
+            }
+        } else {
+            // Find the address for the owning bucket
+            // Get cluster nodes and find target for bucket
+            let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+            let mut sorted_nodes = cluster_nodes;
+            sorted_nodes.sort();
+
+            if let Some(&target_addr) = sorted_nodes.get(bucket as usize) {
+                // TODO: Implement TCP-based custom rate limiting for remote nodes
+                warn!(
+                    "Remote custom rate limiting not yet implemented for {}, falling back to local",
+                    target_addr
+                );
+
+                // For now, fallback to local processing
+                let limiter = {
+                    let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                    })?;
+                    limiters.get(&rule_name).cloned()
+                };
+
+                if let Some(limiter) = limiter {
+                    let mut rate_limiter = limiter.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!(
+                            "Failed to acquire rate limiter lock: {}",
+                            e
+                        ))
+                    })?;
+
+                    if let Some(remaining) = rate_limiter.limit_calls_for_client(key.clone()) {
+                        Ok(Some(CheckCallsResponse {
+                            client_id: key,
+                            calls_remaining: remaining,
+                        }))
+                    } else {
+                        Ok(Some(CheckCallsResponse {
+                            client_id: key,
+                            calls_remaining: 0,
+                        }))
+                    }
+                } else {
+                    Err(ColibriError::Config(format!(
+                        "Named rule '{}' not found",
+                        rule_name
+                    )))
+                }
+            } else {
+                // Fall back to local processing if no target node found
+                let limiter = {
+                    let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                    })?;
+                    limiters.get(&rule_name).cloned()
+                };
+
+                if let Some(limiter) = limiter {
+                    let mut rate_limiter = limiter.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!(
+                            "Failed to acquire rate limiter lock: {}",
+                            e
+                        ))
+                    })?;
+
+                    if let Some(remaining) = rate_limiter.limit_calls_for_client(key.clone()) {
+                        Ok(Some(CheckCallsResponse {
+                            client_id: key,
+                            calls_remaining: remaining,
+                        }))
+                    } else {
+                        Ok(Some(CheckCallsResponse {
+                            client_id: key,
+                            calls_remaining: 0,
+                        }))
+                    }
+                } else {
+                    Err(ColibriError::Config(format!(
+                        "Named rule '{}' not found",
+                        rule_name
+                    )))
+                }
+            }
+        }
+    }
+
+    async fn handle_check_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<CheckCallsResponse> {
+        // Calculate which bucket owns this key
+        let bucket = consistent_hashing::jump_consistent_hash(&key, self.number_of_buckets);
+
+        // If this is our bucket, handle locally
+        if bucket == self.bucket {
+            // Get the named rate limiter
+            let limiter = {
+                let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                    ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                })?;
+                limiters.get(&rule_name).cloned()
+            };
+
+            if let Some(limiter) = limiter {
+                let rate_limiter = limiter.lock().map_err(|e| {
+                    ColibriError::Concurrency(format!("Failed to acquire rate limiter lock: {}", e))
+                })?;
+
+                let remaining = rate_limiter.check_calls_remaining_for_client(&key);
+                Ok(CheckCallsResponse {
+                    client_id: key,
+                    calls_remaining: remaining,
+                })
+            } else {
+                Err(ColibriError::Config(format!(
+                    "Named rule '{}' not found",
+                    rule_name
+                )))
+            }
+        } else {
+            // Find the address for the owning bucket
+            // Get cluster nodes and find target for bucket
+            let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+            let mut sorted_nodes = cluster_nodes;
+            sorted_nodes.sort();
+
+            if let Some(&target_addr) = sorted_nodes.get(bucket as usize) {
+                // TODO: Implement TCP-based custom check limiting for remote nodes
+                warn!("Remote custom check limiting not yet implemented for {}, falling back to local", target_addr);
+
+                // For now, fallback to local processing
+                let limiter = {
+                    let limiters = self.named_rate_limiters.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
+                    })?;
+                    limiters.get(&rule_name).cloned()
+                };
+
+                if let Some(limiter) = limiter {
+                    let rate_limiter = limiter.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!(
+                            "Failed to acquire rate limiter lock: {}",
+                            e
+                        ))
+                    })?;
+
+                    let remaining = rate_limiter.check_calls_remaining_for_client(&key);
+                    Ok(CheckCallsResponse {
+                        client_id: key,
+                        calls_remaining: remaining,
+                    })
+                } else {
+                    Err(ColibriError::Config(format!(
+                        "Named rule '{}' not found",
+                        rule_name
+                    )))
+                }
+            } else {
+                Err(ColibriError::Config(format!(
+                    "No node found for bucket {}",
+                    bucket
+                )))
+            }
+        }
+    }
+
+    async fn handle_admin_command(
+        &self,
+        command: AdminCommand,
+        source: SocketAddr,
+    ) -> Result<AdminResponse> {
+        debug!("Handling admin command {:?} from {}", command, source);
+
+        match command {
+            AdminCommand::GetTopology => {
+                // TODO: Implement topology response
+                Ok(AdminResponse::Error {
+                    message: "Topology response not yet implemented".to_string(),
+                })
+            }
+            AdminCommand::ExportBuckets => {
+                // TODO: Implement bucket export
+                Ok(AdminResponse::Error {
+                    message: "Bucket export not yet implemented".to_string(),
+                })
+            }
+            AdminCommand::ImportBuckets { .. } => {
+                // TODO: Implement bucket import
+                Ok(AdminResponse::Ack)
+            }
+            AdminCommand::HealthCheck => {
+                // TODO: Implement health check
+                Ok(AdminResponse::Error {
+                    message: "Health check not yet implemented".to_string(),
+                })
+            }
+            _ => {
+                warn!("Unhandled admin command: {:?}", command);
+                Ok(AdminResponse::Error {
+                    message: format!("Unhandled command: {:?}", command),
+                })
+            }
+        }
+    }
+
+    async fn handle_export_buckets(&self) -> Result<BucketExport> {
+        // TODO: Implement actual bucket data export
+        warn!("HashringController::handle_export_buckets not yet fully implemented");
+
+        Ok(BucketExport {
+            client_data: Vec::new(),
+            metadata: ExportMetadata {
+                node_name: self.node_name.clone(),
+                export_timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                node_type: RunMode::Hashring,
+                bucket_count: 1, // TODO: Get actual bucket count
+            },
+        })
+    }
+
+    async fn handle_import_buckets(
+        &self,
+        _import_data: BucketExport,
+    ) -> Result<()> {
+        // TODO: Implement bucket import logic with UDP transport
+        warn!("HashringController::handle_import_buckets not yet fully implemented");
+        Ok(())
+    }
+
+    async fn handle_cluster_health(&self) -> Result<StatusResponse> {
+        // TODO: Implement actual health checks with UDP transport
+        Ok(StatusResponse {
+            node_name: self.node_name.clone(),
+            node_type: RunMode::Hashring,
+            status: Status::Healthy,
+            active_clients: 0,          // TODO: implement client counting
+            last_topology_change: None, // TODO: track topology changes
+        })
+    }
+
+    async fn handle_get_topology(&self) -> Result<TopologyResponse> {
+        let cluster_nodes = self.cluster_member.get_cluster_nodes().await;
+        let peer_nodes: Vec<String> = cluster_nodes.iter().map(|addr| addr.to_string()).collect();
+
+        Ok(TopologyResponse {
+            node_name: self.node_name.clone(),
+            node_type: RunMode::Hashring,
+            owned_bucket: Some(self.bucket),
+            replica_buckets: vec![], // TODO: calculate replica buckets
+            cluster_nodes,
+            peer_nodes,
+            errors: None,
+        })
+    }
+
+    async fn handle_new_topology(
+        &self,
+        _request: TopologyChangeRequest,
+    ) -> Result<TopologyResponse> {
+        // TODO: Implement topology change with UDP cluster member
+        warn!("HashringController::handle_new_topology not yet fully implemented");
+        self.handle_get_topology().await
+    }
 }
 
 #[cfg(test)]

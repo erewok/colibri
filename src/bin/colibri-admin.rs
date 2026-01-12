@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 
 use colibri::cli::Cli as ColibriCli;
-use colibri::cluster::{admin::AdminCommandDispatcher, ClusterFactory};
 use colibri::error::Result;
 
 #[derive(Parser)]

@@ -31,7 +31,7 @@ crdts = "7.3.2"
 figment = { version = "0.10.19", features = ["toml"] }
 gxhash = "3.4"
 hostname = "0.4.2"
-indexmap = "2.12.1"
+indexmap = {version = "2.13.0", features = ["serde"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
 papaya = { version = "0.2.3", features = ["serde"] }

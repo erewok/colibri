@@ -8,14 +8,12 @@ use tracing::{debug, error, info};
 use super::GossipController;
 use crate::error::{ColibriError, Result};
 use crate::limiters::NamedRateLimitRule;
-use crate::node::commands::{AdminCommand, AdminResponse};
+// Removed: use crate::node::commands::{AdminCommand, AdminResponse}; - types don't exist
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, StatusResponse, TopologyChangeRequest, TopologyResponse,
 };
-use crate::node::{
-    commands::{BucketExport, ClusterCommand, ExportMetadata},
-    Node, NodeName,
-};
+use crate::node::{Node, NodeName};
+// Removed: commands::{BucketExport, ClusterCommand, ExportMetadata} - types don't exist
 use crate::settings::RunMode;
 use crate::{settings, transport};
 

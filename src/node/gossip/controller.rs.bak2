@@ -11,7 +11,7 @@ use crate::error::{ColibriError, Result};
 use crate::limiters::{NamedRateLimitRule, distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter}};
 use crate::node::controller::BaseController;
 use crate::node::messages::{CheckCallsResponse, Message};
-use crate::node::{NodeId, NodeName};
+use crate::node::{NodeId, NodeName, commands::ClusterCommand};
 use crate::settings::{self, RunMode};
 use crate::transport::TcpTransport;
 
@@ -347,13 +347,255 @@ impl GossipController {
             .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))
             .map(|rl| rl.gossip_delta_state())
     }
+    /// Handle incoming gossip cmd from our channel
+    pub async fn handle_command(&self, cmd: ClusterMessage) -> Result<()> {
+        match cmd {
+            ClusterMessage::ExpireKeys => {
+                self.rate_limiter
+                    .lock()
+                    .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))
+                    .map(|mut rl| rl.expire_keys())?;
+                Ok(())
+            }
+            ClusterMessage:: { data, peer_addr } => {
+                self.process_gossip_packet(data, peer_addr).await
+            }
+            GossipCommand::CheckLimit {
+                client_id,
+                resp_chan,
+            } => {
+                let rl = self
+                    .rate_limiter
+                    .lock()
+                    .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))?;
+                let calls_remaining = rl.check_calls_remaining_for_client(&client_id);
+                info!(
+                    "[GOSSIP_CHECK] node:{} client:{} remaining:{}",
+                    self.node_id, client_id, calls_remaining
+                );
 
-    // ===== Legacy method removed in Phase 3 Task 2 =====
-    // handle_command() method (248 lines) was removed because it referenced
-    // non-existent types (ClusterMessage, GossipCommand).
-    // It was replaced by the new handle_message() method from Phase 2 (lines 111-250).
-    // This removal eliminated ~9 compilation errors.
+                if resp_chan
+                    .send(Ok(CheckCallsResponse {
+                        client_id,
+                        calls_remaining,
+                    }))
+                    .is_err()
+                {
+                    error!(
+                        "[{}] Failed sending oneshot check_limit response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+            GossipCommand::RateLimit {
+                client_id,
+                resp_chan,
+            } => {
+                let dstate: Option<DistributedBucketExternal>;
+                // let mutable result with MutexGuard drop after this block
+                {
+                    let mut result = self
+                        .rate_limiter
+                        .lock()
+                        .map_err(|e| ColibriError::Concurrency(format!("Mutex lock fail {}", e)))?;
 
+                    let calls_left = result.limit_calls_for_client(client_id.to_string());
+                    let response: Option<CheckCallsResponse>;
+                    if let Some(calls_remaining) = calls_left {
+                        response = Some(CheckCallsResponse {
+                            client_id: client_id.clone(),
+                            calls_remaining,
+                        });
+                        info!(
+                            "[GOSSIP_LIMIT] node: {} client:{} remaining:{} allowed:true",
+                            self.node_id, client_id, calls_remaining
+                        );
+                    } else {
+                        response = None;
+                        info!(
+                            "[GOSSIP_LIMIT] node:{} client:{} allowed:false",
+                            self.node_id, client_id
+                        );
+                    }
+                    if resp_chan.send(Ok(response)).is_err() {
+                        error!(
+                            "[{}] Failed sending oneshot rate_limit response",
+                            self.node_id
+                        );
+                    }
+                    dstate = result.client_delta_state_for_gossip(&client_id);
+                }
+                // Send immediate gossip update after rate limiting
+                if let Some(dstate) = dstate {
+                    let message = GossipMessage::DeltaStateSync {
+                        updates: vec![dstate],
+                        sender_node_id: self.node_id,
+                        response_addr: self.response_addr,
+                        propagation_factor: 3, // Limit spread
+                    };
+                    let packet = GossipPacket::new(message);
+                    self.send_gossip_packet(packet).await?;
+                }
+                Ok(())
+            }
+
+            // Handle rate limit configuration commands
+            GossipCommand::CreateNamedRule {
+                rule_name,
+                settings,
+                resp_chan,
+            } => {
+                let result = self
+                    .create_named_rule_local(rule_name.clone(), settings.clone())
+                    .await;
+                if result.is_ok() {
+                    // Gossip the new rule to other nodes
+                    let message = GossipMessage::RateLimitConfigCreate {
+                        response_addr: self.response_addr,
+                        sender_node_id: self.node_id,
+                        rule_name,
+                        settings,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    let packet = GossipPacket::new(message);
+                    if let Err(e) = self.send_gossip_packet(packet).await {
+                        error!(
+                            "[{}] Failed to gossip new rule creation: {}",
+                            self.node_id, e
+                        );
+                    }
+                }
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending create_named_rule response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+            GossipCommand::GetNamedRule {
+                rule_name,
+                resp_chan,
+            } => {
+                let result = self.get_named_rule_local(&rule_name).await;
+                if resp_chan.send(result).is_err() {
+                    error!("[{}] Failed sending get_named_rule response", self.node_id);
+                }
+                Ok(())
+            }
+
+            GossipCommand::DeleteNamedRule {
+                rule_name,
+                resp_chan,
+            } => {
+                let result = self.delete_named_rule_local(rule_name.clone()).await;
+                if result.is_ok() {
+                    // Gossip the rule deletion to other nodes
+                    let message = GossipMessage::RateLimitConfigDelete {
+                        response_addr: self.response_addr,
+                        sender_node_id: self.node_id,
+                        rule_name,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    let packet = GossipPacket::new(message);
+                    if let Err(e) = self.send_gossip_packet(packet).await {
+                        error!("[{}] Failed to gossip rule deletion: {}", self.node_id, e);
+                    }
+                }
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending delete_named_rule response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+
+            GossipCommand::ListNamedRules { resp_chan } => {
+                let result = self.list_named_rules_local().await;
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending list_named_rules response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+
+            GossipCommand::RateLimitCustom {
+                rule_name,
+                key,
+                resp_chan,
+            } => {
+                let result = self.rate_limit_custom_local(rule_name, key).await;
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending rate_limit_custom response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+
+            GossipCommand::CheckLimitCustom {
+                rule_name,
+                key,
+                resp_chan,
+            } => {
+                let result = self.check_limit_custom_local(rule_name, key).await;
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending check_limit_custom response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+
+            // Cluster management commands - delegate to cluster_member
+            GossipCommand::GetClusterNodes { resp_chan } => {
+                let result = Ok(self.cluster_member.get_cluster_nodes().await);
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending get_cluster_nodes response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+
+            GossipCommand::AddClusterNode { address, resp_chan } => {
+                self.cluster_member.add_node(address).await;
+                let result = Ok(());
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending add_cluster_node response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+
+            GossipCommand::RemoveClusterNode { address, resp_chan } => {
+                self.cluster_member.remove_node(address).await;
+                let result = Ok(());
+                if resp_chan.send(result).is_err() {
+                    error!(
+                        "[{}] Failed sending remove_cluster_node response",
+                        self.node_id
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
     /// Process an incoming gossip packet
     pub async fn process_gossip_packet(&self, data: Bytes, peer_addr: SocketAddr) -> Result<()> {
         match GossipPacket::deserialize(&data) {

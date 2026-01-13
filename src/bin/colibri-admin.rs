@@ -1,37 +1,41 @@
 //! Colibri cluster administration tool
-//! Admin commands use  internal transport (not accessible to public clients)
+//!
+//! Sends internal TCP messages to cluster nodes for administrative operations.
+//! Not exposed via public HTTP API - uses direct TCP transport.
 //!
 //! # Examples
 //! ```
-//! # Add a new node to the cluster
-//! colibri-admin add-node 192.168.1.100:8080
-//! # Remove a failed node
-//! colibri-admin remove-node 192.168.1.50:8080
-//! # Change entire cluster topology
-//! colibri-admin change-topology -n 192.168.1.1:8080 -n 192.168.1.2:8080 -n 192.168.1.3:8080
-//! # Get status from node mentioned in config file
-//! colibri-admin get-status
+//! # Get status from a node
+//! colibri-admin get-status --target 192.168.1.100:8421
+//!
+//! # Get topology from a node
+//! colibri-admin get-topology --target 192.168.1.100:8421
+//!
 //! # Export data from a node (for migration)
-//! colibri-admin export-buckets -f exported_data.bin
+//! colibri-admin export-buckets --target 192.168.1.100:8421 -f exported_data.bin
+//!
 //! # Import data to a node (for migration)
-//! colibri-admin import-buckets -f exported_data.bin
+//! colibri-admin import-buckets --target 192.168.1.100:8421 -f exported_data.bin
 //! ```
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use colibri::cli::Cli as ColibriCli;
-use colibri::error::Result;
+use colibri::error::{ColibriError, Result};
+use colibri::node::messages::Message;
+use colibri::transport::TcpTransport;
 
 #[derive(Parser)]
 #[command(name = "colibri-admin")]
 #[command(about = "Colibri cluster administration tool")]
 struct Cli {
-    /// Whether to write updated configuration back to file
-    #[arg(short, long, default_value_t = false)]
-    write_config: bool,
+    /// Target node address (peer TCP port, not client API port)
+    /// If not specified, uses first node from config topology
+    #[arg(short, long, global = true)]
+    target: Option<SocketAddr>,
 
     #[command(subcommand)]
     command: Commands,
@@ -39,28 +43,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Add a new node to cluster membership
-    AddNode {
-        /// Address of the node to add
-        address: SocketAddr,
-    },
-    /// Remove a node from cluster membership
-    RemoveNode {
-        /// Address of the node to remove
-        address: SocketAddr,
-    },
     /// Get cluster status from a node
     GetStatus,
+
     /// Get cluster topology from a node
     GetTopology,
-    /// Import buckets to a node
-    ImportBuckets {
-        /// File to read imported data from
-        file: PathBuf,
-    },
-    /// Export buckets from a node
+
+    /// Export buckets from a node (for migration)
     ExportBuckets {
         /// File to write exported data to
+        #[arg(short, long)]
+        file: PathBuf,
+    },
+
+    /// Import buckets to a node (for migration)
+    ImportBuckets {
+        /// File to read imported data from
+        #[arg(short, long)]
         file: PathBuf,
     },
 }
@@ -70,86 +69,92 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
-    let colibri_existing_conf: ColibriCli = ColibriCli::parse_with_file();
-    let mut update_config = colibri_existing_conf.clone();
 
-    let colibri_existing_settings = colibri_existing_conf.into_settings();
+    // Load config to get topology
+    let colibri_conf: ColibriCli = ColibriCli::parse_with_file();
+    let settings = colibri_conf.into_settings();
 
-    let cluster_member = ClusterFactory::create_from_settings(
-        colibri_existing_settings.node_id(),
-        &colibri_existing_settings,
-    )
-    .await?;
+    // Determine target node
+    let target = if let Some(addr) = cli.target {
+        addr
+    } else {
+        // Use first node from topology
+        let cluster_topology = settings.cluster_topology();
+        cluster_topology
+            .all_nodes()
+            .first()
+            .map(|(_, addr)| *addr)
+            .ok_or_else(|| {
+                ColibriError::Config(
+                    "No target specified and no nodes in topology".to_string()
+                )
+            })?
+    };
 
-    let dispatcher = AdminCommandDispatcher::new(cluster_member);
+    info!("Sending admin command to node at {}", target);
 
-    // Admin uses internal transport
+    // Create TCP transport for sending internal messages
+    let transport_config = settings.transport_config();
+    let transport = TcpTransport::new(&transport_config).await?;
+
+    // Execute command
     match cli.command {
-        // possibly writes back new config file
-        Commands::AddNode { address } => {
-            if !colibri_existing_settings
-                .topology
-                .contains(&address.to_string())
-            {
-                info!("Adding node {} to topology", address);
-                // Dispatch command to add node
-                dispatcher.add_cluster_node(address).await?;
-
-                // Update local config
-                update_config.topology.push(address.to_string());
-
-                if cli.write_config {
-                    if let Some(config_path) = &colibri_existing_settings.config_file {
-                        update_config.to_config_file()?;
-                        warn!(
-                            "Wrote updated configuration with new topology to {:?}",
-                            config_path
-                        );
-                    } else {
-                        warn!("No configuration file path specified, not writing updated configuration to disk");
-                    }
-                }
-            } else {
-                println!("Node {} already in topology", address);
-            }
-        }
-        Commands::RemoveNode { address } => {
-            if colibri_existing_settings
-                .topology
-                .contains(&address.to_string())
-            {
-                info!("Removing node {} from topology", address);
-                // Dispatch command to remove node
-                dispatcher.remove_cluster_node(address).await?;
-
-                // Update local config
-                update_config.topology.retain(|x| x != &address.to_string());
-
-                if cli.write_config {
-                    if let Some(config_path) = &colibri_existing_settings.config_file {
-                        update_config.to_config_file()?;
-                        warn!(
-                            "Wrote updated configuration with new topology to {:?}",
-                            config_path
-                        );
-                    } else {
-                        warn!("No configuration file path specified, not writing updated configuration to disk");
-                    }
-                }
-            } else {
-                println!("Node {} not found in topology", address);
-            }
-        }
         Commands::GetStatus => {
-            let response = dispatcher.get_cluster_stats().await;
-            info!("Cluster stats: {:?}", response);
+            let message = Message::GetStatus;
+            match transport.send_message_request_response(target, &message).await? {
+                Message::StatusResponse(response) => {
+                    println!("Status Response:");
+                    println!("  Status: {:?}", response.status);
+                    println!("  Node: {}", response.node_name);
+                    println!("  Mode: {:?}", response.node_type);
+                    println!("  Bucket Count: {:?}", response.bucket_count);
+                    println!("  Last Topology Change: {:?}", response.last_topology_change);
+                }
+                other => {
+                    error!("Unexpected response: {:?}", other);
+                    return Err(ColibriError::Api(
+                        "Unexpected response type for GetStatus".to_string()
+                    ));
+                }
+            }
         }
+
         Commands::GetTopology => {
-            let response = dispatcher.get_cluster_topology().await;
-            info!("Cluster topology: {:?}", response);
+            let message = Message::GetTopology;
+            match transport.send_message_request_response(target, &message).await? {
+                Message::TopologyResponse(response) => {
+                    println!("Topology Response:");
+                    println!("  Status: {:?}", response.status.status);
+                    println!("  Topology:");
+                    for (name, addr) in &response.topology {
+                        println!("    {} -> {:?}", name, addr);
+                    }
+                }
+                other => {
+                    error!("Unexpected response: {:?}", other);
+                    return Err(ColibriError::Api(
+                        "Unexpected response type for GetTopology".to_string()
+                    ));
+                }
+            }
         }
-        Commands::ImportBuckets { file } => todo!(),
-        Commands::ExportBuckets { file } => todo!(),
+
+        Commands::ExportBuckets { file } => {
+            error!("ExportBuckets not yet implemented");
+            println!("Export buckets functionality will write to: {:?}", file);
+            return Err(ColibriError::Api(
+                "ExportBuckets not yet implemented".to_string()
+            ));
+        }
+
+        Commands::ImportBuckets { file } => {
+            error!("ImportBuckets not yet implemented");
+            println!("Import buckets functionality will read from: {:?}", file);
+            return Err(ColibriError::Api(
+                "ImportBuckets not yet implemented".to_string()
+            ));
+        }
     }
+
     Ok(())
 }

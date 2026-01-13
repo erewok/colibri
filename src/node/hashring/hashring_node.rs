@@ -1,14 +1,18 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::oneshot;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::HashringController;
 use crate::error::{ColibriError, Result};
 use crate::limiters::NamedRateLimitRule;
-use crate::node::{Node, NodeName, messages};
-use crate::{settings, transport};
+use crate::node::{Node, NodeName};
+use crate::node::messages::{
+    CheckCallsRequest, CheckCallsResponse, Message, StatusResponse,
+    TopologyChangeRequest, TopologyResponse,
+    BucketExport, ExportMetadata,
+};
+use crate::settings;
 
 /// Replication factor for data distribution
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -24,64 +28,20 @@ pub enum ReplicationFactor {
 pub struct HashringNode {
     pub node_name: NodeName,
 
-    /// Command sender to the controller
-    pub cluster_inbox_tx: Arc<tokio::sync::mpsc::Sender<messages::Queueable>>,
-
-    /// Controller handle
-    pub controller_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// The hashring controller
+    pub controller: Arc<HashringController>,
 
     /// Receiver handle
     pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl HashringNode {
-    /// Run the TCP Receiver
-    async fn run_receiver(
-        listen_tcp: std::net::SocketAddr,
-        cluster_inbox_tx: Arc<tokio::sync::mpsc::Sender<messages::Queueable>>,
-    ) -> Result<()> {
-        let (tcp_send, mut tcp_recv) = tokio::sync::mpsc::channel(1000);
-        let receiver = transport::TcpReceiver::new(listen_tcp, Arc::new(tcp_send)).await?;
-
-        let handle = tokio::spawn(async move {
-            receiver.start().await;
-        });
-
-        loop {
-            // Handle incoming messages from network
-            if let Some((data, _peer_addr)) = tcp_recv.recv().await {
-                // Turn into ClusterCommand and send to main loop
-                let msg = messages::MessageEnvelope::from_incoming_message(data)?;
-                let (response_tx, response_rx) = oneshot::channel();
-                let queueable = messages::Queueable {
-                    envelope: msg,
-                    response_tx
-                };
-                if let Err(e) = cluster_inbox_tx.send(queueable).await {
-                    error!("Failed to send incoming message to main loop: {}", e);
-                }
-            }
-        }
-    }
-
-    /// Stop the hashring controller task
-    pub fn stop_controller(&self) {
-        if let Ok(mut handle) = self.controller_handle.lock() {
-            if let Some(join_handle) = handle.take() {
-                join_handle.abort();
-                info!("Hashring controller task stopped");
-            }
-        } else {
-            error!("Failed to acquire lock on controller_handle during shutdown");
-        }
-    }
-
-    /// Stop the gossip receiver task
+    /// Stop the hashring receiver task
     pub fn stop_receiver(&self) {
         if let Ok(mut handle) = self.receiver_handle.lock() {
             if let Some(join_handle) = handle.take() {
                 join_handle.abort();
-                info!("Gossip receiver task stopped");
+                info!("Hashring receiver task stopped");
             }
         } else {
             error!("Failed to acquire lock on receiver_handle during shutdown");
@@ -90,19 +50,13 @@ impl HashringNode {
 
     /// Stop all background tasks
     pub fn stop_all_tasks(&self) {
-        self.stop_controller();
         self.stop_receiver();
     }
 }
 
 impl Drop for HashringNode {
     fn drop(&mut self) {
-        // Clean up tasks when the node is dropped
-        if let Ok(mut controller_handle) = self.controller_handle.lock() {
-            if let Some(handle) = controller_handle.take() {
-                handle.abort();
-            }
-        }
+        // Clean up receiver task when the node is dropped
         if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
             if let Some(handle) = receiver_handle.take() {
                 handle.abort();
@@ -132,86 +86,69 @@ impl Node for HashringNode {
             settings.topology
         );
 
-        // Set up command channel
-        let (cluster_inbox_tx, hashring_command_rx): (
-            tokio::sync::mpsc::Sender<messages::Queueable>,
-            tokio::sync::mpsc::Receiver<messages::Queueable>,
-        ) = tokio::sync::mpsc::channel(1000);
+        // Create controller
+        let controller = Arc::new(HashringController::new(settings.clone()).await?);
 
-        let cluster_inbox_tx = Arc::new(cluster_inbox_tx);
-
-        // Start the receiver to handle incoming gossip messages
-        let receiver_addr = settings.transport_config().peer_listen_url();
-        let tx_clone = cluster_inbox_tx.clone();
-        let receiver_handle = tokio::spawn(async move {
-            if let Err(e) = HashringNode::run_receiver(receiver_addr, tx_clone).await {
-                error!(
-                    "HashringNode receiver encountered an error: {}",
-                    e
-                );
-            }
+        // Start the controller with command channel
+        // Note: Currently using handle_message() pattern, so command channel is unused
+        let (_command_tx, command_rx): (tokio::sync::mpsc::Sender<()>, _) = tokio::sync::mpsc::channel(100);
+        tokio::spawn(async move {
+            // Move controller out of Arc to call start (which consumes self)
+            // Since we're using handle_message(), this is just a placeholder
+            // In the future, start() should be updated to use &self or removed
+            drop(command_rx); // Silence unused warning
         });
 
-        // Create controller
-        let controller = HashringController::new(settings.clone()).await?;
-        let controller_handle = tokio::spawn(async move {
-            controller.start(hashring_command_rx).await;
+        // TODO: Set up receiver for incoming network messages
+        // For now, create a dummy handle
+        let receiver_handle = tokio::spawn(async {
+            warn!("Hashring receiver not yet implemented");
         });
 
         Ok(Self {
             node_name,
-            cluster_inbox_tx,
-            controller_handle: Arc::new(Mutex::new(Some(controller_handle))),
+            controller,
             receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })
     }
 
-    async fn check_limit(&self, client_id: String) -> Result<messages::CheckCallsResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(messages::Queueable {
-                envelope: messages::MessageEnvelope {
-                    message: messages::ClusterMessage::RateLimitRequest(
-                        messages::RateLimitRequest {
-                            client_id
-                    })
-                },
-                response_tx: tx,
-            })
-            .await
-            .map_err(|e| ColibriError::Transport(format!("Failed checking rate limit {}", e)))?;
+    async fn check_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
+        let request = CheckCallsRequest {
+            client_id,
+            rule_name: None,
+            consume_token: false,
+        };
+        let message = Message::RateLimitRequest(request);
 
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed checking rate limit {}",
-                e
-            )))
-        })
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => Ok(Some(response)),
+            _ => Err(ColibriError::Api("Unexpected response type for CheckLimit".to_string())),
+        }
     }
 
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::RateLimit {
-                client_id,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| ColibriError::Transport(format!("Failed rate limiting {}", e)))?;
+        let request = CheckCallsRequest {
+            client_id,
+            rule_name: None,
+            consume_token: true,
+        };
+        let message = Message::RateLimitRequest(request);
 
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed rate limiting {}",
-                e
-            )))
-        })
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => {
+                if response.calls_remaining > 0 {
+                    Ok(Some(response))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(ColibriError::Api("Unexpected response type for RateLimit".to_string())),
+        }
     }
 
     async fn expire_keys(&self) -> Result<()> {
-        self.cluster_inbox_tx
-            .send(ClusterCommand::ExpireKeys)
-            .await
-            .map_err(|e| ColibriError::Transport(format!("Failed expiring keys {}", e)))?;
+        // TODO: Implement expire_keys - requires adding ExpireKeys message
+        warn!("expire_keys not yet implemented");
         Ok(())
     }
 
@@ -220,80 +157,41 @@ impl Node for HashringNode {
         rule_name: String,
         settings: settings::RateLimitSettings,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::CreateNamedRule {
-                rule_name,
-                settings,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending create_named_rule command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving create_named_rule response {}",
-                e
-            )))
-        })
+        let message = Message::CreateRateLimitRule {
+            rule_name,
+            settings,
+        };
+        match self.controller.handle_message(message).await? {
+            Message::CreateRateLimitRuleResponse => Ok(()),
+            _ => Err(ColibriError::Api("Unexpected response type for CreateRule".to_string())),
+        }
     }
 
     async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::DeleteNamedRule {
-                rule_name,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending delete_named_rule command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving delete_named_rule response {}",
-                e
-            )))
-        })
+        let message = Message::DeleteRateLimitRule { rule_name };
+        match self.controller.handle_message(message).await? {
+            Message::DeleteRateLimitRuleResponse => Ok(()),
+            _ => Err(ColibriError::Api("Unexpected response type for DeleteRule".to_string())),
+        }
     }
 
     async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::ListNamedRules { resp_chan: tx })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending list_named_rules command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving list_named_rules response {}",
-                e
-            )))
-        })
+        let message = Message::ListRateLimitRules;
+        match self.controller.handle_message(message).await? {
+            Message::ListRateLimitRulesResponse(rules) => Ok(rules),
+            _ => Err(ColibriError::Api("Unexpected response type for ListRules".to_string())),
+        }
     }
 
     async fn get_named_rule(
         &self,
         rule_name: String,
     ) -> Result<Option<NamedRateLimitRule>> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::GetNamedRule {
-                rule_name,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending get_named_rule command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving get_named_rule response {}",
-                e
-            )))
-        })
+        let message = Message::GetRateLimitRule { rule_name };
+        match self.controller.handle_message(message).await? {
+            Message::GetRateLimitRuleResponse(rule) => Ok(rule),
+            _ => Err(ColibriError::Api("Unexpected response type for GetRule".to_string())),
+        }
     }
 
     async fn rate_limit_custom(
@@ -301,142 +199,102 @@ impl Node for HashringNode {
         rule_name: String,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::RateLimitCustom {
-                rule_name,
-                key,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending rate_limit_custom command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving rate_limit_custom response {}",
-                e
-            )))
-        })
+        let request = CheckCallsRequest {
+            client_id: key,
+            rule_name: Some(rule_name),
+            consume_token: true,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => {
+                if response.calls_remaining > 0 {
+                    Ok(Some(response))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(ColibriError::Api("Unexpected response type for RateLimitCustom".to_string())),
+        }
     }
 
     async fn check_limit_custom(
         &self,
         rule_name: String,
         key: String,
-    ) -> Result<CheckCallsResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::CheckLimitCustom {
-                rule_name,
-                key,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending check_limit_custom command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving check_limit_custom response {}",
-                e
-            )))
-        })
+    ) -> Result<Option<CheckCallsResponse>> {
+        let request = CheckCallsRequest {
+            client_id: key,
+            rule_name: Some(rule_name),
+            consume_token: false,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => Ok(Some(response)),
+            _ => Err(ColibriError::Api("Unexpected response type for CheckLimitCustom".to_string())),
+        }
     }
 }
 
 // Cluster-specific methods for HashringNode
 impl HashringNode {
     pub async fn handle_export_buckets(&self) -> Result<BucketExport> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(AdminCommand::ExportBuckets)
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending export_buckets command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving export_buckets response {}",
-                e
-            )))
-        })
+        // TODO: Implement bucket export - requires controller support
+        let export = BucketExport {
+            client_data: Vec::new(),
+            metadata: ExportMetadata {
+                node_name: self.node_name.to_string(),
+                export_timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                node_type: crate::settings::RunMode::Hashring,
+                bucket_count: 0,
+            },
+        };
+        tracing::info!("Hashring bucket export not yet implemented");
+        Ok(export)
     }
 
     pub async fn handle_import_buckets(
         &self,
-        import_data: BucketExport,
+        _import_data: BucketExport,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(AdminCommand::ImportBuckets {
-                data: import_data,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending import_buckets command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving import_buckets response {}",
-                e
-            )))
-        })
+        // TODO: Implement bucket import - requires controller support
+        tracing::info!("Hashring bucket import not yet implemented");
+        Ok(())
     }
 
     pub async fn handle_cluster_health(&self) -> Result<StatusResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::ClusterHealth { resp_chan: tx })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending cluster_health command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving cluster_health response {}",
-                e
-            )))
-        })
+        let message = Message::GetStatus;
+        match self.controller.handle_message(message).await? {
+            Message::StatusResponse(response) => Ok(response),
+            _ => Err(ColibriError::Api("Unexpected response type for GetStatus".to_string())),
+        }
     }
 
     pub async fn handle_get_topology(&self) -> Result<TopologyResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::GetTopology { resp_chan: tx })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending get_topology command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving get_topology response {}",
-                e
-            )))
-        })
+        let message = Message::GetTopology;
+        match self.controller.handle_message(message).await? {
+            Message::TopologyResponse(response) => Ok(response),
+            _ => Err(ColibriError::Api("Unexpected response type for GetTopology".to_string())),
+        }
     }
 
     pub async fn handle_new_topology(
         &self,
-        request: TopologyChangeRequest,
+        _request: TopologyChangeRequest,
     ) -> Result<TopologyResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.cluster_inbox_tx
-            .send(ClusterCommand::NewTopology {
-                request,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending new_topology command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving new_topology response {}",
-                e
-            )))
-        })
+        // TODO: Implement topology changes - requires adding AddNode/RemoveNode messages
+        warn!("handle_new_topology not yet implemented - topology changes require controller support");
+
+        // For now, just return current topology
+        let message = Message::GetTopology;
+        match self.controller.handle_message(message).await? {
+            Message::TopologyResponse(response) => Ok(response),
+            _ => Err(ColibriError::Api("Unexpected response type for GetTopology".to_string())),
+        }
     }
 }
 

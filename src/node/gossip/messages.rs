@@ -8,6 +8,7 @@ use postcard::{from_bytes, to_allocvec};
 use crdts::VClock;
 
 use crate::limiters::distributed_bucket::DistributedBucketExternal;
+use crate::limiters::NamedRateLimitRule;
 use crate::node::NodeId;
 
 /// Gossip message types for production delta-state protocol

@@ -101,7 +101,7 @@ impl TcpSocketPool {
         let len_bytes = request_len.to_be_bytes();
 
         match timeout(self.connection_timeout, async {
-            use tokio::io::{AsyncWriteExt, AsyncReadExt};
+            use tokio::io::AsyncWriteExt;
             connection.write_all(&len_bytes).await?;
             connection.write_all(request_data).await?;
             Result::<()>::Ok(())

@@ -28,10 +28,10 @@ async fn main() -> Result<()> {
 
     // Socket server listen address setup
     let listen_address: IpAddr = settings
-        .listen_address
+        .client_listen_address
         .parse::<IpAddr>()
         .expect("Invalid ip address");
-    let socket_address = SocketAddr::from((listen_address, settings.listen_port_api));
+    let socket_address = SocketAddr::from((listen_address, settings.client_listen_port));
     let listener = tokio::net::TcpListener::bind(socket_address)
         .await
         .expect("Failed to bind TCP listener");

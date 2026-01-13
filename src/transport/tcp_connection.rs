@@ -202,7 +202,7 @@ impl TcpTransport {
             peers
         } else {
             use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let mut selected = peers;
             selected.shuffle(&mut rng);
             selected.into_iter().take(fanout).collect()

@@ -739,3 +739,36 @@ mod message_tests {
     }
 }
 
+// ============================================================================
+// ADDITIONAL TYPES FOR PHASE 3
+// ============================================================================
+
+/// Admin command responses
+/// TODO: Implement proper admin response handling
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AdminResponse {
+    Ack,
+    Error { message: String },
+    Topology(TopologyResponse),
+    Export(BucketExport),
+    Status(StatusResponse),
+}
+
+/// Bucket export data structure
+/// TODO: Define proper bucket export format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketExport {
+    pub client_data: Vec<u8>, // TODO: Define proper structure
+    pub metadata: ExportMetadata,
+}
+
+/// Metadata for bucket exports
+/// TODO: Add more metadata fields as needed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportMetadata {
+    pub node_name: String,
+    pub export_timestamp: u64,
+    pub node_type: RunMode,
+    pub bucket_count: usize,
+}
+

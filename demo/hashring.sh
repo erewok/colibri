@@ -37,38 +37,41 @@ echo "Press Ctrl+C to stop all nodes"
 
 # Start node 1 (knows about nodes 2 and 3)
 cargo run -- \
+    --name "node-1" \
     --run-mode "${mode}" \
     --rate-limit-max-calls-allowed ${max_calls} \
     --rate-limit-interval-seconds ${interval_seconds} \
-    --listen-port 8001 \
-    --listen-port-tcp 8411 \
-    --topology "127.0.0.1:8411" \
-    --topology "127.0.0.1:8421" \
-    --topology "127.0.0.1:8431" &
+    --client-listen-port 8001 \
+    --peer-listen-port 8411 \
+    -t "node-1=127.0.0.1:8411" \
+    -t "node-2=127.0.0.1:8421" \
+    -t "node-3=127.0.0.1:8431" &
 NODE1_PID=$!
 
 # Start node 2 (knows about nodes 1 and 3)
 cargo run -- \
+    --name "node-2" \
     --run-mode "${mode}" \
     --rate-limit-max-calls-allowed ${max_calls} \
     --rate-limit-interval-seconds ${interval_seconds} \
-    --listen-port 8002 \
-    --listen-port-tcp 8421 \
-    --topology "127.0.0.1:8411" \
-    --topology "127.0.0.1:8421" \
-    --topology "127.0.0.1:8431" &
+    --client-listen-port 8002 \
+    --peer-listen-port 8421 \
+    -t "node-1=127.0.0.1:8411" \
+    -t "node-2=127.0.0.1:8421" \
+    -t "node-3=127.0.0.1:8431" &
 NODE2_PID=$!
 
 # Start node 3 (knows about nodes 1 and 2)
 cargo run -- \
+    --name "node-3" \
     --run-mode "${mode}" \
     --rate-limit-max-calls-allowed ${max_calls} \
     --rate-limit-interval-seconds ${interval_seconds} \
-    --listen-port 8003 \
-    --listen-port-tcp 8431 \
-    --topology "127.0.0.1:8411" \
-    --topology "127.0.0.1:8421" \
-    --topology "127.0.0.1:8431" &
+    --client-listen-port 8003 \
+    --peer-listen-port 8431 \
+    -t "node-1=127.0.0.1:8411" \
+    -t "node-2=127.0.0.1:8421" \
+    -t "node-3=127.0.0.1:8431" &
 NODE3_PID=$!
 
 sleep 7
@@ -107,15 +110,16 @@ echo -e "\n--- EXPANDING CLUSTER: Adding node on port 8004 ---"
 # Start the new node
 echo "Starting node 4 on port 8004..."
 cargo run -- \
+    --name "node-4" \
     --run-mode "${mode}" \
     --rate-limit-max-calls-allowed ${max_calls} \
     --rate-limit-interval-seconds ${interval_seconds} \
-    --listen-port 8004 \
-    --listen-port-tcp 8441 \
-    --topology "127.0.0.1:8411" \
-    --topology "127.0.0.1:8421" \
-    --topology "127.0.0.1:8431" \
-    --topology "127.0.0.1:8441" &
+    --client-listen-port 8004 \
+    --peer-listen-port 8441 \
+    -t "node-1=127.0.0.1:8411" \
+    -t "node-2=127.0.0.1:8421" \
+    -t "node-3=127.0.0.1:8431" \
+    -t "node-4=127.0.0.1:8441" &
 NODE4_PID=$!
 sleep 3
 

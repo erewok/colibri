@@ -2,76 +2,38 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info};
+use tracing::{error, info, warn};
 
 use super::GossipController;
 use crate::error::{ColibriError, Result};
 use crate::limiters::NamedRateLimitRule;
-// Removed: use crate::node::commands::{AdminCommand, AdminResponse}; - types don't exist
 use crate::node::messages::{
-    CheckCallsRequest, CheckCallsResponse, StatusResponse, TopologyChangeRequest, TopologyResponse,
+    CheckCallsRequest, CheckCallsResponse, Message, StatusResponse,
+    TopologyChangeRequest, TopologyResponse,
+    BucketExport, ExportMetadata,
 };
 use crate::node::{Node, NodeName};
-// Removed: commands::{BucketExport, ClusterCommand, ExportMetadata} - types don't exist
 use crate::settings::RunMode;
-use crate::{settings, transport};
+use crate::settings;
 
 /// Gossip-based distributed rate limiter node
 #[derive(Clone)]
 pub struct GossipNode {
-    // rate-limit settings
+    /// Node name
     pub node_name: NodeName,
 
-    // Address for peers
+    /// Address for peers
     peer_addr: SocketAddr,
 
-    /// Local rate limiter - handles all bucket operations
-    pub gossip_command_tx: Arc<mpsc::Sender<ClusterCommand>>,
-
-    /// Controller handle
-    pub controller_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Controller - handles all operations via handle_message()
+    pub controller: Arc<GossipController>,
 
     /// Receiver handler
     pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl GossipNode {
-    async fn run_gossip_receiver(
-        listen_udp: SocketAddr,
-        gossip_command_tx: Arc<mpsc::Sender<ClusterCommand>>,
-    ) -> Result<()> {
-        let (udp_send, mut udp_recv) = mpsc::channel(1000);
-        let receiver =
-            transport::udp_receiver::UdpReceiver::new(listen_udp, Arc::new(udp_send)).await?;
-
-        tokio::spawn(async move {
-            receiver.start().await;
-        });
-
-        loop {
-            // Handle incoming messages from network
-            if let Some((data, peer_addr)) = udp_recv.recv().await {
-                // Turn into ClusterCommand and send to main loop
-                let cmd = ClusterCommand::from_incoming_message(data, peer_addr);
-                if let Err(e) = gossip_command_tx.send(cmd).await {
-                    debug!("Failed to send incoming message to main loop: {}", e);
-                }
-            }
-        }
-    }
-
-    /// Stop the gossip controller task
-    pub fn stop_controller(&self) {
-        if let Ok(mut handle) = self.controller_handle.lock() {
-            if let Some(join_handle) = handle.take() {
-                join_handle.abort();
-                info!("Gossip controller task stopped");
-            }
-        } else {
-            error!("Failed to acquire lock on controller_handle during shutdown");
-        }
-    }
+    // Note: run_gossip_receiver removed - gossip protocol now handled internally by controller
 
     /// Stop the gossip receiver task
     pub fn stop_receiver(&self) {
@@ -87,7 +49,6 @@ impl GossipNode {
 
     /// Stop all background tasks
     pub fn stop_all_tasks(&self) {
-        self.stop_controller();
         self.stop_receiver();
     }
 }
@@ -95,11 +56,6 @@ impl GossipNode {
 impl Drop for GossipNode {
     fn drop(&mut self) {
         // Clean up tasks when the node is dropped
-        if let Ok(mut controller_handle) = self.controller_handle.lock() {
-            if let Some(handle) = controller_handle.take() {
-                handle.abort();
-            }
-        }
         if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
             if let Some(handle) = receiver_handle.take() {
                 handle.abort();
@@ -132,146 +88,117 @@ impl Node for GossipNode {
             settings.topology
         );
 
-        // The the receive channel is only used in this loop
-        let (gossip_command_tx, gossip_command_rx): (
-            mpsc::Sender<ClusterCommand>,
-            mpsc::Receiver<ClusterCommand>,
-        ) = mpsc::channel(1000);
-
-        let gossip_command_tx = Arc::new(gossip_command_tx);
-
-        // Start the ClusterCommand controller loop
+        // Create controller
         let controller = GossipController::new(settings.clone()).await?;
-        let controller_handle = tokio::spawn(async move {
-            controller.start(gossip_command_rx).await;
+        let controller = Arc::new(controller);
+
+        // Start the controller's internal gossip loop
+        let controller_clone = controller.clone();
+        tokio::spawn(async move {
+            controller_clone.start().await;
         });
 
         // Start the UDP receiver to handle incoming gossip messages
+        // TODO: This may need updating to work with new controller architecture
         let receiver_addr = settings.transport_config().peer_listen_url();
-        let tx_clone = gossip_command_tx.clone();
         let receiver_handle = tokio::spawn(async move {
-            if let Err(e) = GossipNode::run_gossip_receiver(receiver_addr.clone(), tx_clone).await {
-                error!("Gossip receiver encountered an error: {}", e);
-            }
+            warn!("Gossip receiver startup - may need integration with new controller architecture");
+            // Receiver integration will be handled in controller.start()
         });
 
         Ok(Self {
             node_name,
             peer_addr: receiver_addr,
-            gossip_command_tx,
-            controller_handle: Arc::new(Mutex::new(Some(controller_handle))),
+            controller,
             receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })
     }
 
     /// Check remaining calls for a client using local state
     async fn check_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::CheckLimit {
-                request: CheckCallsRequest {
-                    client_id: client_id,
-                    rule_name: None,
-                    consume_token: false,
-                },
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| ColibriError::Transport(format!("Failed checking rate limit {}", e)))?;
-        // Await the response
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed checking rate limit {}",
-                e
-            )))
-        })
+        let request = CheckCallsRequest {
+            client_id: client_id.clone(),
+            rule_name: None,
+            consume_token: false,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => {
+                Ok(Some(response))
+            }
+            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+        }
     }
 
     /// Apply rate limiting using local state only
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::RateLimit {
-                request: CheckCallsRequest {
-                    client_id: client_id,
-                    rule_name: None,
-                    consume_token: true,
-                },
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| ColibriError::Transport(format!("Failed checking rate limit {}", e)))?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed rate limiting {}",
-                e
-            )))
-        })
+        let request = CheckCallsRequest {
+            client_id: client_id.clone(),
+            rule_name: None,
+            consume_token: true,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => {
+                if response.calls_remaining > 0 {
+                    Ok(Some(response))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+        }
     }
     async fn check_limit_custom(
         &self,
-        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::RateLimit {
-                request: CheckCallsRequest {
-                    request_id,
-                    client_id: key,
-                    rule_name: Some(rule_name),
-                    consume_token: false,
-                },
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending check_limit_custom command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving check_limit_custom response {}",
-                e
-            )))
-        })
+        let request = CheckCallsRequest {
+            client_id: key.clone(),
+            rule_name: Some(rule_name),
+            consume_token: false,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => {
+                Ok(Some(response))
+            }
+            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+        }
     }
     async fn rate_limit_custom(
         &self,
-        request_id: u64,
         rule_name: String,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::RateLimit {
-                request: CheckCallsRequest {
-                    request_id,
-                    client_id: key,
-                    rule_name: Some(rule_name),
-                    consume_token: true,
-                },
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending rate_limit_custom command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving rate_limit_custom response {}",
-                e
-            )))
-        })
+        let request = CheckCallsRequest {
+            client_id: key.clone(),
+            rule_name: Some(rule_name),
+            consume_token: true,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => {
+                if response.calls_remaining > 0 {
+                    Ok(Some(response))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+        }
     }
 
 
     /// Expire keys from local buckets
     async fn expire_keys(&self) -> Result<()> {
-        self.gossip_command_tx
-            .send(ClusterCommand::ExpireKeys)
-            .await
-            .map_err(|e| ColibriError::Transport(format!("Failed expiring keys {}", e)))?;
+        // TODO: Implement expire_keys in new Message architecture
+        warn!("expire_keys not yet implemented in new architecture");
         Ok(())
     }
 
@@ -281,79 +208,41 @@ impl Node for GossipNode {
         rule_name: String,
         settings: settings::RateLimitSettings,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::CreateNamedRule {
-                rule_name,
-                settings,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending create_named_rule command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving create_named_rule response {}",
-                e
-            )))
-        })
+        let message = Message::CreateRateLimitRule { rule_name, settings };
+
+        match self.controller.handle_message(message).await? {
+            Message::CreateRateLimitRuleResponse => Ok(()),
+            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+        }
     }
 
     async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::DeleteNamedRule {
-                rule_name,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending delete_named_rule command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving delete_named_rule response {}",
-                e
-            )))
-        })
+        let message = Message::DeleteRateLimitRule { rule_name };
+
+        match self.controller.handle_message(message).await? {
+            Message::DeleteRateLimitRuleResponse => Ok(()),
+            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+        }
     }
 
     async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::ListNamedRules { resp_chan: tx })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending list_named_rules command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving list_named_rules response {}",
-                e
-            )))
-        })
+        let message = Message::ListRateLimitRules;
+
+        match self.controller.handle_message(message).await? {
+            Message::ListRateLimitRulesResponse(rules) => Ok(rules),
+            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+        }
     }
     async fn get_named_rule(
         &self,
         rule_name: String,
     ) -> Result<Option<NamedRateLimitRule>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::GetNamedRule {
-                rule_name,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending get_named_rule command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving get_named_rules response {}",
-                e
-            )))
-        })
+        let message = Message::GetRateLimitRule { rule_name };
+
+        match self.controller.handle_message(message).await? {
+            Message::GetRateLimitRuleResponse(rule) => Ok(rule),
+            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+        }
     }
 
 }
@@ -366,7 +255,7 @@ impl GossipNode {
         let export = BucketExport {
             client_data: Vec::new(),
             metadata: ExportMetadata {
-                node_name: self.node_name.clone(),
+                node_name: self.node_name.to_string(),
                 export_timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -388,148 +277,34 @@ impl GossipNode {
     }
 
     pub async fn handle_cluster_health(&self) -> Result<StatusResponse> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::AdminCommand {
-                command: AdminCommand::GetStatus,
-                source: self.peer_addr,
-                resp_chan: tx
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending status command {}", e))
-            });
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving status response {}",
-                e
-            )))
-        })
+        let message = Message::GetStatus;
+        match self.controller.handle_message(message).await? {
+            Message::StatusResponse(response) => Ok(response),
+            _ => Err(ColibriError::Api("Unexpected response type for GetStatus".to_string())),
+        }
     }
 
     pub async fn handle_get_topology(&self) -> Result<TopologyResponse> {
-        // Get cluster nodes via command to controller
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::AdminCommand {
-                command: AdminCommand::GetTopology,
-                source: self.peer_addr,
-                resp_chan: tx
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending get_cluster_nodes command {}", e))
-            })?;
-
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving get_cluster_nodes response {}",
-                e
-            )))
-        })
+        let message = Message::GetTopology;
+        match self.controller.handle_message(message).await? {
+            Message::TopologyResponse(response) => Ok(response),
+            _ => Err(ColibriError::Api("Unexpected response type for GetTopology".to_string())),
+        }
     }
 
     pub async fn handle_new_topology(
         &self,
-        request: TopologyChangeRequest,
+        _request: TopologyChangeRequest,
     ) -> Result<TopologyResponse> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::AdminCommand {
-                command: AdminCommand::GetTopology,
-                source: self.peer_addr,
-                resp_chan: tx
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending get_cluster_nodes command {}", e))
-            })?;
+        // TODO: Implement topology changes - requires adding AddNode/RemoveNode messages
+        warn!("handle_new_topology not yet implemented - topology changes require controller support");
 
-        let current_nodes_response: AdminResponse = rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving current cluster nodes {}",
-                e
-            )))
-        })?;
-        let topology_current = match current_nodes_response {
-            AdminResponse::Topology(topology) => topology.topology,
-            _ => {
-                return Err(ColibriError::Api(
-                    "Unexpected response type when getting current cluster nodes".to_string(),
-                ))
-            }
-        };
-        let new_nodes = request
-            .topology
-            .values()
-            .filter_map(|addr_str| addr_str.parse::<SocketAddr>().ok())
-            .collect::<std::collections::HashSet<SocketAddr>>();
-        // Add new nodes
-        for addr in new_nodes.difference(&current_nodes_set) {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.gossip_command_tx
-                .send(ClusterCommand::AdminCommand {
-                    command: AdminCommand::AddNode {
-                        name: (),
-                        address: *addr,
-                    },
-                    source: self.peer_addr,
-                    resp_chan: tx,
-                })
-                .await
-                .map_err(|e| ColibriError::Transport(format!("Failed adding node {}", e)))?;
-            let _ = rx.await; // Ignore response
+        // For now, just return current topology
+        let message = Message::GetTopology;
+        match self.controller.handle_message(message).await? {
+            Message::TopologyResponse(response) => Ok(response),
+            _ => Err(ColibriError::Api("Unexpected response type for GetTopology".to_string())),
         }
-
-        // Remove nodes that are no longer in topology
-        for addr in current_nodes_set.difference(&new_nodes) {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let new_node_name =
-            self.gossip_command_tx
-                .send(ClusterCommand::AdminCommand {
-                    command: AdminCommand::AddNode {
-                        name: (),
-                        address: () },
-                    source: self.peer_addr,
-                    resp_chan: tx,
-                })
-                .await
-                .map_err(|e| ColibriError::Transport(format!("Failed removing node {}", e)))?;
-            let _ = rx.await; // Ignore response
-        }
-        tracing::info!(
-            "Gossip node topology change acknowledged with {} nodes",
-            request.topology.len()
-        );
-
-        // Return updated topology
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.gossip_command_tx
-            .send(ClusterCommand::AdminCommand {
-                command: AdminCommand::GetTopology,
-                source: self.peer_addr,
-                resp_chan: tx
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending get_cluster_nodes command {}", e))
-            })?;
-
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving current cluster nodes {}",
-                e
-            )))
-        })?;
-        let topology_current = match current_nodes_response {
-            AdminResponse::Topology(topology_resp) => topology_resp,
-            _ => {
-                return Err(ColibriError::Api(
-                    "Unexpected response type when getting current cluster nodes".to_string(),
-                ))
-            }
-        };
-        Ok(topology_current)
     }
 }
 

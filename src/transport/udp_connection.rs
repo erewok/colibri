@@ -83,7 +83,6 @@ mod tests {
     use indexmap::IndexMap;
     use super::*;
     use crate::node::NodeName;
-    use std::net::SocketAddr;
 
     fn get_transport_config() -> TransportConfig {
         let mut topology = IndexMap::new();

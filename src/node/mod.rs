@@ -17,6 +17,8 @@ pub use gossip::GossipNode;
 pub use hashring::HashringNode;
 pub use node_id::{NodeId, NodeName, NodeAddress};
 pub use single_node::SingleNode;
+// Export stub types for compilation (Phase 3)
+pub use messages::{AdminCommand, AdminResponse, BucketExport, ExportMetadata};
 
 
 #[async_trait]

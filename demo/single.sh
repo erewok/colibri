@@ -11,10 +11,11 @@ export RUST_LOG=info
 
 # Start node 1
 cargo run -- \
+    --name "node-1" \
     --run-mode "single" \
     --rate-limit-max-calls-allowed ${max_calls} \
     --rate-limit-interval-seconds ${interval_seconds} \
-    --listen-port 8001 &
+    --client-listen-port 8001 &
 NODE1_PID=$!
 
 echo "${mode}-mode node started. PID: $NODE1_PID"

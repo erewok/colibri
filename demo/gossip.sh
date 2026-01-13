@@ -14,35 +14,38 @@ echo "Press Ctrl+C to stop all nodes"
 # export RUSTFLAGS="--cfg tokio_unstable"
 # Start node 1 (knows about nodes 2 and 3)
 cargo run -- \
+    --name "node-1" \
     --run-mode "gossip" \
     --rate-limit-max-calls-allowed ${max_calls} \
     --rate-limit-interval-seconds ${interval_seconds} \
-    --listen-port 8001 \
-    --listen-port-udp $srv1_udp \
-    --topology "127.0.0.1:$srv2_udp" \
-    --topology "127.0.0.1:$srv3_udp" &
+    --client-listen-port 8001 \
+    --peer-listen-port $srv1_udp \
+    -t "node-2=127.0.0.1:$srv2_udp" \
+    -t "node-3=127.0.0.1:$srv3_udp" &
 NODE1_PID=$!
 
 # Start node 2 (knows about nodes 1 and 3)
 cargo run -- \
+    --name "node-2" \
     --run-mode "gossip" \
     --rate-limit-max-calls-allowed ${max_calls} \
     --rate-limit-interval-seconds ${interval_seconds} \
-    --listen-port 8002 \
-    --listen-port-udp $srv2_udp \
-    --topology "127.0.0.1:$srv1_udp" \
-    --topology "127.0.0.1:$srv3_udp" &
+    --client-listen-port 8002 \
+    --peer-listen-port $srv2_udp \
+    -t "node-1=127.0.0.1:$srv1_udp" \
+    -t "node-3=127.0.0.1:$srv3_udp" &
 NODE2_PID=$!
 
 # Start node 3 (knows about nodes 1 and 2)
 cargo run -- \
+    --name "node-3" \
     --run-mode "gossip" \
     --rate-limit-max-calls-allowed ${max_calls} \
     --rate-limit-interval-seconds ${interval_seconds} \
-    --listen-port 8003 \
-    --listen-port-udp $srv3_udp \
-    --topology "127.0.0.1:$srv1_udp" \
-    --topology "127.0.0.1:$srv2_udp" &
+    --client-listen-port 8003 \
+    --peer-listen-port $srv3_udp \
+    -t "node-1=127.0.0.1:$srv1_udp" \
+    -t "node-2=127.0.0.1:$srv2_udp" &
 NODE3_PID=$!
 
 sleep 7

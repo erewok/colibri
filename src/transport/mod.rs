@@ -1,13 +1,9 @@
-//! Transports: UDP and TCP
+//! TCP Transport
 //!
 //! Provides transport abstractions for distributed communication.
-//! TCP is used for request-response patterns (for consistent hashing) and
-//! UDP is used for fire-and-forget patterns (for gossip protocols).
-//!
 //! The transport module provides:
 //! - Common traits (`Sender`, `RequestSender`, `Receiver`, `RequestReceiver`)
-//! - UDP implementation for fire-and-forget messaging
-//! - TCP implementation for request-response patterns
+//! - TCP implementation
 //! - Socket pools for managing connections efficiently
 //! - Statistics and monitoring for all transports
 
@@ -16,11 +12,8 @@ use serde::{Deserialize, Serialize};
 pub mod stats;
 pub mod traits;
 pub mod socket_pool_tcp;
-pub mod socket_pool_udp;
 pub mod tcp_connection;
 pub mod tcp_receiver;
-pub mod udp_connection;
-pub mod udp_receiver;
 
 // Re-export traits for easy access
 pub use traits::{Sender, RequestSender, Receiver, RequestReceiver};
@@ -30,15 +23,12 @@ pub use stats::{FrozenReceiverStats, FrozenSocketPoolStats, ReceiverStats, Socke
 
 // Re-export transport implementations
 pub use tcp_connection::TcpTransport;
-pub use udp_connection::UdpTransport;
 
 // Re-export socket pools
 pub use socket_pool_tcp::TcpSocketPool;
-pub use socket_pool_udp::UdpSocketPool;
 
 // Re-export receivers
 pub use tcp_receiver::TcpReceiver;
-pub use udp_receiver::UdpReceiver;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SendReceiveStats {
@@ -72,13 +62,4 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_transport_creation() {
-        let transport_config = get_transport_config();
-        let transport = UdpTransport::new(&transport_config)
-            .await
-            .unwrap();
-
-        assert_eq!(transport.get_peers().await.len(), 2);
-    }
 }

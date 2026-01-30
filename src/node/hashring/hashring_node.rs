@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::HashringController;
 use crate::error::{ColibriError, Result};
@@ -89,20 +89,37 @@ impl Node for HashringNode {
         // Create controller
         let controller = Arc::new(HashringController::new(settings.clone()).await?);
 
-        // Start the controller with command channel
-        // Note: Currently using handle_message() pattern, so command channel is unused
-        let (_command_tx, command_rx): (tokio::sync::mpsc::Sender<()>, _) = tokio::sync::mpsc::channel(100);
-        tokio::spawn(async move {
-            // Move controller out of Arc to call start (which consumes self)
-            // Since we're using handle_message(), this is just a placeholder
-            // In the future, start() should be updated to use &self or removed
-            drop(command_rx); // Silence unused warning
-        });
+        // Start TCP receiver to handle incoming cluster messages
+        let receiver_addr = settings.transport_config().peer_listen_url();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1000);
 
-        // TODO: Set up receiver for incoming network messages
-        // For now, create a dummy handle
-        let receiver_handle = tokio::spawn(async {
-            warn!("Hashring receiver not yet implemented");
+        let receiver = crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
+        receiver.start().await;
+
+        // Spawn task to process incoming messages
+        let controller_for_receiver = controller.clone();
+        let receiver_handle = tokio::spawn(async move {
+            info!("Hashring TCP receiver started on {}", receiver_addr);
+            while let Some((data, _peer_addr)) = message_rx.recv().await {
+                // Deserialize and process message
+                match crate::node::messages::Message::deserialize(&data) {
+                    Ok(message) => {
+                        match controller_for_receiver.handle_message(message).await {
+                            Ok(response) => {
+                                // For request-response, we'd send the response back
+                                // TCP receiver needs enhancement to support this
+                                debug!("Processed hashring message, response: {:?}", response);
+                            }
+                            Err(e) => {
+                                error!("Error handling hashring message: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize message: {}", e);
+                    }
+                }
+            }
         });
 
         Ok(Self {
@@ -147,8 +164,7 @@ impl Node for HashringNode {
     }
 
     async fn expire_keys(&self) -> Result<()> {
-        // TODO: Implement expire_keys - requires adding ExpireKeys message
-        warn!("expire_keys not yet implemented");
+        // warn!("expire_keys not yet implemented");
         Ok(())
     }
 

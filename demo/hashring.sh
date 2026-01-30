@@ -4,6 +4,11 @@ export mode="hashring"
 export max_calls=5
 export interval_seconds=3
 
+# Kill any existing colibri processes
+echo "Cleaning up any existing colibri processes..."
+pkill -9 colibri 2>/dev/null || true
+sleep 1
+
 # Helper function to check cluster health
 check_cluster_health() {
     local nodes="$1"

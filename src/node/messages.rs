@@ -142,9 +142,9 @@ pub struct CreateRateLimitRule{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminCommand {
     /// Add a new node to cluster membership
-    AddNode { name: String, address: SocketAddr },
+    AddNode { name: NodeName, address: SocketAddr },
     /// Remove a node from cluster membership
-    RemoveNode { name: String, address: SocketAddr },
+    RemoveNode { name: NodeName, address: SocketAddr },
     /// Export all rate limiting data (for cluster migration)
     ExportBuckets,
     /// Import rate limiting data (for cluster migration)
@@ -275,7 +275,7 @@ impl MessageEnvelopeV2 {
 }
 
 // ============================================================================
-// NEW UNIFIED MESSAGE TYPES (Phase 1)
+// MESSAGE TYPES
 // ============================================================================
 
 /// Unified message type for all cluster communication.
@@ -286,17 +286,18 @@ impl MessageEnvelopeV2 {
 /// - Configuration operations (both modes)
 /// - Cluster operations (both modes)
 /// - Gossip-specific operations (gossip mode only)
-/// - Admin operations (both modes)
+/// - Admin operations (all modes)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
-    // ===== Rate limiting operations (both modes) =====
+    // ===== Rate limiting operations =====
 
     /// Request to check or consume rate limit tokens
     RateLimitRequest(CheckCallsRequest),
     /// Response with remaining tokens
     RateLimitResponse(CheckCallsResponse),
 
-    // ===== Configuration operations (both modes) =====
+    ExpireKeys, // Internal message to trigger key expiry
+    // ===== Configuration operations =====
 
     /// Create a new named rate limit rule
     CreateRateLimitRule {
@@ -444,13 +445,13 @@ impl From<ClusterMessage> for Message {
                 match cmd {
                     AdminCommand::AddNode { name, address } => {
                         Message::AddNode {
-                            name: NodeName::new(name),
+                            name,
                             address
                         }
                     },
                     AdminCommand::RemoveNode { name, address } => {
                         Message::RemoveNode {
-                            name: NodeName::new(name),
+                            name,
                             address
                         }
                     },
@@ -591,7 +592,7 @@ mod message_tests {
     #[test]
     fn test_admin_command_conversion() {
         let admin_cmd = ClusterMessage::AdminCommand(AdminCommand::AddNode {
-            name: "node1".to_string(),
+            name: "node1".into(),
             address: "127.0.0.1:8000".parse().unwrap(),
         });
 
@@ -740,7 +741,7 @@ mod message_tests {
 }
 
 // ============================================================================
-// ADDITIONAL TYPES FOR PHASE 3
+// ADDITIONAL TYPES
 // ============================================================================
 
 /// Admin command responses

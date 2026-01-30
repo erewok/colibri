@@ -15,22 +15,22 @@ use super::stats::{FrozenSocketPoolStats, FrozenReceiverStats};
 pub trait Sender {
     /// Send data to a specific peer by NodeId
     async fn send_to_peer(&self, target: NodeId, data: &[u8]) -> Result<()>;
-    
+
     /// Send data to a random peer (useful for gossip protocols)
     async fn send_to_random_peer(&self, data: &[u8]) -> Result<NodeId>;
-    
+
     /// Send data to multiple random peers (for gossip broadcasting)
     async fn send_to_random_peers(&self, data: &[u8], count: usize) -> Result<Vec<NodeId>>;
-    
+
     /// Add a new peer to the transport
-    async fn add_peer(&mut self, node_id: NodeId, addr: SocketAddr) -> Result<()>;
-    
+    async fn add_peer(&self, node_id: NodeId, addr: SocketAddr) -> Result<()>;
+
     /// Remove a peer from the transport
     async fn remove_peer(&self, node_id: NodeId) -> Result<()>;
-    
+
     /// Get list of current peer NodeIds
     async fn get_peers(&self) -> Vec<NodeId>;
-    
+
     /// Get transport statistics for monitoring
     async fn get_stats(&self) -> FrozenSocketPoolStats;
 }
@@ -44,13 +44,13 @@ pub trait RequestSender: Sender {
         target: NodeId,
         request_data: &[u8],
     ) -> Result<Vec<u8>>;
-    
+
     /// Send request to random peer and wait for response
     async fn send_request_response_random(
         &self,
         request_data: &[u8],
     ) -> Result<(NodeId, Vec<u8>)>;
-    
+
     /// Cleanup expired connections (for connection-based transports)
     async fn cleanup_expired_connections(&self);
 }
@@ -60,13 +60,13 @@ pub trait RequestSender: Sender {
 pub trait Receiver {
     /// Start listening for incoming messages
     async fn start(&self) -> Result<()>;
-    
+
     /// Stop the receiver
     async fn stop(&self) -> Result<()>;
-    
+
     /// Check if the receiver is running
     fn is_running(&self) -> bool;
-    
+
     /// Get receiver statistics
     async fn get_stats(&self) -> FrozenReceiverStats;
 }

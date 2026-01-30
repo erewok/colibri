@@ -9,9 +9,9 @@ rate_limit_max_calls_allowed=1000
 rate_limit_interval_seconds=60
 run_mode="gossip"
 topology=[
-    "127.0.0.1:8412",
-    "127.0.0.1:8413",
-    "127.0.0.1:8414",
+    "node2=127.0.0.1:8412",
+    "node3=127.0.0.1:8413",
+    "node4=127.0.0.1:8414",
 ]
 gossip_interval_ms=500
 gossip_fanout=1

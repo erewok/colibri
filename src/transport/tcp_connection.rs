@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::sync::RwLock;
 
 use super::traits::{Sender, RequestSender};
@@ -14,7 +15,6 @@ use super::socket_pool_tcp::TcpSocketPool;
 use crate::error::{Result, ColibriError};
 use crate::node::{NodeId, messages::Message};
 use crate::settings::TransportConfig;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
 #[derive(Clone, Debug)]
 pub struct TcpTransport {
@@ -32,7 +32,7 @@ impl TcpTransport {
     }
 
     // ============================================================================
-    // MESSAGE ENUM SUPPORT (Phase 1)
+    // MESSAGE ENUM SUPPORT
     // ============================================================================
 
     /// Send a Message to a peer by address (fire-and-forget)
@@ -247,7 +247,7 @@ impl Sender for TcpTransport {
     }
 
     /// Add a new peer to the socket pool
-    async fn add_peer(&mut self, node_id: NodeId, addr: SocketAddr) -> Result<()> {
+    async fn add_peer(&self, node_id: NodeId, addr: SocketAddr) -> Result<()> {
         self.socket_pool.write().await.add_peer(node_id, addr).await
     }
 
@@ -345,8 +345,9 @@ mod tests {
     #[tokio::test]
     async fn test_message_serialization() {
         let message = Message::RateLimitRequest(CheckCallsRequest {
-            key: "test-key".to_string(),
-            calls_requested: 1,
+            client_id: "test-key".to_string(),
+            rule_name: None,
+            consume_token: true,
         });
 
         let serialized = message.serialize();
@@ -358,8 +359,8 @@ mod tests {
 
         match deserialized.unwrap() {
             Message::RateLimitRequest(req) => {
-                assert_eq!(req.key, "test-key");
-                assert_eq!(req.calls_requested, 1);
+                assert_eq!(req.client_id, "test-key");
+                assert_eq!(req.consume_token, true);
             }
             _ => panic!("Wrong message variant"),
         }
@@ -371,8 +372,9 @@ mod tests {
         let transport = TcpTransport::new(&config).await.unwrap();
 
         let message = Message::RateLimitRequest(CheckCallsRequest {
-            key: "test".to_string(),
-            calls_requested: 1,
+            client_id: "test".to_string(),
+            rule_name: None,
+            consume_token: true,
         });
 
         // This should return immediately even if peer is not available
@@ -393,8 +395,9 @@ mod tests {
         let transport = TcpTransport::new(&config).await.unwrap();
 
         let message = Message::RateLimitResponse(CheckCallsResponse {
-            allowed: true,
-            remaining: 10,
+            client_id: "test".to_string(),
+            rule_name: None,
+            calls_remaining: 10,
         });
 
         // Broadcasting to empty list should fail

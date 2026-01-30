@@ -1,30 +1,30 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info};
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{RateLimitConfig, TokenBucketLimiter};
-use crate::node::controller::BaseController;
-use crate::node::messages::{Message, Queueable};
-use crate::node::NodeName;
-use crate::settings::{self, RunMode};
+use crate::limiters::{NamedRateLimitRule, RateLimitConfig, TokenBucketLimiter};
+use crate::node::messages::{CheckCallsRequest, CheckCallsResponse, Message, Queueable, Status, StatusResponse, TopologyResponse};
+use crate::node::{NodeAddress, NodeName};
+use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::TcpTransport;
+use crate::transport::traits::Sender;
 
 use super::consistent_hashing;
 
 /// Controller for consistent hash ring distributed rate limiter
-/// Handles all communication and cluster coordination
 #[derive(Clone)]
 pub struct HashringController {
-    /// Shared controller logic - delegates admin, rate limiting, rule management
-    base: Arc<BaseController>,
-    // Legacy fields kept during transition
     node_name: NodeName,
     bucket: u32,
     number_of_buckets: u32,
-    // Rate limiting state
+    topology: Arc<RwLock<ClusterTopology>>,
+    transport: Arc<TcpTransport>,
+    rate_limit_settings: RateLimitSettings,
     pub rate_limiter: Arc<Mutex<TokenBucketLimiter>>,
     pub rate_limit_config: Arc<Mutex<RateLimitConfig>>,
     pub named_rate_limiters: Arc<Mutex<HashMap<String, Arc<Mutex<TokenBucketLimiter>>>>>,
@@ -44,7 +44,6 @@ impl HashringController {
     pub async fn new(settings: settings::Settings) -> Result<Self> {
         let node_name = settings.node_name();
 
-        // Get cluster topology from settings
         let cluster_topology = settings.cluster_topology();
         let number_of_buckets = cluster_topology
             .nodes
@@ -57,38 +56,23 @@ impl HashringController {
                 "Hashring mode requires cluster topology with other nodes".to_string(),
             ));
         }
+
         let bucket = consistent_hashing::jump_consistent_hash(node_name.as_str(), number_of_buckets);
 
-        // Create rate limiter
         let rl_settings = settings.rate_limit_settings();
         let rate_limiter = TokenBucketLimiter::new(rl_settings.clone());
-        let rate_limit_config = RateLimitConfig::new(settings.rate_limit_settings());
+        let rate_limit_config = RateLimitConfig::new(rl_settings.clone());
 
-        // Create TCP transport from settings for BaseController
         let transport_config = settings.transport_config();
         let transport = TcpTransport::new(&transport_config).await?;
 
-        // Create a separate limiter for BaseController (using DistributedBucketLimiter)
-        let base_limiter = crate::limiters::distributed_bucket::DistributedBucketLimiter::new(
-            node_name.node_id(),
-            rl_settings.clone(),
-        );
-
-        // Create base controller with shared logic
-        let base = BaseController::new(
-            node_name.clone(),
-            cluster_topology,
-            transport,
-            base_limiter,
-            RunMode::Hashring,
-            rl_settings.clone(),
-        );
-
         Ok(Self {
-            base: Arc::new(base),
             node_name,
             bucket,
             number_of_buckets,
+            topology: Arc::new(RwLock::new(cluster_topology)),
+            transport: Arc::new(transport),
+            rate_limit_settings: rl_settings,
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(Mutex::new(rate_limit_config)),
             named_rate_limiters: Arc::new(Mutex::new(HashMap::new())),
@@ -113,62 +97,248 @@ impl HashringController {
         info!("HashringController stopped for node {}", self.node_name);
     }
 
-    /// Handle incoming messages using unified Message enum (Phase 2)
-    ///
-    /// For hashring mode, this delegates most operations to BaseController.
-    /// Routing/bucket ownership checks would be added here in the future.
+    fn owns_bucket_for_client(&self, client_id: &str) -> bool {
+        let client_bucket = consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
+        client_bucket == self.bucket
+    }
+
+    async fn find_bucket_owner(&self, client_id: &str) -> Result<SocketAddr> {
+        let client_bucket = consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
+
+        let topology = self.topology.read().await;
+        let all_nodes: Vec<_> = topology.all_nodes().into_iter().collect();
+
+        if client_bucket as usize >= all_nodes.len() {
+            return Err(ColibriError::Node(format!(
+                "Bucket {} out of range for {} nodes",
+                client_bucket, all_nodes.len()
+            )));
+        }
+
+        let (_name, address) = &all_nodes[client_bucket as usize];
+        Ok(*address)
+    }
+
+    async fn forward_request(&self, target: SocketAddr, message: &Message) -> Result<Message> {
+        debug!("Forwarding request to {} for routing", target);
+
+        let data = postcard::to_allocvec(message)
+            .map_err(|e| ColibriError::Transport(format!("Failed to serialize message: {}", e)))?;
+
+        let response_data = self.transport.send_request_response(target, &data).await?;
+
+        let response: Message = postcard::from_bytes(&response_data)
+            .map_err(|e| ColibriError::Transport(format!("Failed to deserialize response: {}", e)))?;
+        Ok(response)
+    }
+
+    async fn handle_rate_limit_request(
+        &self,
+        request: CheckCallsRequest,
+    ) -> Result<CheckCallsResponse> {
+        if !self.owns_bucket_for_client(&request.client_id) {
+            let owner = self.find_bucket_owner(&request.client_id).await?;
+            debug!("Forwarding rate limit request for {} to {}", request.client_id, owner);
+
+            let response = self.forward_request(
+                owner,
+                &Message::RateLimitRequest(request)
+            ).await?;
+
+            match response {
+                Message::RateLimitResponse(resp) => return Ok(resp),
+                _ => return Err(ColibriError::Transport("Unexpected response from forward".to_string())),
+            }
+        }
+
+        let mut limiter = self.rate_limiter.lock().unwrap();
+
+        let calls_remaining = if request.consume_token {
+            limiter.limit_calls_for_client(request.client_id.clone())
+        } else {
+            Some(limiter.check_calls_remaining_for_client(&request.client_id))
+        };
+
+        Ok(CheckCallsResponse {
+            client_id: request.client_id,
+            rule_name: request.rule_name,
+            calls_remaining: calls_remaining.unwrap_or(0),
+        })
+    }
+
+    async fn get_status(&self) -> Result<StatusResponse> {
+        let topology = self.topology.read().await;
+
+        Ok(StatusResponse {
+            node_name: self.node_name.clone(),
+            node_type: RunMode::Hashring,
+            status: Status::Healthy,
+            bucket_count: Some(topology.node_count()),
+            last_topology_change: None,
+            errors: None,
+        })
+    }
+
+    async fn get_topology(&self) -> Result<TopologyResponse> {
+        let status = self.get_status().await?;
+        let topology = self.topology.read().await;
+
+        let topology_map = topology
+            .all_nodes()
+            .into_iter()
+            .map(|(name, addr)| {
+                let node_addr = NodeAddress {
+                    name: name.clone(),
+                    local_address: addr,
+                    remote_address: addr,
+                };
+                (name, node_addr)
+            })
+            .collect();
+
+        Ok(TopologyResponse {
+            status,
+            topology: topology_map,
+        })
+    }
+
+    async fn add_node(&self, name: NodeName, address: SocketAddr) -> Result<()> {
+        let mut topology = self.topology.write().await;
+        topology.add_node(name.clone(), address);
+
+        tracing::info!("Added node {} at {} to hashring topology", name.as_str(), address);
+        self.transport.add_peer(name.node_id(), address).await?;
+
+        Ok(())
+    }
+
+    async fn remove_node(&self, name: NodeName) -> Result<()> {
+        let mut topology = self.topology.write().await;
+
+        if let Some(address) = topology.remove_node(&name) {
+            tracing::info!("Removed node {} (was at {}) from hashring topology", name.as_str(), address);
+            self.transport.remove_peer(name.node_id()).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn create_rate_limit_rule(
+        &self,
+        rule_name: String,
+        settings: RateLimitSettings,
+    ) -> Result<()> {
+        let mut named_limiters = self.named_rate_limiters.lock().unwrap();
+        let limiter = TokenBucketLimiter::new(settings.clone());
+        named_limiters.insert(rule_name.clone(), Arc::new(Mutex::new(limiter)));
+        tracing::info!("Created named rule '{}' in hashring node", rule_name);
+        Ok(())
+    }
+
+    async fn delete_rate_limit_rule(&self, rule_name: String) -> Result<()> {
+        let mut named_limiters = self.named_rate_limiters.lock().unwrap();
+        if named_limiters.remove(&rule_name).is_some() {
+            tracing::info!("Deleted named rule '{}' from hashring node", rule_name);
+        } else {
+            tracing::warn!("Attempted to delete non-existent rule '{}'", rule_name);
+        }
+        Ok(())
+    }
+
+    async fn get_rate_limit_rule(
+        &self,
+        rule_name: String,
+    ) -> Result<Option<NamedRateLimitRule>> {
+        if rule_name == "default" {
+            return Ok(Some(NamedRateLimitRule {
+                name: "default".to_string(),
+                settings: self.rate_limit_settings.clone(),
+            }));
+        }
+
+        let named_limiters = self.named_rate_limiters.lock().unwrap();
+
+        if let Some(limiter_arc) = named_limiters.get(&rule_name) {
+            let limiter = limiter_arc.lock().unwrap();
+            let settings = limiter.get_settings().clone();
+
+            return Ok(Some(NamedRateLimitRule {
+                name: rule_name,
+                settings,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    async fn list_rate_limit_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
+        let mut rules = vec![
+            NamedRateLimitRule {
+                name: "default".to_string(),
+                settings: self.rate_limit_settings.clone(),
+            }
+        ];
+
+        let named_limiters = self.named_rate_limiters.lock().unwrap();
+
+        for (name, limiter_arc) in named_limiters.iter() {
+            let limiter = limiter_arc.lock().unwrap();
+            rules.push(NamedRateLimitRule {
+                name: name.clone(),
+                settings: limiter.get_settings().clone(),
+            });
+        }
+
+        Ok(rules)
+    }
+
     pub async fn handle_message(&self, message: Message) -> Result<Message> {
         match message {
-            // Rate limiting - delegate to BaseController
-            // In full implementation, should check bucket ownership first
             Message::RateLimitRequest(req) => {
-                let response = self.base.handle_rate_limit_request(req).await?;
+                let response = self.handle_rate_limit_request(req).await?;
                 Ok(Message::RateLimitResponse(response))
             }
 
-            // Admin operations - delegate to BaseController
             Message::GetStatus => {
-                let status = self.base.get_status().await?;
+                let status = self.get_status().await?;
                 Ok(Message::StatusResponse(status))
             }
 
             Message::GetTopology => {
-                let topology = self.base.get_topology().await?;
+                let topology = self.get_topology().await?;
                 Ok(Message::TopologyResponse(topology))
             }
 
             Message::AddNode { name, address } => {
-                self.base.add_node(name, address).await?;
+                self.add_node(name, address).await?;
                 Ok(Message::Ack)
             }
 
             Message::RemoveNode { name, address: _ } => {
-                self.base.remove_node(name).await?;
+                self.remove_node(name).await?;
                 Ok(Message::Ack)
             }
 
-            // Rule management - delegate to BaseController
             Message::CreateRateLimitRule { rule_name, settings } => {
-                self.base.create_rate_limit_rule(rule_name, settings).await?;
+                self.create_rate_limit_rule(rule_name, settings).await?;
                 Ok(Message::CreateRateLimitRuleResponse)
             }
 
             Message::DeleteRateLimitRule { rule_name } => {
-                self.base.delete_rate_limit_rule(rule_name).await?;
+                self.delete_rate_limit_rule(rule_name).await?;
                 Ok(Message::DeleteRateLimitRuleResponse)
             }
 
             Message::GetRateLimitRule { rule_name } => {
-                let rule = self.base.get_rate_limit_rule(rule_name).await?;
+                let rule = self.get_rate_limit_rule(rule_name).await?;
                 Ok(Message::GetRateLimitRuleResponse(rule))
             }
 
             Message::ListRateLimitRules => {
-                let rules = self.base.list_rate_limit_rules().await?;
+                let rules = self.list_rate_limit_rules().await?;
                 Ok(Message::ListRateLimitRulesResponse(rules))
             }
 
-            // Unsupported messages
             _ => Err(ColibriError::Api(format!(
                 "Unsupported message type for HashringController: {:?}",
                 message

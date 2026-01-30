@@ -475,7 +475,8 @@ pub mod tests {
 
         let node = topology.node_for_key("user:123");
         assert!(node.is_some());
-        assert!(node.unwrap() == NodeName::from("node-a") || node.unwrap() == NodeName::from("node-b"));
+        let node_name = node.as_ref().unwrap();
+        assert!(*node_name == NodeName::from("node-a") || *node_name == NodeName::from("node-b"));
 
         let addr = topology.address_for_key("user:123");
         assert!(addr.is_some());

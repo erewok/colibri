@@ -1,4 +1,4 @@
-//! Base Controller (Phase 2)
+//! Base Controller
 //!
 //! Shared controller logic for both Gossip and Hashring modes.
 //! Handles rate limiting, rule management, and admin operations.
@@ -59,7 +59,7 @@ impl BaseController {
     }
 
     // ============================================================================
-    // RATE LIMITING OPERATIONS (shared by both modes)
+    // RATE LIMITING OPERATIONS
     // ============================================================================
 
     /// Handle a rate limit request
@@ -88,7 +88,7 @@ impl BaseController {
     }
 
     // ============================================================================
-    // ADMIN OPERATIONS (shared by both modes)
+    // ADMIN OPERATIONS
     // ============================================================================
 
     /// Get status of this node
@@ -161,7 +161,7 @@ impl BaseController {
     }
 
     // ============================================================================
-    // RULE MANAGEMENT OPERATIONS (shared by both modes)
+    // RULE MANAGEMENT OPERATIONS
     // ============================================================================
 
     // Note: The current DistributedBucketLimiter doesn't have named rule support yet.

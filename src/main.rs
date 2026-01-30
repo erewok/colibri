@@ -1,6 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
 
-use clap::Parser;
 use tokio::time::{self, Duration};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

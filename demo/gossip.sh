@@ -3,6 +3,11 @@ export RUST_LOG=info
 export max_calls=5
 export interval_seconds=3
 
+# Kill any existing colibri processes
+echo "Cleaning up any existing colibri processes..."
+pkill -9 colibri 2>/dev/null || true
+sleep 1
+
 export srv1_udp=8401
 export srv2_udp=8402
 export srv3_udp=8403

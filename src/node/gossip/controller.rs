@@ -6,7 +6,6 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-use super::{GossipMessage, GossipPacket};
 use crate::error::{ColibriError, Result};
 use crate::limiters::{NamedRateLimitRule, RateLimitConfig, distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter}};
 use crate::node::messages::{CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse};
@@ -15,6 +14,8 @@ use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::TcpTransport;
 use crate::transport::traits::Sender;
 use tokio::sync::RwLock;
+
+use super::{GossipMessage, GossipPacket};
 
 /// A gossip-based node that maintains all client state locally
 /// and syncs with other nodes via gossip protocol.
@@ -859,190 +860,5 @@ impl GossipController {
 
 // ===== Tests temporarily disabled =====
 
-// TODO: Rewrite these tests in a future phase when node implementations are updated
-/*
-#[cfg(test)]
-mod tests {
-    //! Simple tests for GossipController to verify core functionality
 
-    use super::*;
-    use tokio::sync::oneshot;
 
-    use crate::node::NodeName;
-
-    #[tokio::test]
-    async fn test_controller_creation() {
-        let settings = settings::tests::sample();
-        let controller = GossipController::new(settings).await.unwrap();
-
-        // Basic checks that controller is properly initialized
-        assert!(controller.has_gossip()); // Always true for gossip mode
-        assert_eq!(controller.gossip_interval_ms, 1000);
-        assert_eq!(controller.gossip_fanout, 3);
-    }
-
-    #[tokio::test]
-    async fn test_rate_limit_command() {
-        let settings = settings::tests::sample();
-        let controller = GossipController::new(settings).await.unwrap();
-        let (tx, rx) = oneshot::channel();
-
-        let cmd = GossipCommand::RateLimit {
-            client_id: "test_client".to_string(),
-            resp_chan: tx,
-        };
-
-        // Handle the rate limit command
-        controller.handle_command(cmd).await.unwrap();
-
-        // Check response
-        let response = rx.await.unwrap().unwrap();
-        assert!(response.is_some());
-        let check_result = response.unwrap();
-        assert_eq!(check_result.client_id, "test_client");
-        assert!(check_result.calls_remaining < 100); // Should consume tokens
-    }
-
-    #[tokio::test]
-    async fn test_check_limit_command() {
-        let settings = settings::tests::sample();
-        let controller = GossipController::new(settings).await.unwrap();
-        let (tx, rx) = oneshot::channel();
-
-        let cmd = GossipCommand::CheckLimit {
-            client_id: "test_client".to_string(),
-            resp_chan: tx,
-        };
-
-        // Handle the check limit command
-        controller.handle_command(cmd).await.unwrap();
-
-        // Check response
-        let response = rx.await.unwrap().unwrap();
-        assert_eq!(response.client_id, "test_client");
-        // For a new client, should have full token bucket
-        assert_eq!(response.calls_remaining, 100);
-    }
-
-    #[tokio::test]
-    async fn test_expire_keys_command() {
-        let settings = settings::tests::sample();
-        let controller = GossipController::new(settings).await.unwrap();
-
-        let cmd = GossipCommand::ExpireKeys;
-
-        // Should not panic or error
-        controller.handle_command(cmd).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_gossip_message_processing() {
-        let settings = settings::tests::sample();
-        let controller = GossipController::new(settings).await.unwrap();
-
-        // Create a heartbeat message
-        let message = GossipMessage::Heartbeat {
-            node_id: NodeName::from("z").node_id(), // Different node ID
-            timestamp: 1234567890,
-            vclock: crdts::VClock::new(),
-            response_addr: "127.0.0.1:8412".parse().unwrap(),
-        };
-
-        let packet = GossipPacket::new(message);
-        let data = packet.serialize().unwrap();
-
-        let cmd = GossipCommand::GossipMessageReceived {
-            data,
-            peer_addr: "127.0.0.1:8412".parse().unwrap(),
-        };
-
-        // Should process without error
-        controller.handle_command(cmd).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_self_message_filtering() {
-        let settings = settings::tests::sample();
-        let controller = GossipController::new(settings).await.unwrap();
-        let our_node_id = controller.node_id;
-
-        // Create a heartbeat from our own node
-        let message = GossipMessage::Heartbeat {
-            node_id: our_node_id, // Same node ID as controller
-            timestamp: 1234567890,
-            vclock: crdts::VClock::new(),
-            response_addr: "127.0.0.1:8412".parse().unwrap(),
-        };
-
-        let packet = GossipPacket::new(message);
-        let data = packet.serialize().unwrap();
-
-        let cmd = GossipCommand::GossipMessageReceived {
-            data,
-            peer_addr: "127.0.0.1:8412".parse().unwrap(),
-        };
-
-        // Should ignore our own message
-        controller.handle_command(cmd).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiting_exhaustion() {
-        let mut settings = settings::tests::sample();
-        settings.rate_limit_max_calls_allowed = 3; // Very small limit
-
-        let controller = GossipController::new(settings).await.unwrap();
-        let client_id = "heavy_client".to_string();
-
-        // Make multiple calls to exhaust the rate limit
-        let mut successful_calls = 0;
-        let mut failed_calls = 0;
-
-        for _i in 0..5 {
-            let (tx, rx) = oneshot::channel();
-            let cmd = GossipCommand::RateLimit {
-                client_id: client_id.clone(),
-                resp_chan: tx,
-            };
-
-            controller.handle_command(cmd).await.unwrap();
-            let response = rx.await.unwrap().unwrap();
-
-            if response.is_some() {
-                successful_calls += 1;
-            } else {
-                failed_calls += 1;
-            }
-        }
-
-        // We should have some successful calls (at least 1) and some failed ones
-        assert!(
-            successful_calls > 0,
-            "Should have at least one successful call"
-        );
-        assert!(
-            failed_calls > 0,
-            "Should have at least one rate-limited call"
-        );
-        assert!(successful_calls <= 3, "Should not exceed the rate limit");
-    }
-
-    #[tokio::test]
-    async fn test_malformed_gossip_message() {
-        let settings = settings::tests::sample();
-        let controller = GossipController::new(settings).await.unwrap();
-
-        // Send garbage data
-        let bad_data = bytes::Bytes::from_static(b"this is not a valid gossip packet");
-
-        let cmd = GossipCommand::GossipMessageReceived {
-            data: bad_data,
-            peer_addr: "127.0.0.1:8412".parse().unwrap(),
-        };
-
-        // Should handle gracefully and return an error
-        let result = controller.handle_command(cmd).await;
-        assert!(result.is_err());
-    }
-}
-*/

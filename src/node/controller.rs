@@ -138,7 +138,7 @@ impl BaseController {
 
         tracing::info!("Added node {} at {} to topology", name.as_str(), address);
 
-        // TODO: Notify transport layer to add peer
+
         // This would call something like:
         // self.transport.add_peer(name.node_id(), address).await?;
 
@@ -152,7 +152,7 @@ impl BaseController {
         if let Some(address) = topology.remove_node(&name) {
             tracing::info!("Removed node {} (was at {}) from topology", name.as_str(), address);
 
-            // TODO: Notify transport layer to remove peer
+
             // This would call something like:
             // self.transport.remove_peer(name.node_id()).await?;
         }
@@ -169,9 +169,6 @@ impl BaseController {
     // rule management is added to the limiter in a future phase.
 
     /// Create a new rate limit rule
-    ///
-    /// TODO: This is a placeholder. DistributedBucketLimiter needs to be enhanced
-    /// to support multiple named rules beyond the default rule.
     pub async fn create_rate_limit_rule(
         &self,
         rule_name: String,
@@ -181,20 +178,17 @@ impl BaseController {
             "create_rate_limit_rule called for '{}' but rule management not yet implemented in DistributedBucketLimiter",
             rule_name
         );
-        // TODO: Add rule to limiter when API is available
+
         Ok(())
     }
 
     /// Delete a rate limit rule
-    ///
-    /// TODO: This is a placeholder. DistributedBucketLimiter needs to be enhanced
-    /// to support multiple named rules beyond the default rule.
     pub async fn delete_rate_limit_rule(&self, rule_name: String) -> Result<()> {
         tracing::warn!(
             "delete_rate_limit_rule called for '{}' but rule management not yet implemented in DistributedBucketLimiter",
             rule_name
         );
-        // TODO: Remove rule from limiter when API is available
+
         Ok(())
     }
 

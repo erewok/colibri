@@ -92,7 +92,7 @@ impl RateLimitSettings {
 }
 
 // ============================================================================
-// CLUSTER TOPOLOGY (Phase 1)
+// CLUSTER TOPOLOGY
 // ============================================================================
 
 /// Single source of truth for cluster membership.

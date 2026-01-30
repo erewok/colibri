@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::GossipController;
 use crate::error::{ColibriError, Result};
@@ -109,16 +109,20 @@ impl Node for GossipNode {
         let controller_for_receiver = controller.clone();
         let receiver_handle = tokio::spawn(async move {
             info!("Gossip TCP receiver started on {}", receiver_addr);
-            while let Some((data, _peer_addr)) = message_rx.recv().await {
+            while let Some(request) = message_rx.recv().await {
                 // Deserialize and process message
-                match crate::node::messages::Message::deserialize(&data) {
+                match crate::node::messages::Message::deserialize(&request.data) {
                     Ok(message) => {
                         if let Err(e) = controller_for_receiver.handle_message(message).await {
                             error!("Error handling message: {}", e);
                         }
+                        // Gossip is fire-and-forget, send empty ack
+                        let _ = request.response_tx.send(vec![]);
                     }
                     Err(e) => {
                         error!("Failed to deserialize message: {}", e);
+                        // Still send empty response to avoid blocking sender
+                        let _ = request.response_tx.send(vec![]);
                     }
                 }
             }
@@ -314,8 +318,7 @@ impl GossipNode {
         &self,
         _request: TopologyChangeRequest,
     ) -> Result<TopologyResponse> {
-        // TODO: Implement topology changes - requires adding AddNode/RemoveNode messages
-        warn!("handle_new_topology not yet implemented - topology changes require controller support");
+        warn!("Topology changes not yet implemented for gossip nodes");
 
         // For now, just return current topology
         let message = Message::GetTopology;

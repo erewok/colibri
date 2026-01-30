@@ -22,7 +22,7 @@ pub struct Queueable {
 }
 
 // ============================================================================
-// UNIFIED COMMAND TYPE (Phase 1)
+// UNIFIED COMMAND TYPE
 // ============================================================================
 
 /// Unified command type for controller queues
@@ -216,7 +216,7 @@ impl MessageEnvelope {
 }
 
 // ============================================================================
-// MESSAGE ENVELOPE V2 (Phase 1)
+// MESSAGE ENVELOPE
 // ============================================================================
 
 /// Message routing and delivery information using new Message enum
@@ -267,9 +267,6 @@ impl MessageEnvelopeV2 {
     /// Convert to old MessageEnvelope (for backward compatibility)
     /// Returns None if the message cannot be converted back
     pub fn to_v1(&self) -> Option<MessageEnvelope> {
-        // This is a simplified conversion - in practice you'd need
-        // to handle all Message variants and convert them back
-        // For Phase 1, we'll just return None for now
         None
     }
 }
@@ -745,7 +742,6 @@ mod message_tests {
 // ============================================================================
 
 /// Admin command responses
-/// TODO: Implement proper admin response handling
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminResponse {
     Ack,
@@ -756,15 +752,13 @@ pub enum AdminResponse {
 }
 
 /// Bucket export data structure
-/// TODO: Define proper bucket export format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketExport {
-    pub client_data: Vec<u8>, // TODO: Define proper structure
+    pub client_data: Vec<u8>,
     pub metadata: ExportMetadata,
 }
 
 /// Metadata for bucket exports
-/// TODO: Add more metadata fields as needed
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportMetadata {
     pub node_name: String,

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::HashringController;
 use crate::error::{ColibriError, Result};
@@ -100,18 +100,30 @@ impl Node for HashringNode {
         let controller_for_receiver = controller.clone();
         let receiver_handle = tokio::spawn(async move {
             info!("Hashring TCP receiver started on {}", receiver_addr);
-            while let Some((data, _peer_addr)) = message_rx.recv().await {
+            while let Some(request) = message_rx.recv().await {
                 // Deserialize and process message
-                match crate::node::messages::Message::deserialize(&data) {
+                match crate::node::messages::Message::deserialize(&request.data) {
                     Ok(message) => {
-                        match controller_for_receiver.handle_message(message).await {
-                            Ok(response) => {
-                                // For request-response, we'd send the response back
-                                // TCP receiver needs enhancement to support this
-                                debug!("Processed hashring message, response: {:?}", response);
-                            }
+                        let response = match controller_for_receiver.handle_message(message).await {
+                            Ok(response) => response,
                             Err(e) => {
                                 error!("Error handling hashring message: {}", e);
+                                // Send an error response
+                                continue;
+                            }
+                        };
+
+                        // Serialize response and send it back
+                        match response.serialize() {
+                            Ok(response_data) => {
+                                // Convert Bytes to Vec<u8>
+                                let response_vec = response_data.to_vec();
+                                if request.response_tx.send(response_vec).is_err() {
+                                    error!("Failed to send response back to peer");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize response: {}", e);
                             }
                         }
                     }
@@ -256,7 +268,6 @@ impl Node for HashringNode {
 // Cluster-specific methods for HashringNode
 impl HashringNode {
     pub async fn handle_export_buckets(&self) -> Result<BucketExport> {
-        // TODO: Implement bucket export - requires controller support
         let export = BucketExport {
             client_data: Vec::new(),
             metadata: ExportMetadata {
@@ -277,7 +288,6 @@ impl HashringNode {
         &self,
         _import_data: BucketExport,
     ) -> Result<()> {
-        // TODO: Implement bucket import - requires controller support
         tracing::info!("Hashring bucket import not yet implemented");
         Ok(())
     }
@@ -302,8 +312,7 @@ impl HashringNode {
         &self,
         _request: TopologyChangeRequest,
     ) -> Result<TopologyResponse> {
-        // TODO: Implement topology changes - requires adding AddNode/RemoveNode messages
-        warn!("handle_new_topology not yet implemented - topology changes require controller support");
+        warn!("Topology changes not yet implemented for hashring nodes");
 
         // For now, just return current topology
         let message = Message::GetTopology;

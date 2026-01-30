@@ -5,25 +5,33 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::stats::{FrozenReceiverStats, ReceiverStats};
 use crate::error::{ColibriError, Result};
+
+/// A request with a channel to send the response back
+pub struct TcpRequest {
+    pub data: bytes::Bytes,
+    pub peer_addr: SocketAddr,
+    pub response_tx: oneshot::Sender<Vec<u8>>,
+}
 
 /// TCP message receiver
 pub struct TcpReceiver {
     pub local_addr: SocketAddr,
     socket: Arc<TcpListener>,
     stats: Arc<ReceiverStats>,
-    message_tx: Arc<mpsc::Sender<(bytes::Bytes, SocketAddr)>>,
+    message_tx: Arc<mpsc::Sender<TcpRequest>>,
 }
 
 impl TcpReceiver {
     /// Create a new TCP receiver
     pub async fn new(
         bind_addr: SocketAddr,
-        message_tx: Arc<mpsc::Sender<(bytes::Bytes, SocketAddr)>>,
+        message_tx: Arc<mpsc::Sender<TcpRequest>>,
     ) -> Result<Self> {
         let socket = TcpListener::bind(bind_addr)
             .await
@@ -41,38 +49,93 @@ impl TcpReceiver {
         })
     }
 
-    /// Get a channel receiver for incoming messages
+    /// Start the receiving task
     pub async fn start(&self) -> () {
-        // Start the receiving task if not already started
         let socket = self.socket.clone();
         let stats = self.stats.clone();
         let tx_clone = self.message_tx.clone();
 
         tokio::spawn(async move {
             loop {
-                let (_socket, send_addr) = socket.accept().await.unwrap_or_else(|e| {
-                    panic!("TCP accept failed: {}", e);
-                });
-                // Wait for the socket to be readable
-                let _ = _socket.readable().await;
-                let mut buf = vec![0u8; 65536]; // 64KB buffer
-                match _socket.try_read_buf(&mut buf) {
-                    Ok(len) => {
-                        let data = buf[..len].to_vec();
-                        stats.messages_received.fetch_add(1, Ordering::Relaxed);
-                        let message = (bytes::Bytes::from(data), send_addr);
-                        // Send to channel
-                        if tx_clone.send(message).await.is_err() {
-                            // Receiver dropped, exit the task
-                            break;
+                let (mut stream, peer_addr) = match socket.accept().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        eprintln!("TCP accept failed: {}", e);
+                        continue;
+                    }
+                };
+
+                let tx = tx_clone.clone();
+                let stats_clone = stats.clone();
+
+                // Spawn a task to handle this connection
+                tokio::spawn(async move {
+                    // Read length prefix (4 bytes)
+                    let mut len_bytes = [0u8; 4];
+                    if let Err(e) = stream.read_exact(&mut len_bytes).await {
+                        stats_clone.receive_errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("Failed to read length prefix: {}", e);
+                        return;
+                    }
+
+                    let msg_len = u32::from_be_bytes(len_bytes) as usize;
+
+                    if msg_len > 10 * 1024 * 1024 {
+                        stats_clone.receive_errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("Message too large: {} bytes", msg_len);
+                        return;
+                    }
+
+                    // Read message data
+                    let mut buf = vec![0u8; msg_len];
+                    if let Err(e) = stream.read_exact(&mut buf).await {
+                        stats_clone.receive_errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("Failed to read message data: {}", e);
+                        return;
+                    }
+
+                    stats_clone.messages_received.fetch_add(1, Ordering::Relaxed);
+
+                    // Create a oneshot channel for the response
+                    let (response_tx, response_rx) = oneshot::channel();
+
+                    let request = TcpRequest {
+                        data: bytes::Bytes::from(buf),
+                        peer_addr,
+                        response_tx,
+                    };
+
+                    // Send the request to the handler
+                    if tx.send(request).await.is_err() {
+                        eprintln!("Failed to send request to handler");
+                        return;
+                    }
+
+                    // Wait for the response
+                    match response_rx.await {
+                        Ok(response_data) => {
+                            // Write response length prefix
+                            let len = response_data.len() as u32;
+                            if let Err(e) = stream.write_all(&len.to_be_bytes()).await {
+                                eprintln!("Failed to write response length: {}", e);
+                                return;
+                            }
+
+                            // Write response data
+                            if let Err(e) = stream.write_all(&response_data).await {
+                                eprintln!("Failed to write response data: {}", e);
+                                return;
+                            }
+
+                            if let Err(e) = stream.flush().await {
+                                eprintln!("Failed to flush response: {}", e);
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("Handler dropped response channel");
                         }
                     }
-                    Err(e) => {
-                        stats.receive_errors.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("TCP receive error: {}", e);
-                        // Continue receiving despite errors
-                    }
-                }
+                });
             }
         });
     }

@@ -8,11 +8,14 @@ use tracing::{debug, info};
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::{NamedRateLimitRule, RateLimitConfig, TokenBucketLimiter};
-use crate::node::messages::{CheckCallsRequest, CheckCallsResponse, Message, Queueable, Status, StatusResponse, TopologyResponse};
+use crate::node::messages::{
+    CheckCallsRequest, CheckCallsResponse, Message, Queueable, Status, StatusResponse,
+    TopologyResponse,
+};
 use crate::node::{NodeAddress, NodeName};
 use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
-use crate::transport::TcpTransport;
 use crate::transport::traits::Sender;
+use crate::transport::TcpTransport;
 
 use super::consistent_hashing;
 
@@ -57,7 +60,8 @@ impl HashringController {
             ));
         }
 
-        let bucket = consistent_hashing::jump_consistent_hash(node_name.as_str(), number_of_buckets);
+        let bucket =
+            consistent_hashing::jump_consistent_hash(node_name.as_str(), number_of_buckets);
 
         let rl_settings = settings.rate_limit_settings();
         let rate_limiter = TokenBucketLimiter::new(rl_settings.clone());
@@ -83,19 +87,20 @@ impl HashringController {
     pub async fn start(self, mut command_rx: mpsc::Receiver<Queueable>) {
         info!("HashringController started for node {}", self.node_name);
 
-        while let Some(_command) = command_rx.recv().await {
-        }
+        while let Some(_command) = command_rx.recv().await {}
 
         info!("HashringController stopped for node {}", self.node_name);
     }
 
     fn owns_bucket_for_client(&self, client_id: &str) -> bool {
-        let client_bucket = consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
+        let client_bucket =
+            consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
         client_bucket == self.bucket
     }
 
     async fn find_bucket_owner(&self, client_id: &str) -> Result<SocketAddr> {
-        let client_bucket = consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
+        let client_bucket =
+            consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
 
         let topology = self.topology.read().await;
         let all_nodes: Vec<_> = topology.all_nodes().into_iter().collect();
@@ -103,7 +108,8 @@ impl HashringController {
         if client_bucket as usize >= all_nodes.len() {
             return Err(ColibriError::Node(format!(
                 "Bucket {} out of range for {} nodes",
-                client_bucket, all_nodes.len()
+                client_bucket,
+                all_nodes.len()
             )));
         }
 
@@ -119,8 +125,9 @@ impl HashringController {
 
         let response_data = self.transport.send_request_response(target, &data).await?;
 
-        let response: Message = postcard::from_bytes(&response_data)
-            .map_err(|e| ColibriError::Transport(format!("Failed to deserialize response: {}", e)))?;
+        let response: Message = postcard::from_bytes(&response_data).map_err(|e| {
+            ColibriError::Transport(format!("Failed to deserialize response: {}", e))
+        })?;
         Ok(response)
     }
 
@@ -130,16 +137,22 @@ impl HashringController {
     ) -> Result<CheckCallsResponse> {
         if !self.owns_bucket_for_client(&request.client_id) {
             let owner = self.find_bucket_owner(&request.client_id).await?;
-            debug!("Forwarding rate limit request for {} to {}", request.client_id, owner);
+            debug!(
+                "Forwarding rate limit request for {} to {}",
+                request.client_id, owner
+            );
 
-            let response = self.forward_request(
-                owner,
-                &Message::RateLimitRequest(request)
-            ).await?;
+            let response = self
+                .forward_request(owner, &Message::RateLimitRequest(request))
+                .await?;
 
             match response {
                 Message::RateLimitResponse(resp) => return Ok(resp),
-                _ => return Err(ColibriError::Transport("Unexpected response from forward".to_string())),
+                _ => {
+                    return Err(ColibriError::Transport(
+                        "Unexpected response from forward".to_string(),
+                    ))
+                }
             }
         }
 
@@ -198,7 +211,11 @@ impl HashringController {
         let mut topology = self.topology.write().await;
         topology.add_node(name.clone(), address);
 
-        tracing::info!("Added node {} at {} to hashring topology", name.as_str(), address);
+        tracing::info!(
+            "Added node {} at {} to hashring topology",
+            name.as_str(),
+            address
+        );
         self.transport.add_peer(name.node_id(), address).await?;
 
         Ok(())
@@ -208,7 +225,11 @@ impl HashringController {
         let mut topology = self.topology.write().await;
 
         if let Some(address) = topology.remove_node(&name) {
-            tracing::info!("Removed node {} (was at {}) from hashring topology", name.as_str(), address);
+            tracing::info!(
+                "Removed node {} (was at {}) from hashring topology",
+                name.as_str(),
+                address
+            );
             self.transport.remove_peer(name.node_id()).await?;
         }
 
@@ -243,10 +264,7 @@ impl HashringController {
         Ok(())
     }
 
-    async fn get_rate_limit_rule(
-        &self,
-        rule_name: String,
-    ) -> Result<Option<NamedRateLimitRule>> {
+    async fn get_rate_limit_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
         if rule_name == "default" {
             return Ok(Some(NamedRateLimitRule {
                 name: "default".to_string(),
@@ -270,12 +288,10 @@ impl HashringController {
     }
 
     async fn list_rate_limit_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let mut rules = vec![
-            NamedRateLimitRule {
-                name: "default".to_string(),
-                settings: self.rate_limit_settings.clone(),
-            }
-        ];
+        let mut rules = vec![NamedRateLimitRule {
+            name: "default".to_string(),
+            settings: self.rate_limit_settings.clone(),
+        }];
 
         let named_limiters = self.named_rate_limiters.lock().unwrap();
 
@@ -317,7 +333,10 @@ impl HashringController {
                 Ok(Message::Ack)
             }
 
-            Message::CreateRateLimitRule { rule_name, settings } => {
+            Message::CreateRateLimitRule {
+                rule_name,
+                settings,
+            } => {
                 self.create_rate_limit_rule(rule_name, settings).await?;
                 Ok(Message::CreateRateLimitRuleResponse)
             }
@@ -431,4 +450,3 @@ impl HashringController {
 // - TcpTransport instead of cluster::ClusterMember
 //
 // TODO: Rewrite these tests in a future phase when node implementations are updated
-

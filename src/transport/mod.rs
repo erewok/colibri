@@ -9,14 +9,14 @@
 
 use serde::{Deserialize, Serialize};
 
-pub mod stats;
-pub mod traits;
 pub mod socket_pool_tcp;
+pub mod stats;
 pub mod tcp_connection;
 pub mod tcp_receiver;
+pub mod traits;
 
 // Re-export traits for easy access
-pub use traits::{Sender, RequestSender, Receiver, RequestReceiver};
+pub use traits::{Receiver, RequestReceiver, RequestSender, Sender};
 
 // Re-export statistics
 pub use stats::{FrozenReceiverStats, FrozenSocketPoolStats, ReceiverStats, SocketPoolStats};
@@ -39,13 +39,13 @@ pub struct SendReceiveStats {
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
-    use indexmap::IndexMap;
-    #[allow(unused_imports)]
     use super::*;
     #[allow(unused_imports)]
     use crate::node::NodeName;
     #[allow(unused_imports)]
     use crate::settings::TransportConfig;
+    #[allow(unused_imports)]
+    use indexmap::IndexMap;
 
     #[allow(dead_code)]
     fn get_transport_config() -> TransportConfig {
@@ -66,5 +66,4 @@ mod tests {
             topology,
         }
     }
-
 }

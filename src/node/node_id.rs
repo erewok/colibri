@@ -1,20 +1,17 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::net::ToSocketAddrs;
 use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 
 use serde::{Deserialize, Serialize};
 
 /// Unique identifier for cluster nodes
-#[derive(
-    Clone, Debug, Default, Deserialize, Serialize, PartialEq, PartialOrd, Ord, Eq, Hash,
-)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, PartialOrd, Ord, Eq, Hash)]
 pub struct NodeName(String);
 
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, PartialOrd, Ord, Eq, Hash,
 )]
 pub struct NodeId(u32);
-
 
 impl NodeName {
     pub fn new(id: String) -> Self {
@@ -60,7 +57,6 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-
 /// Node addressing information
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeAddress {
@@ -71,11 +67,23 @@ pub struct NodeAddress {
 }
 
 impl NodeAddress {
-    pub fn new(name: impl Into<String>, local_address: impl ToSocketAddrs, remote_address: impl ToSocketAddrs) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        local_address: impl ToSocketAddrs,
+        remote_address: impl ToSocketAddrs,
+    ) -> Self {
         Self {
             name: NodeName::new(name.into()),
-            local_address: local_address.to_socket_addrs().expect("Invalid local address").next().expect("No local address found"),
-            remote_address: remote_address.to_socket_addrs().expect("Invalid remote address").next().expect("No remote address found"),
+            local_address: local_address
+                .to_socket_addrs()
+                .expect("Invalid local address")
+                .next()
+                .expect("No local address found"),
+            remote_address: remote_address
+                .to_socket_addrs()
+                .expect("Invalid remote address")
+                .next()
+                .expect("No remote address found"),
         }
     }
 

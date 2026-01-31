@@ -8,13 +8,12 @@ use super::GossipController;
 use crate::error::{ColibriError, Result};
 use crate::limiters::NamedRateLimitRule;
 use crate::node::messages::{
-    CheckCallsRequest, CheckCallsResponse, Message, StatusResponse,
+    BucketExport, CheckCallsRequest, CheckCallsResponse, ExportMetadata, Message, StatusResponse,
     TopologyChangeRequest, TopologyResponse,
-    BucketExport, ExportMetadata,
 };
 use crate::node::{Node, NodeName};
-use crate::settings::RunMode;
 use crate::settings;
+use crate::settings::RunMode;
 
 /// Gossip-based distributed rate limiter node
 #[derive(Clone)]
@@ -103,7 +102,8 @@ impl Node for GossipNode {
         let receiver_addr = settings.transport_config().peer_listen_url();
         let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1000);
 
-        let receiver = crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
+        let receiver =
+            crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
         receiver.start().await;
 
         // Spawn task to process incoming messages
@@ -147,10 +147,10 @@ impl Node for GossipNode {
         let message = Message::RateLimitRequest(request);
 
         match self.controller.handle_message(message).await? {
-            Message::RateLimitResponse(response) => {
-                Ok(Some(response))
-            }
-            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+            Message::RateLimitResponse(response) => Ok(Some(response)),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
         }
     }
 
@@ -171,7 +171,9 @@ impl Node for GossipNode {
                     Ok(None)
                 }
             }
-            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
         }
     }
     async fn check_limit_custom(
@@ -187,10 +189,10 @@ impl Node for GossipNode {
         let message = Message::RateLimitRequest(request);
 
         match self.controller.handle_message(message).await? {
-            Message::RateLimitResponse(response) => {
-                Ok(Some(response))
-            }
-            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+            Message::RateLimitResponse(response) => Ok(Some(response)),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
         }
     }
     async fn rate_limit_custom(
@@ -213,10 +215,11 @@ impl Node for GossipNode {
                     Ok(None)
                 }
             }
-            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
         }
     }
-
 
     /// Expire keys from local buckets
     async fn expire_keys(&self) -> Result<()> {
@@ -231,11 +234,16 @@ impl Node for GossipNode {
         rule_name: String,
         settings: settings::RateLimitSettings,
     ) -> Result<()> {
-        let message = Message::CreateRateLimitRule { rule_name, settings };
+        let message = Message::CreateRateLimitRule {
+            rule_name,
+            settings,
+        };
 
         match self.controller.handle_message(message).await? {
             Message::CreateRateLimitRuleResponse => Ok(()),
-            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
         }
     }
 
@@ -244,7 +252,9 @@ impl Node for GossipNode {
 
         match self.controller.handle_message(message).await? {
             Message::DeleteRateLimitRuleResponse => Ok(()),
-            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
         }
     }
 
@@ -253,21 +263,21 @@ impl Node for GossipNode {
 
         match self.controller.handle_message(message).await? {
             Message::ListRateLimitRulesResponse(rules) => Ok(rules),
-            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
         }
     }
-    async fn get_named_rule(
-        &self,
-        rule_name: String,
-    ) -> Result<Option<NamedRateLimitRule>> {
+    async fn get_named_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
         let message = Message::GetRateLimitRule { rule_name };
 
         match self.controller.handle_message(message).await? {
             Message::GetRateLimitRuleResponse(rule) => Ok(rule),
-            _ => Err(ColibriError::Node("Unexpected response from controller".to_string())),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
         }
     }
-
 }
 
 // Cluster-specific methods for GossipNode
@@ -303,7 +313,9 @@ impl GossipNode {
         let message = Message::GetStatus;
         match self.controller.handle_message(message).await? {
             Message::StatusResponse(response) => Ok(response),
-            _ => Err(ColibriError::Api("Unexpected response type for GetStatus".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetStatus".to_string(),
+            )),
         }
     }
 
@@ -311,7 +323,9 @@ impl GossipNode {
         let message = Message::GetTopology;
         match self.controller.handle_message(message).await? {
             Message::TopologyResponse(response) => Ok(response),
-            _ => Err(ColibriError::Api("Unexpected response type for GetTopology".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetTopology".to_string(),
+            )),
         }
     }
 
@@ -325,7 +339,9 @@ impl GossipNode {
         let message = Message::GetTopology;
         match self.controller.handle_message(message).await? {
             Message::TopologyResponse(response) => Ok(response),
-            _ => Err(ColibriError::Api("Unexpected response type for GetTopology".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetTopology".to_string(),
+            )),
         }
     }
 }

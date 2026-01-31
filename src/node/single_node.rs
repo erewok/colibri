@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{NamedRateLimitRule, RateLimitConfig, token_bucket};
+use crate::limiters::{token_bucket, NamedRateLimitRule, RateLimitConfig};
 use crate::node::{messages::CheckCallsResponse, Node, NodeName};
 use crate::settings::{RateLimitSettings, Settings};
 
@@ -26,7 +26,10 @@ impl Node for SingleNode {
         Self: Sized,
     {
         let node_name: NodeName = settings.server_name.clone().into();
-        let listen_api = format!("{}:{}", settings.client_listen_address, settings.client_listen_port);
+        let listen_api = format!(
+            "{}:{}",
+            settings.client_listen_address, settings.client_listen_port
+        );
         info!(
             "[Node<{}>] Starting at {} in single-node mode",
             node_name, listen_api
@@ -194,7 +197,6 @@ impl Node for SingleNode {
         rate_limiter.expire_keys();
         Ok(())
     }
-
 }
 
 pub async fn local_check_limit(

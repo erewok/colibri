@@ -6,12 +6,11 @@ use tracing::{error, info, warn};
 use super::HashringController;
 use crate::error::{ColibriError, Result};
 use crate::limiters::NamedRateLimitRule;
-use crate::node::{Node, NodeName};
 use crate::node::messages::{
-    CheckCallsRequest, CheckCallsResponse, Message, StatusResponse,
+    BucketExport, CheckCallsRequest, CheckCallsResponse, ExportMetadata, Message, StatusResponse,
     TopologyChangeRequest, TopologyResponse,
-    BucketExport, ExportMetadata,
 };
+use crate::node::{Node, NodeName};
 use crate::settings;
 
 /// Replication factor for data distribution
@@ -77,7 +76,10 @@ impl std::fmt::Debug for HashringNode {
 impl Node for HashringNode {
     async fn new(settings: settings::Settings) -> Result<Self> {
         let node_name: NodeName = settings.node_name();
-        let listen_api = format!("{}:{}", settings.client_listen_address, settings.client_listen_port);
+        let listen_api = format!(
+            "{}:{}",
+            settings.client_listen_address, settings.client_listen_port
+        );
         info!(
             "[Node<{}>] Hashring node starting at {} with {} nodes in topology: {:?}",
             &node_name,
@@ -93,7 +95,8 @@ impl Node for HashringNode {
         let receiver_addr = settings.transport_config().peer_listen_url();
         let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1000);
 
-        let receiver = crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
+        let receiver =
+            crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
         receiver.start().await;
 
         // Spawn task to process incoming messages
@@ -151,7 +154,9 @@ impl Node for HashringNode {
 
         match self.controller.handle_message(message).await? {
             Message::RateLimitResponse(response) => Ok(Some(response)),
-            _ => Err(ColibriError::Api("Unexpected response type for CheckLimit".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for CheckLimit".to_string(),
+            )),
         }
     }
 
@@ -171,7 +176,9 @@ impl Node for HashringNode {
                     Ok(None)
                 }
             }
-            _ => Err(ColibriError::Api("Unexpected response type for RateLimit".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for RateLimit".to_string(),
+            )),
         }
     }
 
@@ -191,7 +198,9 @@ impl Node for HashringNode {
         };
         match self.controller.handle_message(message).await? {
             Message::CreateRateLimitRuleResponse => Ok(()),
-            _ => Err(ColibriError::Api("Unexpected response type for CreateRule".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for CreateRule".to_string(),
+            )),
         }
     }
 
@@ -199,7 +208,9 @@ impl Node for HashringNode {
         let message = Message::DeleteRateLimitRule { rule_name };
         match self.controller.handle_message(message).await? {
             Message::DeleteRateLimitRuleResponse => Ok(()),
-            _ => Err(ColibriError::Api("Unexpected response type for DeleteRule".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for DeleteRule".to_string(),
+            )),
         }
     }
 
@@ -207,18 +218,19 @@ impl Node for HashringNode {
         let message = Message::ListRateLimitRules;
         match self.controller.handle_message(message).await? {
             Message::ListRateLimitRulesResponse(rules) => Ok(rules),
-            _ => Err(ColibriError::Api("Unexpected response type for ListRules".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for ListRules".to_string(),
+            )),
         }
     }
 
-    async fn get_named_rule(
-        &self,
-        rule_name: String,
-    ) -> Result<Option<NamedRateLimitRule>> {
+    async fn get_named_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
         let message = Message::GetRateLimitRule { rule_name };
         match self.controller.handle_message(message).await? {
             Message::GetRateLimitRuleResponse(rule) => Ok(rule),
-            _ => Err(ColibriError::Api("Unexpected response type for GetRule".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetRule".to_string(),
+            )),
         }
     }
 
@@ -242,7 +254,9 @@ impl Node for HashringNode {
                     Ok(None)
                 }
             }
-            _ => Err(ColibriError::Api("Unexpected response type for RateLimitCustom".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for RateLimitCustom".to_string(),
+            )),
         }
     }
 
@@ -260,7 +274,9 @@ impl Node for HashringNode {
 
         match self.controller.handle_message(message).await? {
             Message::RateLimitResponse(response) => Ok(Some(response)),
-            _ => Err(ColibriError::Api("Unexpected response type for CheckLimitCustom".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for CheckLimitCustom".to_string(),
+            )),
         }
     }
 }
@@ -284,10 +300,7 @@ impl HashringNode {
         Ok(export)
     }
 
-    pub async fn handle_import_buckets(
-        &self,
-        _import_data: BucketExport,
-    ) -> Result<()> {
+    pub async fn handle_import_buckets(&self, _import_data: BucketExport) -> Result<()> {
         tracing::info!("Hashring bucket import not yet implemented");
         Ok(())
     }
@@ -296,7 +309,9 @@ impl HashringNode {
         let message = Message::GetStatus;
         match self.controller.handle_message(message).await? {
             Message::StatusResponse(response) => Ok(response),
-            _ => Err(ColibriError::Api("Unexpected response type for GetStatus".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetStatus".to_string(),
+            )),
         }
     }
 
@@ -304,7 +319,9 @@ impl HashringNode {
         let message = Message::GetTopology;
         match self.controller.handle_message(message).await? {
             Message::TopologyResponse(response) => Ok(response),
-            _ => Err(ColibriError::Api("Unexpected response type for GetTopology".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetTopology".to_string(),
+            )),
         }
     }
 
@@ -318,7 +335,9 @@ impl HashringNode {
         let message = Message::GetTopology;
         match self.controller.handle_message(message).await? {
             Message::TopologyResponse(response) => Ok(response),
-            _ => Err(ColibriError::Api("Unexpected response type for GetTopology".to_string())),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetTopology".to_string(),
+            )),
         }
     }
 }

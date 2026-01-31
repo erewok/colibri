@@ -14,10 +14,9 @@ use crate::limiters::NamedRateLimitRule;
 use crate::settings;
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;
-pub use node_id::{NodeId, NodeName, NodeAddress};
-pub use single_node::SingleNode;
 pub use messages::{AdminCommand, AdminResponse, BucketExport, ExportMetadata};
-
+pub use node_id::{NodeAddress, NodeId, NodeName};
+pub use single_node::SingleNode;
 
 #[async_trait]
 pub trait Node {
@@ -36,10 +35,7 @@ pub trait Node {
     ) -> Result<()>;
     async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>>;
     async fn delete_named_rule(&self, rule_name: String) -> Result<()>;
-    async fn get_named_rule(
-        &self,
-        rule_name: String,
-    ) -> Result<Option<NamedRateLimitRule>>;
+    async fn get_named_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>>;
     async fn rate_limit_custom(
         &self,
         rule_name: String,
@@ -63,14 +59,12 @@ impl NodeWrapper {
     pub async fn new(settings: settings::Settings) -> Result<Self> {
         // A rate_limiter holds all rate-limiting data in memory: no data persisted to disk!
         if settings.topology.is_empty() {
-            Ok(Self::Single(Arc::new(
-                SingleNode::new(settings).await?,
-            )))
+            Ok(Self::Single(Arc::new(SingleNode::new(settings).await?)))
         } else {
             match settings.run_mode {
-                settings::RunMode::Single => Ok(Self::Single(Arc::new(
-                    SingleNode::new(settings).await?,
-                ))),
+                settings::RunMode::Single => {
+                    Ok(Self::Single(Arc::new(SingleNode::new(settings).await?)))
+                }
                 settings::RunMode::Gossip => {
                     warn!("Gossip mode is experimental!");
                     let gossip_node = Arc::new(GossipNode::new(settings).await?);
@@ -105,11 +99,17 @@ impl NodeWrapper {
         self.get_node_ref().expire_keys().await
     }
 
-    pub async fn check_limit(&self, client_id: String) -> Result<Option<messages::CheckCallsResponse>> {
+    pub async fn check_limit(
+        &self,
+        client_id: String,
+    ) -> Result<Option<messages::CheckCallsResponse>> {
         self.get_node_ref().check_limit(client_id).await
     }
 
-    pub async fn rate_limit(&self, client_id: String) -> Result<Option<messages::CheckCallsResponse>> {
+    pub async fn rate_limit(
+        &self,
+        client_id: String,
+    ) -> Result<Option<messages::CheckCallsResponse>> {
         self.get_node_ref().rate_limit(client_id).await
     }
 
@@ -123,10 +123,7 @@ impl NodeWrapper {
             .await
     }
 
-    pub async fn get_named_rule(
-        &self,
-        rule_name: String,
-    ) -> Result<Option<NamedRateLimitRule>> {
+    pub async fn get_named_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
         self.get_node_ref().get_named_rule(rule_name).await
     }
 

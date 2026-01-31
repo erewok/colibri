@@ -1,20 +1,26 @@
 //! Token bucket rate limiting algorithm
-use serde::{Deserialize, Serialize};
 use chrono::Utc;
 use papaya::HashMap;
+use serde::{Deserialize, Serialize};
 
 use crate::node::NodeId;
 use crate::settings;
 
 /// Rate limiter bucket interface
 pub trait Bucket {
-    fn new(max_calls: u32, node_id: NodeId) -> Self where Self: Sized;
+    fn new(max_calls: u32, node_id: NodeId) -> Self
+    where
+        Self: Sized;
     fn add_tokens_to_bucket(
         &mut self,
         rate_limit_settings: &settings::RateLimitSettings,
-    ) -> &mut Self where Self: Sized;
+    ) -> &mut Self
+    where
+        Self: Sized;
     fn check_if_allowed(&self) -> bool;
-    fn decrement(&mut self) -> &mut Self where Self: Sized;
+    fn decrement(&mut self) -> &mut Self
+    where
+        Self: Sized;
     fn tokens_to_u32(&self) -> u32;
 }
 
@@ -105,7 +111,10 @@ impl TokenBucketLimiter {
     }
 
     pub fn new_bucket(&self) -> TokenBucket {
-        TokenBucket::new(self.settings.rate_limit_max_calls_allowed, NodeId::default())
+        TokenBucket::new(
+            self.settings.rate_limit_max_calls_allowed,
+            NodeId::default(),
+        )
     }
 
     // It's possible that updates happen around this object
@@ -595,8 +604,7 @@ mod tests {
             rate_limit_interval_seconds: 1,
         };
 
-        let mut limiter: TokenBucketLimiter =
-            TokenBucketLimiter::new(zero_settings);
+        let mut limiter: TokenBucketLimiter = TokenBucketLimiter::new(zero_settings);
 
         // default is 0
         assert_eq!(limiter.check_calls_remaining_for_client("test_client"), 0);

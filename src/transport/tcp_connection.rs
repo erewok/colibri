@@ -6,14 +6,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
-use super::traits::{Sender, RequestSender};
-use super::stats::FrozenSocketPoolStats;
 use super::socket_pool_tcp::TcpSocketPool;
-use crate::error::{Result, ColibriError};
-use crate::node::{NodeId, messages::Message};
+use super::stats::FrozenSocketPoolStats;
+use super::traits::{RequestSender, Sender};
+use crate::error::{ColibriError, Result};
+use crate::node::{messages::Message, NodeId};
 use crate::settings::TransportConfig;
 
 #[derive(Clone, Debug)]
@@ -74,11 +74,7 @@ impl TcpTransport {
 
     /// Send raw data without waiting for response (fire-and-forget)
     /// This spawns a task to send the message asynchronously
-    pub async fn send_fire_and_forget(
-        &self,
-        peer: SocketAddr,
-        data: &[u8],
-    ) -> Result<()> {
+    pub async fn send_fire_and_forget(&self, peer: SocketAddr, data: &[u8]) -> Result<()> {
         let data = data.to_vec();
         let socket_pool = self.socket_pool.clone();
 
@@ -112,11 +108,7 @@ impl TcpTransport {
     }
 
     /// Send raw data to a peer and wait for response
-    pub async fn send_request_response(
-        &self,
-        peer: SocketAddr,
-        data: &[u8],
-    ) -> Result<Vec<u8>> {
+    pub async fn send_request_response(&self, peer: SocketAddr, data: &[u8]) -> Result<Vec<u8>> {
         let mut stream = tokio::net::TcpStream::connect(peer).await?;
 
         // Write request with length prefix
@@ -148,13 +140,11 @@ impl TcpTransport {
 
     /// Broadcast raw data to multiple peers (fire-and-forget)
     /// Returns number of successful sends
-    pub async fn broadcast(
-        &self,
-        peers: Vec<SocketAddr>,
-        data: &[u8],
-    ) -> Result<usize> {
+    pub async fn broadcast(&self, peers: Vec<SocketAddr>, data: &[u8]) -> Result<usize> {
         if peers.is_empty() {
-            return Err(ColibriError::Transport("No peers to broadcast to".to_string()));
+            return Err(ColibriError::Transport(
+                "No peers to broadcast to".to_string(),
+            ));
         }
 
         let mut success_count = 0;
@@ -170,7 +160,7 @@ impl TcpTransport {
 
         if success_count == 0 {
             return Err(ColibriError::Transport(
-                "Failed to broadcast to any peers".to_string()
+                "Failed to broadcast to any peers".to_string(),
             ));
         }
 
@@ -178,11 +168,7 @@ impl TcpTransport {
     }
 
     /// Broadcast to a subset of random peers (gossip fanout)
-    pub async fn broadcast_random(
-        &self,
-        fanout: usize,
-        data: &[u8],
-    ) -> Result<usize> {
+    pub async fn broadcast_random(&self, fanout: usize, data: &[u8]) -> Result<usize> {
         let peer_ids = self.get_peers().await;
 
         if peer_ids.is_empty() {
@@ -192,7 +178,8 @@ impl TcpTransport {
         // Get peer addresses from the socket pool
         let peers: Vec<SocketAddr> = {
             let pool = self.socket_pool.read().await;
-            peer_ids.iter()
+            peer_ids
+                .iter()
                 .filter_map(|id| pool.get_peer_address(*id))
                 .collect()
         };
@@ -218,15 +205,23 @@ impl Sender for TcpTransport {
     async fn send_to_peer(&self, target: NodeId, data: &[u8]) -> Result<()> {
         // For TCP, this could be a simplified send without waiting for response
         // or we could adapt it to send and ignore the response
-        let _response = self.socket_pool.read().await
-            .send_request_response(target, data).await?;
+        let _response = self
+            .socket_pool
+            .read()
+            .await
+            .send_request_response(target, data)
+            .await?;
         Ok(())
     }
 
     /// Send data to a random peer (fire-and-forget)
     async fn send_to_random_peer(&self, data: &[u8]) -> Result<NodeId> {
-        let (node_id, _response) = self.socket_pool.read().await
-            .send_request_response_random(data).await?;
+        let (node_id, _response) = self
+            .socket_pool
+            .read()
+            .await
+            .send_request_response_random(data)
+            .await?;
         Ok(node_id)
     }
 
@@ -240,7 +235,9 @@ impl Sender for TcpTransport {
             }
         }
         if sent_to.is_empty() {
-            Err(crate::error::ColibriError::Transport("All sends failed".to_string()))
+            Err(crate::error::ColibriError::Transport(
+                "All sends failed".to_string(),
+            ))
         } else {
             Ok(sent_to)
         }
@@ -270,11 +267,7 @@ impl Sender for TcpTransport {
 #[async_trait]
 impl RequestSender for TcpTransport {
     /// Send request to specific peer and wait for response
-    async fn send_request_response(
-        &self,
-        target: NodeId,
-        request_data: &[u8],
-    ) -> Result<Vec<u8>> {
+    async fn send_request_response(&self, target: NodeId, request_data: &[u8]) -> Result<Vec<u8>> {
         self.socket_pool
             .read()
             .await
@@ -283,10 +276,7 @@ impl RequestSender for TcpTransport {
     }
 
     /// Send request to random peer and wait for response
-    async fn send_request_response_random(
-        &self,
-        request_data: &[u8],
-    ) -> Result<(NodeId, Vec<u8>)> {
+    async fn send_request_response_random(&self, request_data: &[u8]) -> Result<(NodeId, Vec<u8>)> {
         self.socket_pool
             .read()
             .await
@@ -308,9 +298,9 @@ impl RequestSender for TcpTransport {
 mod tests {
     use super::*;
     use crate::node::messages::{CheckCallsRequest, CheckCallsResponse};
+    use crate::node::NodeName;
     use crate::settings::TransportConfig;
     use indexmap::IndexMap;
-    use crate::node::NodeName;
 
     fn create_test_transport_config() -> TransportConfig {
         let mut topology = IndexMap::new();
@@ -379,10 +369,7 @@ mod tests {
 
         // This should return immediately even if peer is not available
         let result = transport
-            .send_message_fire_and_forget(
-                "127.0.0.1:9999".parse().unwrap(),
-                &message,
-            )
+            .send_message_fire_and_forget("127.0.0.1:9999".parse().unwrap(), &message)
             .await;
 
         // Fire-and-forget always returns Ok (errors are logged)
@@ -405,4 +392,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

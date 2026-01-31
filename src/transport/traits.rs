@@ -3,12 +3,12 @@
 //! Provides common traits for different transport protocols (UDP, TCP)
 //! to enable consistent peer-to-peer communication in the cluster.
 
-use std::net::SocketAddr;
 use async_trait::async_trait;
+use std::net::SocketAddr;
 
+use super::stats::{FrozenReceiverStats, FrozenSocketPoolStats};
 use crate::error::Result;
 use crate::node::NodeId;
-use super::stats::{FrozenSocketPoolStats, FrozenReceiverStats};
 
 /// Trait for sending messages to peers in the cluster
 #[async_trait]
@@ -39,17 +39,10 @@ pub trait Sender {
 #[async_trait]
 pub trait RequestSender: Sender {
     /// Send request to specific peer and wait for response
-    async fn send_request_response(
-        &self,
-        target: NodeId,
-        request_data: &[u8],
-    ) -> Result<Vec<u8>>;
+    async fn send_request_response(&self, target: NodeId, request_data: &[u8]) -> Result<Vec<u8>>;
 
     /// Send request to random peer and wait for response
-    async fn send_request_response_random(
-        &self,
-        request_data: &[u8],
-    ) -> Result<(NodeId, Vec<u8>)>;
+    async fn send_request_response_random(&self, request_data: &[u8]) -> Result<(NodeId, Vec<u8>)>;
 
     /// Cleanup expired connections (for connection-based transports)
     async fn cleanup_expired_connections(&self);

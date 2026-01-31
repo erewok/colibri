@@ -36,9 +36,18 @@ fn test_token_bucket_exhaustion() {
     let client_id = "exhaustion_client";
 
     // Exhaust the tokens
-    assert_eq!(limiter.limit_calls_for_client(client_id.to_string()), Some(2));
-    assert_eq!(limiter.limit_calls_for_client(client_id.to_string()), Some(1));
-    assert_eq!(limiter.limit_calls_for_client(client_id.to_string()), Some(0));
+    assert_eq!(
+        limiter.limit_calls_for_client(client_id.to_string()),
+        Some(2)
+    );
+    assert_eq!(
+        limiter.limit_calls_for_client(client_id.to_string()),
+        Some(1)
+    );
+    assert_eq!(
+        limiter.limit_calls_for_client(client_id.to_string()),
+        Some(0)
+    );
 
     // Next call should be denied
     assert_eq!(limiter.limit_calls_for_client(client_id.to_string()), None);
@@ -54,9 +63,18 @@ fn test_token_bucket_multiple_clients() {
     let mut limiter = TokenBucketLimiter::new(settings);
 
     // Different clients have independent limits
-    assert_eq!(limiter.limit_calls_for_client("client1".to_string()), Some(4));
-    assert_eq!(limiter.limit_calls_for_client("client2".to_string()), Some(4));
-    assert_eq!(limiter.limit_calls_for_client("client1".to_string()), Some(3));
+    assert_eq!(
+        limiter.limit_calls_for_client("client1".to_string()),
+        Some(4)
+    );
+    assert_eq!(
+        limiter.limit_calls_for_client("client2".to_string()),
+        Some(4)
+    );
+    assert_eq!(
+        limiter.limit_calls_for_client("client1".to_string()),
+        Some(3)
+    );
 
     // Check they're tracked separately
     assert_eq!(limiter.check_calls_remaining_for_client("client1"), 3);

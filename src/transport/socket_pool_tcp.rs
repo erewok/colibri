@@ -94,10 +94,14 @@ impl TcpSocketPool {
         target: NodeId,
         request_data: &[u8],
     ) -> Result<Vec<u8>> {
-        let peer_info = self.peer_connections.get(&target)
+        let peer_info = self
+            .peer_connections
+            .get(&target)
             .ok_or_else(|| ColibriError::Transport(format!("Peer not found: {:?}", target)))?;
 
-        let mut connection = self.get_or_create_connection(target, peer_info.socket_addr).await?;
+        let mut connection = self
+            .get_or_create_connection(target, peer_info.socket_addr)
+            .await?;
 
         // Send request with length prefix
         let request_len = request_data.len() as u32;
@@ -115,11 +119,17 @@ impl TcpSocketPool {
                 self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
             }
             Ok(Err(e)) => {
-                self.stats.errors.send_errors.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .errors
+                    .send_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(e);
             }
             Err(_) => {
-                self.stats.errors.timeout_errors.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .errors
+                    .timeout_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(ColibriError::Transport("Request send timeout".to_string()));
             }
         }
@@ -134,11 +144,19 @@ impl TcpSocketPool {
         {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                return Err(ColibriError::Transport(format!("Failed to read response length: {}", e)));
+                return Err(ColibriError::Transport(format!(
+                    "Failed to read response length: {}",
+                    e
+                )));
             }
             Err(_) => {
-                self.stats.errors.timeout_errors.fetch_add(1, Ordering::Relaxed);
-                return Err(ColibriError::Transport("Response length read timeout".to_string()));
+                self.stats
+                    .errors
+                    .timeout_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(ColibriError::Transport(
+                    "Response length read timeout".to_string(),
+                ));
             }
         }
 
@@ -157,15 +175,23 @@ impl TcpSocketPool {
         .await
         {
             Ok(Ok(_)) => {
-                self.stats.responses_received.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .responses_received
+                    .fetch_add(1, Ordering::Relaxed);
                 Ok(response_data)
             }
-            Ok(Err(e)) => {
-                return Err(ColibriError::Transport(format!("Failed to read response data: {}", e)));
-            }
+            Ok(Err(e)) => Err(ColibriError::Transport(format!(
+                "Failed to read response data: {}",
+                e
+            ))),
             Err(_) => {
-                self.stats.errors.timeout_errors.fetch_add(1, Ordering::Relaxed);
-                Err(ColibriError::Transport("Response data read timeout".to_string()))
+                self.stats
+                    .errors
+                    .timeout_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(ColibriError::Transport(
+                    "Response data read timeout".to_string(),
+                ))
             }
         }
     }
@@ -188,22 +214,38 @@ impl TcpSocketPool {
         }
     }
     /// Get a connection from the pool or create a new one
-    async fn get_or_create_connection(&self, node_id: NodeId, socket_addr: SocketAddr) -> Result<TcpStream> {
+    async fn get_or_create_connection(
+        &self,
+        node_id: NodeId,
+        socket_addr: SocketAddr,
+    ) -> Result<TcpStream> {
         // For now, create a new connection each time (simplified implementation)
         // In a full implementation, you'd maintain a connection pool
         match timeout(self.connection_timeout, TcpStream::connect(socket_addr)).await {
             Ok(Ok(stream)) => {
-                debug!("Created new TCP connection to {:?} at {}", node_id, socket_addr);
+                debug!(
+                    "Created new TCP connection to {:?} at {}",
+                    node_id, socket_addr
+                );
                 self.stats.total_connections.fetch_add(1, Ordering::Relaxed);
                 Ok(stream)
             }
             Ok(Err(e)) => {
-                error!("Failed to connect to {:?} at {}: {}", node_id, socket_addr, e);
-                self.stats.errors.send_errors.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    "Failed to connect to {:?} at {}: {}",
+                    node_id, socket_addr, e
+                );
+                self.stats
+                    .errors
+                    .send_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 Err(ColibriError::Transport(format!("Connection failed: {}", e)))
             }
             Err(_) => {
-                self.stats.errors.timeout_errors.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .errors
+                    .timeout_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 Err(ColibriError::Transport("Connection timeout".to_string()))
             }
         }
@@ -217,14 +259,18 @@ impl TcpSocketPool {
         };
         self.peer_connections.insert(node_id, peer_info);
 
-        self.stats.peer_count.store(self.peer_connections.len(), Ordering::Relaxed);
+        self.stats
+            .peer_count
+            .store(self.peer_connections.len(), Ordering::Relaxed);
         Ok(())
     }
 
     /// Remove a peer from the socket pool
     pub async fn remove_peer(&mut self, node_id: NodeId) -> Result<()> {
         self.peer_connections.swap_remove(&node_id);
-        self.stats.peer_count.store(self.peer_connections.len(), Ordering::Relaxed);
+        self.stats
+            .peer_count
+            .store(self.peer_connections.len(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -235,7 +281,9 @@ impl TcpSocketPool {
 
     /// Get the socket address for a specific peer
     pub fn get_peer_address(&self, node_id: NodeId) -> Option<SocketAddr> {
-        self.peer_connections.get(&node_id).map(|info| info.socket_addr)
+        self.peer_connections
+            .get(&node_id)
+            .map(|info| info.socket_addr)
     }
 
     /// Cleanup expired connections (simplified for now)

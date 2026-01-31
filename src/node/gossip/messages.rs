@@ -3,9 +3,9 @@
 //! Defines all message types for cluster communication.
 use std::net::SocketAddr;
 
-use serde::{Deserialize, Serialize};
-use postcard::{from_bytes, to_allocvec};
 use crdts::VClock;
+use postcard::{from_bytes, to_allocvec};
+use serde::{Deserialize, Serialize};
 
 use crate::limiters::distributed_bucket::DistributedBucketExternal;
 use crate::limiters::NamedRateLimitRule;
@@ -104,7 +104,6 @@ impl GossipPacket {
         from_bytes(data)
     }
 }
-
 
 // impl GossipCommand {
 //     pub fn from_incoming_message(data: bytes::Bytes, peer_addr: SocketAddr) -> Self {

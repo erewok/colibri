@@ -34,7 +34,7 @@ pub struct Cli {
 
     // Configuration file (can be combined or overridden with other options)
     #[clap(
-        short='f',
+        short = 'f',
         long,
         default_value = "colibri.toml",
         env("COLIBRI_CONFIG_FILE"),
@@ -185,7 +185,6 @@ impl Cli {
         )
     }
 }
-
 
 /// Parse a single key-value pair
 fn parse_key_val<T, U>(s: &str) -> Result<(T, U), Box<dyn Error + Send + Sync + 'static>>

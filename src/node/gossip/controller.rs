@@ -7,12 +7,17 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{NamedRateLimitRule, RateLimitConfig, distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter}};
-use crate::node::messages::{CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse};
+use crate::limiters::{
+    distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter},
+    NamedRateLimitRule, RateLimitConfig,
+};
+use crate::node::messages::{
+    CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
+};
 use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
-use crate::transport::TcpTransport;
 use crate::transport::traits::Sender;
+use crate::transport::TcpTransport;
 use tokio::sync::RwLock;
 
 use super::{GossipMessage, GossipPacket};
@@ -53,7 +58,10 @@ impl GossipController {
 
         info!(
             "Created GossipNode {} <{}> (Peer address: {}:{})",
-            node_name.as_str(), node_id, settings.peer_listen_address, settings.peer_listen_port
+            node_name.as_str(),
+            node_id,
+            settings.peer_listen_address,
+            settings.peer_listen_port
         );
 
         let rl_settings = settings.rate_limit_settings();
@@ -137,7 +145,11 @@ impl GossipController {
         let mut topology = self.topology.write().await;
         topology.add_node(name.clone(), address);
 
-        tracing::info!("Added node {} at {} to gossip topology", name.as_str(), address);
+        tracing::info!(
+            "Added node {} at {} to gossip topology",
+            name.as_str(),
+            address
+        );
         self.transport.add_peer(name.node_id(), address).await?;
 
         Ok(())
@@ -147,7 +159,11 @@ impl GossipController {
         let mut topology = self.topology.write().await;
 
         if let Some(address) = topology.remove_node(&name) {
-            tracing::info!("Removed node {} (was at {}) from gossip topology", name.as_str(), address);
+            tracing::info!(
+                "Removed node {} (was at {}) from gossip topology",
+                name.as_str(),
+                address
+            );
             self.transport.remove_peer(name.node_id()).await?;
         }
 
@@ -182,10 +198,7 @@ impl GossipController {
         Ok(())
     }
 
-    async fn get_rate_limit_rule(
-        &self,
-        rule_name: String,
-    ) -> Result<Option<NamedRateLimitRule>> {
+    async fn get_rate_limit_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
         if rule_name == "default" {
             return Ok(Some(NamedRateLimitRule {
                 name: "default".to_string(),
@@ -195,19 +208,20 @@ impl GossipController {
 
         let named_limiters = self.named_rate_limiters.lock().await;
         if named_limiters.contains_key(&rule_name) {
-            tracing::warn!("Rule '{}' exists but settings not retrievable yet", rule_name);
+            tracing::warn!(
+                "Rule '{}' exists but settings not retrievable yet",
+                rule_name
+            );
         }
 
         Ok(None)
     }
 
     async fn list_rate_limit_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let rules = vec![
-            NamedRateLimitRule {
-                name: "default".to_string(),
-                settings: self.rate_limit_settings.clone(),
-            }
-        ];
+        let rules = vec![NamedRateLimitRule {
+            name: "default".to_string(),
+            settings: self.rate_limit_settings.clone(),
+        }];
 
         let named_limiters = self.named_rate_limiters.lock().await;
         for name in named_limiters.keys() {
@@ -244,7 +258,10 @@ impl GossipController {
                 Ok(Message::Ack)
             }
 
-            Message::CreateRateLimitRule { rule_name, settings } => {
+            Message::CreateRateLimitRule {
+                rule_name,
+                settings,
+            } => {
                 self.create_rate_limit_rule(rule_name, settings).await?;
                 Ok(Message::Ack)
             }
@@ -264,7 +281,10 @@ impl GossipController {
                 Ok(Message::ListRateLimitRulesResponse(rules))
             }
 
-            Message::GossipDeltaSync { updates, propagation_factor } => {
+            Message::GossipDeltaSync {
+                updates,
+                propagation_factor,
+            } => {
                 self.handle_delta_sync(updates, propagation_factor).await?;
                 Ok(Message::Ack)
             }
@@ -293,12 +313,14 @@ impl GossipController {
         propagation_factor: u8,
     ) -> Result<()> {
         // Merge updates into local rate limiter
-        let mut limiter = self.rate_limiter
-            .lock()
-            .await;
+        let mut limiter = self.rate_limiter.lock().await;
 
         limiter.accept_delta_state(&updates);
-        debug!("[{}] Merged {} delta updates from gossip", self.node_id, updates.len());
+        debug!(
+            "[{}] Merged {} delta updates from gossip",
+            self.node_id,
+            updates.len()
+        );
 
         // Propagate to random peers if propagation_factor > 0
         if propagation_factor > 0 {
@@ -317,11 +339,7 @@ impl GossipController {
     }
 
     /// Gossip-specific: Handle heartbeat
-    async fn handle_heartbeat(
-        &self,
-        timestamp: u64,
-        _vclock: crdts::VClock<NodeId>,
-    ) -> Result<()> {
+    async fn handle_heartbeat(&self, timestamp: u64, _vclock: crdts::VClock<NodeId>) -> Result<()> {
         // Update peer liveness tracking
         // For now, just acknowledge receipt
         debug!(
@@ -336,18 +354,22 @@ impl GossipController {
         &self,
         missing_keys: Option<Vec<String>>,
     ) -> Result<Vec<DistributedBucketExternal>> {
-        let limiter = self.rate_limiter
-            .lock()
-            .await;
+        let limiter = self.rate_limiter.lock().await;
 
         if let Some(_keys) = missing_keys {
             // For now, return all delta state since we don't have per-key lookup
             // TODO: Implement selective key export if needed
-            debug!("[{}] State request with specific keys - returning all state", self.node_id);
+            debug!(
+                "[{}] State request with specific keys - returning all state",
+                self.node_id
+            );
             Ok(limiter.gossip_delta_state())
         } else {
             // Return all buckets that have been updated
-            debug!("[{}] State request - returning all delta state", self.node_id);
+            debug!(
+                "[{}] State request - returning all delta state",
+                self.node_id
+            );
             Ok(limiter.gossip_delta_state())
         }
     }
@@ -363,7 +385,8 @@ impl GossipController {
         let bucket_count = self.rate_limiter.lock().await.len();
         debug!(
             "[{}] Gossip node stats: {} active client buckets",
-            self.node_name.as_str(), bucket_count
+            self.node_name.as_str(),
+            bucket_count
         );
     }
 
@@ -371,7 +394,8 @@ impl GossipController {
     pub async fn start(&self) {
         info!(
             "[{}] Starting central IO loop with {}ms gossip interval",
-            self.node_name.as_str(), self.gossip_interval_ms
+            self.node_name.as_str(),
+            self.gossip_interval_ms
         );
 
         let mut gossip_timer = time::interval(time::Duration::from_millis(self.gossip_interval_ms));
@@ -423,11 +447,7 @@ impl GossipController {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                vclock: self
-                    .rate_limiter
-                    .lock()
-                    .await
-                    .get_latest_updated_vclock(),
+                vclock: self.rate_limiter.lock().await.get_latest_updated_vclock(),
                 response_addr: self.response_addr,
             };
 
@@ -440,9 +460,7 @@ impl GossipController {
 
     /// Collect buckets that have been updated and should be gossiped
     pub async fn collect_gossip_updates(&self) -> Result<Vec<DistributedBucketExternal>> {
-        let rl = self.rate_limiter
-            .lock()
-            .await;
+        let rl = self.rate_limiter.lock().await;
         Ok(rl.gossip_delta_state())
     }
 
@@ -723,10 +741,7 @@ impl GossipController {
             node_id,
             entries.len()
         );
-        rate_limiter
-            .lock()
-            .await
-            .accept_delta_state(entries);
+        rate_limiter.lock().await.accept_delta_state(entries);
         debug!("[{}] merge_gossip_state_static completed", node_id);
     }
 
@@ -741,10 +756,7 @@ impl GossipController {
             return Ok(());
         }
 
-        let mut config = self
-            .rate_limit_config
-            .lock()
-            .await;
+        let mut config = self.rate_limit_config.lock().await;
         let rule = NamedRateLimitRule {
             name: rule_name.clone(),
             settings: settings.clone(),
@@ -752,10 +764,7 @@ impl GossipController {
         config.add_named_rule(&rule);
 
         // Create the rate limiter for this rule
-        let mut limiters = self
-            .named_rate_limiters
-            .lock()
-            .await;
+        let mut limiters = self.named_rate_limiters.lock().await;
 
         let rate_limiter = DistributedBucketLimiter::new(self.node_id, settings);
         limiters.insert(rule_name, rate_limiter);
@@ -767,9 +776,7 @@ impl GossipController {
         &self,
         rule_name: &str,
     ) -> Result<Option<NamedRateLimitRule>> {
-        let rlconf = self.rate_limit_config
-            .lock()
-            .await;
+        let rlconf = self.rate_limit_config.lock().await;
         Ok(rlconf
             .get_named_rule_settings(rule_name)
             .cloned()
@@ -781,10 +788,7 @@ impl GossipController {
 
     /// Delete a named rate limit rule locally (without gossiping)
     pub async fn delete_named_rule_local(&self, rule_name: String) -> Result<()> {
-        let mut config = self
-            .rate_limit_config
-            .lock()
-            .await;
+        let mut config = self.rate_limit_config.lock().await;
 
         if config.remove_named_rule(&rule_name).is_some() {
             // Remove the rate limiter for this rule
@@ -799,10 +803,7 @@ impl GossipController {
 
     /// List all named rate limit rules locally
     pub async fn list_named_rules_local(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let config = self
-            .rate_limit_config
-            .lock()
-            .await;
+        let config = self.rate_limit_config.lock().await;
 
         Ok(config.list_named_rules())
     }
@@ -813,10 +814,7 @@ impl GossipController {
         rule_name: String,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
-        let mut limiters = self
-            .named_rate_limiters
-            .lock()
-            .await;
+        let mut limiters = self.named_rate_limiters.lock().await;
 
         if let Some(rate_limiter) = limiters.get_mut(&rule_name) {
             let calls_left = rate_limiter.limit_calls_for_client(key.clone());
@@ -843,10 +841,7 @@ impl GossipController {
         rule_name: String,
         key: String,
     ) -> Result<CheckCallsResponse> {
-        let limiters = self
-            .named_rate_limiters
-            .lock()
-            .await;
+        let limiters = self.named_rate_limiters.lock().await;
 
         if let Some(rate_limiter) = limiters.get(&rule_name) {
             let calls_remaining = rate_limiter.check_calls_remaining_for_client(&key);
@@ -865,6 +860,3 @@ impl GossipController {
 }
 
 // ===== Tests temporarily disabled =====
-
-
-

@@ -94,7 +94,9 @@ impl TcpReceiver {
                         return;
                     }
 
-                    stats_clone.messages_received.fetch_add(1, Ordering::Relaxed);
+                    stats_clone
+                        .messages_received
+                        .fetch_add(1, Ordering::Relaxed);
 
                     // Create a oneshot channel for the response
                     let (response_tx, response_rx) = oneshot::channel();

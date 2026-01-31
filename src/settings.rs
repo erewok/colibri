@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::node::{NodeName, NodeId};
+use crate::node::{NodeId, NodeName};
 
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -21,7 +21,6 @@ pub struct RateLimitSettings {
     pub rate_limit_max_calls_allowed: u32,
     pub rate_limit_interval_seconds: u32,
 }
-
 
 #[derive(Clone, Debug)]
 pub struct TransportConfig {
@@ -135,10 +134,7 @@ impl ClusterTopology {
 
     /// Get all nodes as (name, address) pairs
     pub fn all_nodes(&self) -> Vec<(NodeName, SocketAddr)> {
-        self.nodes
-            .iter()
-            .map(|(n, a)| (n.clone(), *a))
-            .collect()
+        self.nodes.iter().map(|(n, a)| (n.clone(), *a)).collect()
     }
 
     /// Get all node addresses (for transport initialization)
@@ -161,10 +157,12 @@ impl ClusterTopology {
             return None;
         }
         let num_buckets = self.nodes.len() as u32;
-        Some(crate::node::hashring::consistent_hashing::jump_consistent_hash(
-            node_name.as_str(),
-            num_buckets,
-        ))
+        Some(
+            crate::node::hashring::consistent_hashing::jump_consistent_hash(
+                node_name.as_str(),
+                num_buckets,
+            ),
+        )
     }
 
     /// Get the node that owns a specific bucket
@@ -187,10 +185,7 @@ impl ClusterTopology {
             return None;
         }
         let num_buckets = self.nodes.len() as u32;
-        Some(crate::node::hashring::consistent_hashing::jump_consistent_hash(
-            key,
-            num_buckets,
-        ))
+        Some(crate::node::hashring::consistent_hashing::jump_consistent_hash(key, num_buckets))
     }
 
     /// Get the node that should handle a specific key
@@ -399,10 +394,7 @@ pub mod tests {
             topology.get_node_address(&NodeName::from("node-b")),
             Some(addr_b)
         );
-        assert_eq!(
-            topology.get_node_address(&NodeName::from("node-x")),
-            None
-        );
+        assert_eq!(topology.get_node_address(&NodeName::from("node-x")), None);
 
         // Lookup by address
         assert_eq!(
@@ -550,4 +542,3 @@ pub mod tests {
         assert!(topology.node_for_key("test").is_none());
     }
 }
-

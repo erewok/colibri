@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::RateLimitSettings;
 
-
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct NamedRateLimitRule {
     pub name: String,
@@ -16,7 +15,6 @@ pub struct RateLimitConfig {
     pub default_settings: RateLimitSettings,
     pub named_rules: HashMap<String, RateLimitSettings>,
 }
-
 
 impl RateLimitConfig {
     pub fn new(default_settings: RateLimitSettings) -> Self {

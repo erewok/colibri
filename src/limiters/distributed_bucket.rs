@@ -734,7 +734,8 @@ mod tests {
         let settings = test_settings();
 
         let mut limiter1 = DistributedBucketLimiter::new(node_id(), settings.clone());
-        let mut limiter2 = DistributedBucketLimiter::new(NodeName::from("b").node_id(), settings.clone());
+        let mut limiter2 =
+            DistributedBucketLimiter::new(NodeName::from("b").node_id(), settings.clone());
         let mut limiter3 = DistributedBucketLimiter::new(NodeName::from("c").node_id(), settings);
 
         let client_id = "shared_client".to_string();

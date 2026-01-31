@@ -93,19 +93,25 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::GetStatus => {
             let message = Message::GetStatus;
-            match transport.send_message_request_response(target, &message).await? {
+            match transport
+                .send_message_request_response(target, &message)
+                .await?
+            {
                 Message::StatusResponse(response) => {
                     println!("Status Response:");
                     println!("  Status: {:?}", response.status);
                     println!("  Node: {}", response.node_name);
                     println!("  Mode: {:?}", response.node_type);
                     println!("  Bucket Count: {:?}", response.bucket_count);
-                    println!("  Last Topology Change: {:?}", response.last_topology_change);
+                    println!(
+                        "  Last Topology Change: {:?}",
+                        response.last_topology_change
+                    );
                 }
                 other => {
                     error!("Unexpected response: {:?}", other);
                     return Err(ColibriError::Api(
-                        "Unexpected response type for GetStatus".to_string()
+                        "Unexpected response type for GetStatus".to_string(),
                     ));
                 }
             }
@@ -113,7 +119,10 @@ async fn main() -> Result<()> {
 
         Commands::GetTopology => {
             let message = Message::GetTopology;
-            match transport.send_message_request_response(target, &message).await? {
+            match transport
+                .send_message_request_response(target, &message)
+                .await?
+            {
                 Message::TopologyResponse(response) => {
                     println!("Topology Response:");
                     println!("  Status: {:?}", response.status.status);
@@ -125,7 +134,7 @@ async fn main() -> Result<()> {
                 other => {
                     error!("Unexpected response: {:?}", other);
                     return Err(ColibriError::Api(
-                        "Unexpected response type for GetTopology".to_string()
+                        "Unexpected response type for GetTopology".to_string(),
                     ));
                 }
             }
@@ -135,7 +144,7 @@ async fn main() -> Result<()> {
             error!("ExportBuckets not yet implemented");
             println!("Export buckets functionality will write to: {:?}", file);
             return Err(ColibriError::Api(
-                "ExportBuckets not yet implemented".to_string()
+                "ExportBuckets not yet implemented".to_string(),
             ));
         }
 
@@ -143,7 +152,7 @@ async fn main() -> Result<()> {
             error!("ImportBuckets not yet implemented");
             println!("Import buckets functionality will read from: {:?}", file);
             return Err(ColibriError::Api(
-                "ImportBuckets not yet implemented".to_string()
+                "ImportBuckets not yet implemented".to_string(),
             ));
         }
     }

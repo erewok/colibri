@@ -35,35 +35,3 @@ pub struct SendReceiveStats {
     pub sent: FrozenSocketPoolStats,
     pub received: FrozenReceiverStats,
 }
-
-#[cfg(test)]
-mod tests {
-    #[allow(unused_imports)]
-    use super::*;
-    #[allow(unused_imports)]
-    use crate::node::NodeName;
-    #[allow(unused_imports)]
-    use crate::settings::TransportConfig;
-    #[allow(unused_imports)]
-    use indexmap::IndexMap;
-
-    #[allow(dead_code)]
-    fn get_transport_config() -> TransportConfig {
-        let mut topology = IndexMap::new();
-        topology.insert(
-            NodeName::from("node_a").node_id(),
-            "127.0.0.1:8001".parse().unwrap(),
-        );
-        topology.insert(
-            NodeName::from("node_b").node_id(),
-            "127.0.0.1:8002".parse().unwrap(),
-        );
-
-        TransportConfig {
-            node_name: NodeName::from("test_node"),
-            peer_listen_address: "127.0.0.1".to_string(),
-            peer_listen_port: 8000,
-            topology,
-        }
-    }
-}

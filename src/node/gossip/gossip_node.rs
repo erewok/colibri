@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -20,10 +19,6 @@ use crate::settings::RunMode;
 pub struct GossipNode {
     /// Node name
     pub node_name: NodeName,
-
-    /// Address for peers
-    #[allow(dead_code)] // Kept for debugging and future use
-    peer_addr: SocketAddr,
 
     /// Controller - handles all operations via handle_message()
     pub controller: Arc<GossipController>,
@@ -131,7 +126,6 @@ impl Node for GossipNode {
 
         Ok(Self {
             node_name,
-            peer_addr: receiver_addr,
             controller,
             receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })

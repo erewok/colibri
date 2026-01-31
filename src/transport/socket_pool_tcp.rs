@@ -9,58 +9,22 @@ use std::time::Duration;
 
 use indexmap::IndexMap;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, error};
 
 use super::stats::SocketPoolStats;
 use crate::error::{ColibriError, Result};
-use crate::node::{NodeId, NodeName};
+use crate::node::NodeId;
 use crate::settings::TransportConfig;
-
-/// TCP connection with metadata
-#[derive(Debug)]
-#[allow(dead_code)] // Kept for future connection pooling implementation
-struct TcpConnection {
-    stream: TcpStream,
-    last_used: std::time::Instant,
-    in_use: bool,
-}
-
-#[allow(dead_code)] // Kept for future connection pooling implementation
-impl TcpConnection {
-    fn new(stream: TcpStream) -> Self {
-        Self {
-            stream,
-            last_used: std::time::Instant::now(),
-            in_use: false,
-        }
-    }
-
-    fn is_expired(&self, timeout: Duration) -> bool {
-        !self.in_use && self.last_used.elapsed() > timeout
-    }
-}
 
 /// Pool of TCP connections for efficient peer communication
 #[derive(Debug)]
-#[allow(dead_code)] // node_name used for debugging
 pub struct TcpSocketPool {
     // Connection pools per peer using NodeId
-    peer_connections: IndexMap<NodeId, PeerConnectionInfo>,
-    // Configuration
-    node_name: NodeName,
-    max_connections_per_peer: usize,
+    peer_connections: IndexMap<NodeId, SocketAddr>,
     connection_timeout: Duration,
     // for statistics and monitoring
     stats: Arc<SocketPoolStats>,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)] // Kept for future connection pooling implementation
-struct PeerConnectionInfo {
-    socket_addr: SocketAddr,
-    connections: Arc<Mutex<Vec<TcpConnection>>>,
 }
 
 impl TcpSocketPool {
@@ -70,19 +34,13 @@ impl TcpSocketPool {
 
         // Initialize empty connection pools for each peer
         for (node_id, socket_addr) in &transport_config.topology {
-            let peer_info = PeerConnectionInfo {
-                socket_addr: *socket_addr,
-                connections: Arc::new(Mutex::new(Vec::new())),
-            };
-            peer_connections.insert(*node_id, peer_info);
+            peer_connections.insert(*node_id, *socket_addr);
         }
 
         let stats = Arc::new(SocketPoolStats::new(peer_connections.len()));
 
         Ok(Self {
             peer_connections,
-            node_name: transport_config.node_name.clone(),
-            max_connections_per_peer: 5, // Default value
             connection_timeout: Duration::from_millis(200),
             stats,
         })
@@ -94,14 +52,12 @@ impl TcpSocketPool {
         target: NodeId,
         request_data: &[u8],
     ) -> Result<Vec<u8>> {
-        let peer_info = self
+        let peer_addr = self
             .peer_connections
             .get(&target)
             .ok_or_else(|| ColibriError::Transport(format!("Peer not found: {:?}", target)))?;
 
-        let mut connection = self
-            .get_or_create_connection(target, peer_info.socket_addr)
-            .await?;
+        let mut connection = self.get_or_create_connection(target, *peer_addr).await?;
 
         // Send request with length prefix
         let request_len = request_data.len() as u32;
@@ -253,11 +209,7 @@ impl TcpSocketPool {
 
     /// Add a new peer to the socket pool
     pub async fn add_peer(&mut self, node_id: NodeId, addr: SocketAddr) -> Result<()> {
-        let peer_info = PeerConnectionInfo {
-            socket_addr: addr,
-            connections: Arc::new(Mutex::new(Vec::new())),
-        };
-        self.peer_connections.insert(node_id, peer_info);
+        self.peer_connections.insert(node_id, addr);
 
         self.stats
             .peer_count
@@ -281,9 +233,7 @@ impl TcpSocketPool {
 
     /// Get the socket address for a specific peer
     pub fn get_peer_address(&self, node_id: NodeId) -> Option<SocketAddr> {
-        self.peer_connections
-            .get(&node_id)
-            .map(|info| info.socket_addr)
+        self.peer_connections.get(&node_id).cloned()
     }
 
     /// Cleanup expired connections (simplified for now)

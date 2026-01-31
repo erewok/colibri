@@ -25,17 +25,13 @@ fn bench_token_bucket_local(c: &mut Criterion) {
     // Test 1: Single client, sequential checks
     group.bench_function("single_client_check", |b| {
         let limiter = TokenBucketLimiter::new(settings.clone());
-        b.iter(|| {
-            black_box(limiter.check_calls_remaining_for_client("test_client"))
-        });
+        b.iter(|| black_box(limiter.check_calls_remaining_for_client("test_client")));
     });
 
     // Test 2: Single client, consuming tokens
     group.bench_function("single_client_consume", |b| {
         let mut limiter = TokenBucketLimiter::new(settings.clone());
-        b.iter(|| {
-            black_box(limiter.limit_calls_for_client("test_client".to_string()))
-        });
+        b.iter(|| black_box(limiter.limit_calls_for_client("test_client".to_string())));
     });
 
     // Test 3: Many clients (cache pressure)

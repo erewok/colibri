@@ -23,7 +23,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::{error, info};
 
-use colibri::cli::Cli as ColibriCli;
 use colibri::error::{ColibriError, Result};
 use colibri::node::messages::Message;
 use colibri::transport::TcpTransport;
@@ -33,8 +32,7 @@ use colibri::transport::TcpTransport;
 #[command(about = "Colibri cluster administration tool")]
 struct Cli {
     /// Target node address (peer TCP port, not client API port)
-    /// If not specified, uses first node from config topology
-    #[arg(short, long, global = true)]
+    #[arg(short, long, required = true)]
     target: Option<SocketAddr>,
 
     #[command(subcommand)]
@@ -44,12 +42,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Get cluster status from a node
+    #[command(name = "get-status")]
     GetStatus,
 
     /// Get cluster topology from a node
+    #[command(name = "get-topology")]
     GetTopology,
 
     /// Export buckets from a node (for migration)
+    #[command(name = "export-buckets")]
     ExportBuckets {
         /// File to write exported data to
         #[arg(short, long)]
@@ -57,6 +58,7 @@ enum Commands {
     },
 
     /// Import buckets to a node (for migration)
+    #[command(name = "import-buckets")]
     ImportBuckets {
         /// File to read imported data from
         #[arg(short, long)]
@@ -70,31 +72,21 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Load config to get topology
-    let colibri_conf: ColibriCli = ColibriCli::parse_with_file();
-    let settings = colibri_conf.into_settings();
-
-    // Determine target node
-    let target = if let Some(addr) = cli.target {
-        addr
-    } else {
-        // Use first node from topology
-        let cluster_topology = settings.cluster_topology();
-        cluster_topology
-            .all_nodes()
-            .first()
-            .map(|(_, addr)| *addr)
-            .ok_or_else(|| {
-                ColibriError::Config(
-                    "No target specified and no nodes in topology".to_string()
-                )
-            })?
-    };
+    // Require target to be specified
+    let target = cli.target.ok_or_else(|| {
+        ColibriError::Config("Target node address is required (use --target)".to_string())
+    })?;
 
     info!("Sending admin command to node at {}", target);
 
     // Create TCP transport for sending internal messages
-    let transport_config = settings.transport_config();
+    // Use a minimal transport config since we don't need to listen
+    let transport_config = colibri::settings::TransportConfig {
+        node_name: colibri::node::NodeName::from("admin-tool"),
+        peer_listen_address: "127.0.0.1".to_string(),
+        peer_listen_port: 0, // Not used for outgoing only
+        topology: indexmap::IndexMap::new(),
+    };
     let transport = TcpTransport::new(&transport_config).await?;
 
     // Execute command

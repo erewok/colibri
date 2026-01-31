@@ -332,9 +332,9 @@ pub mod tests {
             config_file: None,
             server_name: "test-node".to_string(),
             client_listen_address: "127.0.0.1".to_string(),
-            client_listen_port: 8411,
+            client_listen_port: 0, // Use random port for tests
             peer_listen_address: "127.0.0.1".to_string(),
-            peer_listen_port: 8412,
+            peer_listen_port: 0, // Use random port for tests
             rate_limit_max_calls_allowed: 100,
             rate_limit_interval_seconds: 60,
             run_mode: RunMode::Gossip,

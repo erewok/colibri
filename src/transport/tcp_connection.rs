@@ -109,29 +109,36 @@ impl TcpTransport {
 
     /// Send raw data to a peer and wait for response
     pub async fn send_request_response(&self, peer: SocketAddr, data: &[u8]) -> Result<Vec<u8>> {
-        let mut stream = tokio::net::TcpStream::connect(peer).await?;
+        // Add timeout to prevent hanging on unresponsive peers
+        let timeout_duration = tokio::time::Duration::from_secs(5);
 
-        // Write request with length prefix
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(data).await?;
-        stream.flush().await?;
+        tokio::time::timeout(timeout_duration, async {
+            let mut stream = tokio::net::TcpStream::connect(peer).await?;
 
-        // Read response length
-        let mut len_bytes = [0u8; 4];
-        stream.read_exact(&mut len_bytes).await?;
-        let response_len = u32::from_be_bytes(len_bytes) as usize;
+            // Write request with length prefix
+            let len = data.len() as u32;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(data).await?;
+            stream.flush().await?;
 
-        if response_len > 10 * 1024 * 1024 {
-            // 10MB limit
-            return Err(ColibriError::Transport("Response too large".to_string()));
-        }
+            // Read response length
+            let mut len_bytes = [0u8; 4];
+            stream.read_exact(&mut len_bytes).await?;
+            let response_len = u32::from_be_bytes(len_bytes) as usize;
 
-        // Read response data
-        let mut response_data = vec![0u8; response_len];
-        stream.read_exact(&mut response_data).await?;
+            if response_len > 10 * 1024 * 1024 {
+                // 10MB limit
+                return Err(ColibriError::Transport("Response too large".to_string()));
+            }
 
-        Ok(response_data)
+            // Read response data
+            let mut response_data = vec![0u8; response_len];
+            stream.read_exact(&mut response_data).await?;
+
+            Ok(response_data)
+        })
+        .await
+        .map_err(|_| ColibriError::Transport(format!("Request to {} timed out after 5s", peer)))?
     }
 
     // ============================================================================

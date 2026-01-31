@@ -94,7 +94,7 @@ impl TcpTransport {
 
     /// Internal helper to send data using the socket pool
     async fn send_with_socket_pool(
-        socket_pool: &Arc<RwLock<TcpSocketPool>>,
+        _socket_pool: &Arc<RwLock<TcpSocketPool>>,
         peer: SocketAddr,
         data: &[u8],
     ) -> Result<()> {

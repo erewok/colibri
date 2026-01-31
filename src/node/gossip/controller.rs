@@ -160,6 +160,12 @@ impl GossipController {
         settings: RateLimitSettings,
     ) -> Result<()> {
         let mut named_limiters = self.named_rate_limiters.lock().await;
+
+        // Only create if it doesn't already exist
+        if named_limiters.contains_key(&rule_name) {
+            return Ok(());
+        }
+
         let limiter = DistributedBucketLimiter::new(self.node_id, settings.clone());
         named_limiters.insert(rule_name.clone(), limiter);
         tracing::info!("Created named rule '{}' in gossip node", rule_name);

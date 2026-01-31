@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::{NamedRateLimitRule, RateLimitConfig, TokenBucketLimiter};
@@ -221,6 +221,12 @@ impl HashringController {
         settings: RateLimitSettings,
     ) -> Result<()> {
         let mut named_limiters = self.named_rate_limiters.lock().unwrap();
+
+        // Only create if it doesn't already exist
+        if named_limiters.contains_key(&rule_name) {
+            return Ok(());
+        }
+
         let limiter = TokenBucketLimiter::new(settings.clone());
         named_limiters.insert(rule_name.clone(), Arc::new(Mutex::new(limiter)));
         tracing::info!("Created named rule '{}' in hashring node", rule_name);

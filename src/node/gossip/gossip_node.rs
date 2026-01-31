@@ -23,6 +23,7 @@ pub struct GossipNode {
     pub node_name: NodeName,
 
     /// Address for peers
+    #[allow(dead_code)] // Kept for debugging and future use
     peer_addr: SocketAddr,
 
     /// Controller - handles all operations via handle_message()

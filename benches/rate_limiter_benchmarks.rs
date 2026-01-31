@@ -1,4 +1,5 @@
 use colibri::limiters::distributed_bucket::DistributedBucketLimiter;
+use colibri::node::NodeName;
 use colibri::settings::RateLimitSettings;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
@@ -11,9 +12,10 @@ fn benchmark_rate_limiter_sequential(c: &mut Criterion) {
 
     c.bench_function("rate_limiter_sequential", |b| {
         let mut counter = 0;
+        let node_id = NodeName::from("bench-node").node_id();
         b.iter(|| {
             let mut limiter: DistributedBucketLimiter =
-                DistributedBucketLimiter::new(1.into(), settings.clone());
+                DistributedBucketLimiter::new(node_id, settings.clone());
             counter += 1;
             let client_id = format!("benchmark_client_{}", counter % 1000);
             black_box(limiter.limit_calls_for_client(client_id))
@@ -27,8 +29,9 @@ fn benchmark_rate_limiter_check_remaining(c: &mut Criterion) {
         rate_limit_interval_seconds: 3600,
     };
 
+    let node_id = NodeName::from("bench-node").node_id();
     let limiter: DistributedBucketLimiter =
-        DistributedBucketLimiter::new(1.into(), settings.clone());
+        DistributedBucketLimiter::new(node_id, settings.clone());
 
     c.bench_function("rate_limiter_check_remaining", |b| {
         let mut counter = 0;

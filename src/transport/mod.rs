@@ -38,11 +38,16 @@ pub struct SendReceiveStats {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use indexmap::IndexMap;
+    #[allow(unused_imports)]
     use super::*;
+    #[allow(unused_imports)]
     use crate::node::NodeName;
+    #[allow(unused_imports)]
     use crate::settings::TransportConfig;
 
+    #[allow(dead_code)]
     fn get_transport_config() -> TransportConfig {
         let mut topology = IndexMap::new();
         topology.insert(

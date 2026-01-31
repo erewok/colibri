@@ -20,12 +20,14 @@ use crate::settings::TransportConfig;
 
 /// TCP connection with metadata
 #[derive(Debug)]
+#[allow(dead_code)] // Kept for future connection pooling implementation
 struct TcpConnection {
     stream: TcpStream,
     last_used: std::time::Instant,
     in_use: bool,
 }
 
+#[allow(dead_code)] // Kept for future connection pooling implementation
 impl TcpConnection {
     fn new(stream: TcpStream) -> Self {
         Self {
@@ -55,6 +57,7 @@ pub struct TcpSocketPool {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Kept for future connection pooling implementation
 struct PeerConnectionInfo {
     socket_addr: SocketAddr,
     connections: Arc<Mutex<Vec<TcpConnection>>>,

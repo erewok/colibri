@@ -185,9 +185,11 @@ mod tests {
 
         // Receive the message
         match timeout(Duration::from_millis(100), recv_chan.recv()).await {
-            Ok(Some((data, addr))) => {
-                assert_eq!(data, bytes::Bytes::from_static(b"test message"));
-                assert_eq!(addr, sender_addr);
+            Ok(Some(request)) => {
+                assert_eq!(request.data, bytes::Bytes::from_static(b"test message"));
+                assert_eq!(request.peer_addr, sender_addr);
+                // Send empty response
+                let _ = request.response_tx.send(vec![]);
             }
             Ok(None) => panic!("Channel closed unexpectedly"),
             Err(_) => panic!("Timeout waiting for message"),

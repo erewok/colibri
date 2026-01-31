@@ -2,66 +2,38 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info};
+use tracing::{error, info, warn};
 
-use super::{GossipCommand, GossipController};
+use super::GossipController;
 use crate::error::{ColibriError, Result};
-use crate::node::{CheckCallsResponse, Node, NodeId};
-use crate::{settings, transport};
+use crate::limiters::NamedRateLimitRule;
+use crate::node::messages::{
+    BucketExport, CheckCallsRequest, CheckCallsResponse, ExportMetadata, Message, StatusResponse,
+    TopologyChangeRequest, TopologyResponse,
+};
+use crate::node::{Node, NodeName};
+use crate::settings;
+use crate::settings::RunMode;
 
 /// Gossip-based distributed rate limiter node
 #[derive(Clone)]
 pub struct GossipNode {
-    // rate-limit settings
-    pub node_id: NodeId,
+    /// Node name
+    pub node_name: NodeName,
 
-    /// Local rate limiter - handles all bucket operations
-    pub gossip_command_tx: Arc<mpsc::Sender<GossipCommand>>,
+    /// Address for peers
+    #[allow(dead_code)] // Kept for debugging and future use
+    peer_addr: SocketAddr,
 
-    /// Controller handle
-    pub controller_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Controller - handles all operations via handle_message()
+    pub controller: Arc<GossipController>,
 
     /// Receiver handler
     pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl GossipNode {
-    async fn run_gossip_receiver(
-        listen_udp: SocketAddr,
-        gossip_command_tx: Arc<mpsc::Sender<GossipCommand>>,
-    ) -> Result<()> {
-        let (udp_send, mut udp_recv) = mpsc::channel(1000);
-        let receiver =
-            transport::receiver::UdpReceiver::new(listen_udp, Arc::new(udp_send)).await?;
-
-        tokio::spawn(async move {
-            receiver.start().await;
-        });
-
-        loop {
-            // Handle incoming messages from network
-            if let Some((data, peer_addr)) = udp_recv.recv().await {
-                // Turn into GossipCommand and send to main loop
-                let cmd = GossipCommand::from_incoming_message(data, peer_addr);
-                if let Err(e) = gossip_command_tx.send(cmd).await {
-                    debug!("Failed to send incoming message to main loop: {}", e);
-                }
-            }
-        }
-    }
-
-    /// Stop the gossip controller task
-    pub fn stop_controller(&self) {
-        if let Ok(mut handle) = self.controller_handle.lock() {
-            if let Some(join_handle) = handle.take() {
-                join_handle.abort();
-                info!("Gossip controller task stopped");
-            }
-        } else {
-            error!("Failed to acquire lock on controller_handle during shutdown");
-        }
-    }
+    // Note: run_gossip_receiver removed - gossip protocol now handled internally by controller
 
     /// Stop the gossip receiver task
     pub fn stop_receiver(&self) {
@@ -77,7 +49,6 @@ impl GossipNode {
 
     /// Stop all background tasks
     pub fn stop_all_tasks(&self) {
-        self.stop_controller();
         self.stop_receiver();
     }
 }
@@ -85,11 +56,6 @@ impl GossipNode {
 impl Drop for GossipNode {
     fn drop(&mut self) {
         // Clean up tasks when the node is dropped
-        if let Ok(mut controller_handle) = self.controller_handle.lock() {
-            if let Some(handle) = controller_handle.take() {
-                handle.abort();
-            }
-        }
         if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
             if let Some(handle) = receiver_handle.take() {
                 handle.abort();
@@ -101,97 +67,164 @@ impl Drop for GossipNode {
 impl std::fmt::Debug for GossipNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GossipNode")
-            .field("node_id", &self.node_id)
+            .field("node_name", &self.node_name)
             .finish()
     }
 }
 
 #[async_trait]
 impl Node for GossipNode {
-    async fn new(node_id: NodeId, settings: settings::Settings) -> Result<Self> {
-        let listen_api = format!("{}:{}", settings.listen_address, settings.listen_port_api);
+    async fn new(settings: settings::Settings) -> Result<Self> {
+        let node_name: NodeName = settings.node_name();
+        let listen_api = format!(
+            "{}:{}",
+            settings.client_listen_address, settings.client_listen_port
+        );
         info!(
             "[Node<{}>] Gossip node starting at {} in gossip mode with {} other nodes: {:?}",
-            node_id,
+            node_name.as_str(),
             listen_api,
             settings.topology.len(),
             settings.topology
         );
 
-        // The the receive channel is only used in this loop
-        let (gossip_command_tx, gossip_command_rx): (
-            mpsc::Sender<GossipCommand>,
-            mpsc::Receiver<GossipCommand>,
-        ) = mpsc::channel(1000);
-
-        let gossip_command_tx = Arc::new(gossip_command_tx);
-
-        // Start the GossipCommand controller loop
+        // Create controller
         let controller = GossipController::new(settings.clone()).await?;
-        let controller_handle = tokio::spawn(async move {
-            controller.start(gossip_command_rx).await;
+        let controller = Arc::new(controller);
+
+        // Start the controller's internal gossip loop
+        let controller_clone = controller.clone();
+        tokio::spawn(async move {
+            controller_clone.start().await;
         });
 
-        // Start the UDP receiver to handle incoming gossip messages
-        let receiver_addr = settings.transport_config().listen_udp;
-        let tx_clone = gossip_command_tx.clone();
+        // Start TCP receiver to handle incoming cluster messages
+        let receiver_addr = settings.transport_config().peer_listen_url();
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1000);
+
+        let receiver =
+            crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
+        receiver.start().await;
+
+        // Spawn task to process incoming messages
+        let controller_for_receiver = controller.clone();
         let receiver_handle = tokio::spawn(async move {
-            if let Err(e) = GossipNode::run_gossip_receiver(receiver_addr, tx_clone).await {
-                error!("[{}] Gossip receiver encountered an error: {}", node_id, e);
+            info!("Gossip TCP receiver started on {}", receiver_addr);
+            while let Some(request) = message_rx.recv().await {
+                // Deserialize and process message
+                match crate::node::messages::Message::deserialize(&request.data) {
+                    Ok(message) => {
+                        if let Err(e) = controller_for_receiver.handle_message(message).await {
+                            error!("Error handling message: {}", e);
+                        }
+                        // Gossip is fire-and-forget, send empty ack
+                        let _ = request.response_tx.send(vec![]);
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize message: {}", e);
+                        // Still send empty response to avoid blocking sender
+                        let _ = request.response_tx.send(vec![]);
+                    }
+                }
             }
         });
 
         Ok(Self {
-            node_id,
-            gossip_command_tx,
-            controller_handle: Arc::new(Mutex::new(Some(controller_handle))),
+            node_name,
+            peer_addr: receiver_addr,
+            controller,
             receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })
     }
 
     /// Check remaining calls for a client using local state
-    async fn check_limit(&self, client_id: String) -> Result<CheckCallsResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(GossipCommand::CheckLimit {
-                client_id,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| ColibriError::Transport(format!("Failed checking rate limit {}", e)))?;
-        // Await the response
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed checking rate limit {}",
-                e
-            )))
-        })
+    async fn check_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
+        let request = CheckCallsRequest {
+            client_id: client_id.clone(),
+            rule_name: None,
+            consume_token: false,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => Ok(Some(response)),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
+        }
     }
 
     /// Apply rate limiting using local state only
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(GossipCommand::RateLimit {
-                client_id,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| ColibriError::Transport(format!("Failed checking rate limit {}", e)))?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed rate limiting {}",
-                e
-            )))
-        })
+        let request = CheckCallsRequest {
+            client_id: client_id.clone(),
+            rule_name: None,
+            consume_token: true,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => {
+                if response.calls_remaining > 0 {
+                    Ok(Some(response))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
+        }
+    }
+    async fn check_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
+        let request = CheckCallsRequest {
+            client_id: key.clone(),
+            rule_name: Some(rule_name),
+            consume_token: false,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => Ok(Some(response)),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
+        }
+    }
+    async fn rate_limit_custom(
+        &self,
+        rule_name: String,
+        key: String,
+    ) -> Result<Option<CheckCallsResponse>> {
+        let request = CheckCallsRequest {
+            client_id: key.clone(),
+            rule_name: Some(rule_name),
+            consume_token: true,
+        };
+        let message = Message::RateLimitRequest(request);
+
+        match self.controller.handle_message(message).await? {
+            Message::RateLimitResponse(response) => {
+                if response.calls_remaining > 0 {
+                    Ok(Some(response))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
+        }
     }
 
     /// Expire keys from local buckets
     async fn expire_keys(&self) -> Result<()> {
-        self.gossip_command_tx
-            .send(GossipCommand::ExpireKeys)
-            .await
-            .map_err(|e| ColibriError::Transport(format!("Failed expiring keys {}", e)))?;
+        // TODO: Implement expire_keys in new Message architecture
+        // warn!("expire_keys not yet implemented in new architecture");
         Ok(())
     }
 
@@ -201,127 +234,115 @@ impl Node for GossipNode {
         rule_name: String,
         settings: settings::RateLimitSettings,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(GossipCommand::CreateNamedRule {
-                rule_name,
-                settings,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending create_named_rule command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving create_named_rule response {}",
-                e
-            )))
-        })
+        let message = Message::CreateRateLimitRule {
+            rule_name,
+            settings,
+        };
+
+        match self.controller.handle_message(message).await? {
+            Message::CreateRateLimitRuleResponse => Ok(()),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
+        }
     }
 
     async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(GossipCommand::DeleteNamedRule {
-                rule_name,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending delete_named_rule command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving delete_named_rule response {}",
-                e
-            )))
-        })
+        let message = Message::DeleteRateLimitRule { rule_name };
+
+        match self.controller.handle_message(message).await? {
+            Message::DeleteRateLimitRuleResponse => Ok(()),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
+        }
     }
 
-    async fn list_named_rules(&self) -> Result<Vec<settings::NamedRateLimitRule>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(GossipCommand::ListNamedRules { resp_chan: tx })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending list_named_rules command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving list_named_rules response {}",
-                e
-            )))
-        })
+    async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
+        let message = Message::ListRateLimitRules;
+
+        match self.controller.handle_message(message).await? {
+            Message::ListRateLimitRulesResponse(rules) => Ok(rules),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
+        }
     }
-    async fn get_named_rule(
-        &self,
-        rule_name: String,
-    ) -> Result<Option<settings::NamedRateLimitRule>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(GossipCommand::GetNamedRule {
-                rule_name,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending get_named_rule command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving get_named_rules response {}",
-                e
-            )))
-        })
+    async fn get_named_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
+        let message = Message::GetRateLimitRule { rule_name };
+
+        match self.controller.handle_message(message).await? {
+            Message::GetRateLimitRuleResponse(rule) => Ok(rule),
+            _ => Err(ColibriError::Node(
+                "Unexpected response from controller".to_string(),
+            )),
+        }
+    }
+}
+
+// Cluster-specific methods for GossipNode
+impl GossipNode {
+    pub async fn handle_export_buckets(&self) -> Result<BucketExport> {
+        // Gossip nodes don't use bucket-based data export
+        // All data is replicated across gossip network
+        let export = BucketExport {
+            client_data: Vec::new(),
+            metadata: ExportMetadata {
+                node_name: self.node_name.to_string(),
+                export_timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                node_type: RunMode::Gossip,
+                bucket_count: 0,
+            },
+        };
+
+        tracing::info!("Gossip node export skipped - using gossip synchronization");
+        Ok(export)
     }
 
-    async fn rate_limit_custom(
-        &self,
-        rule_name: String,
-        key: String,
-    ) -> Result<Option<CheckCallsResponse>> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(GossipCommand::RateLimitCustom {
-                rule_name,
-                key,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending rate_limit_custom command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving rate_limit_custom response {}",
-                e
-            )))
-        })
+    pub async fn handle_import_buckets(&self, _import_data: BucketExport) -> Result<()> {
+        // Gossip nodes don't use bucket-based data import
+        // Data synchronization happens through gossip protocol
+        tracing::info!("Gossip node data import skipped - using gossip synchronization");
+        Ok(())
     }
 
-    async fn check_limit_custom(
+    pub async fn handle_cluster_health(&self) -> Result<StatusResponse> {
+        let message = Message::GetStatus;
+        match self.controller.handle_message(message).await? {
+            Message::StatusResponse(response) => Ok(response),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetStatus".to_string(),
+            )),
+        }
+    }
+
+    pub async fn handle_get_topology(&self) -> Result<TopologyResponse> {
+        let message = Message::GetTopology;
+        match self.controller.handle_message(message).await? {
+            Message::TopologyResponse(response) => Ok(response),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetTopology".to_string(),
+            )),
+        }
+    }
+
+    pub async fn handle_new_topology(
         &self,
-        rule_name: String,
-        key: String,
-    ) -> Result<CheckCallsResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.gossip_command_tx
-            .send(GossipCommand::CheckLimitCustom {
-                rule_name,
-                key,
-                resp_chan: tx,
-            })
-            .await
-            .map_err(|e| {
-                ColibriError::Transport(format!("Failed sending check_limit_custom command {}", e))
-            })?;
-        rx.await.unwrap_or_else(|e| {
-            Err(ColibriError::Transport(format!(
-                "Failed receiving check_limit_custom response {}",
-                e
-            )))
-        })
+        _request: TopologyChangeRequest,
+    ) -> Result<TopologyResponse> {
+        warn!("Topology changes not yet implemented for gossip nodes");
+
+        // For now, just return current topology
+        let message = Message::GetTopology;
+        match self.controller.handle_message(message).await? {
+            Message::TopologyResponse(response) => Ok(response),
+            _ => Err(ColibriError::Api(
+                "Unexpected response type for GetTopology".to_string(),
+            )),
+        }
     }
 }
 
@@ -330,58 +351,34 @@ mod tests {
     //! Simple tests for GossipNode functionality - traffic direction and command forwarding
 
     use super::*;
-    use std::collections::HashSet;
-
-    fn test_settings() -> settings::Settings {
-        settings::Settings {
-            listen_address: "127.0.0.1".to_string(),
-            listen_port_api: 8410,
-            listen_port_tcp: 8411,
-            listen_port_udp: 8412,
-            rate_limit_max_calls_allowed: 100,
-            rate_limit_interval_seconds: 60,
-            run_mode: settings::RunMode::Gossip,
-            gossip_interval_ms: 1000, // Longer for testing
-            gossip_fanout: 3,
-            topology: HashSet::new(), // Empty topology for simple tests
-            failure_timeout_secs: 30,
-            hash_replication_factor: 1,
-        }
-    }
 
     #[tokio::test]
     async fn test_gossip_node_creation() {
-        let node_id = NodeId::new(1);
-        let settings = test_settings();
+        let settings = settings::tests::sample();
 
         // Should create successfully
-        let node = GossipNode::new(node_id, settings).await.unwrap();
-
-        assert_eq!(node.node_id, node_id);
-        assert!(node.gossip_command_tx.is_closed() == false);
-        assert!(node.controller_handle.lock().unwrap().is_some());
+        let node = GossipNode::new(settings).await.unwrap();
+        // Controller is Arc so just verify it's set up
         assert!(node.receiver_handle.lock().unwrap().is_some());
     }
 
     #[tokio::test]
     async fn test_gossip_node_check_limit() {
-        let node_id = NodeId::new(1);
-        let settings = test_settings();
-        let node = GossipNode::new(node_id, settings).await.unwrap();
+        let settings = settings::tests::sample();
+        let node = GossipNode::new(settings).await.unwrap();
 
         let client_id = "test_client".to_string();
 
         // Check limit should work (returns full limit for new client)
-        let result = node.check_limit(client_id.clone()).await.unwrap();
+        let result = node.check_limit(client_id.clone()).await.unwrap().unwrap();
         assert_eq!(result.client_id, client_id);
         assert_eq!(result.calls_remaining, 100); // From test_settings
     }
 
     #[tokio::test]
     async fn test_gossip_node_rate_limit() {
-        let node_id = NodeId::new(1);
-        let settings = test_settings();
-        let node = GossipNode::new(node_id, settings).await.unwrap();
+        let settings = settings::tests::sample();
+        let node = GossipNode::new(settings).await.unwrap();
 
         let client_id = "test_client".to_string();
 
@@ -396,9 +393,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_gossip_node_expire_keys() {
-        let node_id = NodeId::new(1);
-        let settings = test_settings();
-        let node = GossipNode::new(node_id, settings).await.unwrap();
+        let settings = settings::tests::sample();
+        let node = GossipNode::new(settings).await.unwrap();
 
         // Should complete without error
         node.expire_keys().await.unwrap();
@@ -406,16 +402,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_gossip_node_command_forwarding() {
-        let node_id = NodeId::new(1);
-        let settings = test_settings();
-        let node = GossipNode::new(node_id, settings).await.unwrap();
+        let settings = settings::tests::sample();
+        let node = GossipNode::new(settings).await.unwrap();
 
         let client_id = "test_client".to_string();
 
         // Make multiple operations to verify command forwarding works
-        let check1 = node.check_limit(client_id.clone()).await.unwrap();
+        let check1 = node.check_limit(client_id.clone()).await.unwrap().unwrap();
         let rate1 = node.rate_limit(client_id.clone()).await.unwrap().unwrap();
-        let check2 = node.check_limit(client_id.clone()).await.unwrap();
+        let check2 = node.check_limit(client_id.clone()).await.unwrap().unwrap();
 
         // Check that operations are properly forwarded and processed
         assert_eq!(check1.client_id, client_id);
@@ -428,53 +423,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_gossip_node_cleanup() {
-        let node_id = NodeId::new(1);
-        let settings = test_settings();
-        let node = GossipNode::new(node_id, settings).await.unwrap();
+        let settings = settings::tests::sample();
+        let node = GossipNode::new(settings).await.unwrap();
 
-        // Verify handles are initially present
-        assert!(node.controller_handle.lock().unwrap().is_some());
+        // Verify controller and receiver are initialized
+        // Controller is Arc so just check it's not null by trying to use it
         assert!(node.receiver_handle.lock().unwrap().is_some());
 
-        // Test individual cleanup methods
-        node.stop_controller();
-        assert!(node.controller_handle.lock().unwrap().is_none());
-        assert!(node.receiver_handle.lock().unwrap().is_some());
-
-        node.stop_receiver();
+        // Test stop_all_tasks method
+        node.stop_all_tasks();
         assert!(node.receiver_handle.lock().unwrap().is_none());
-
-        // Test stop_all_tasks method with a fresh node
-        let node2 = GossipNode::new(node_id, test_settings()).await.unwrap();
-        node2.stop_all_tasks();
-        assert!(node2.controller_handle.lock().unwrap().is_none());
-        assert!(node2.receiver_handle.lock().unwrap().is_none());
-    }
-
-    // Helper functions (keeping for compatibility but marked as used)
-    #[allow(dead_code)]
-    pub fn gen_settings() -> settings::Settings {
-        settings::Settings {
-            listen_address: "0.0.0.0".to_string(),
-            listen_port_api: settings::STANDARD_PORT_HTTP,
-            listen_port_tcp: settings::STANDARD_PORT_TCP,
-            listen_port_udp: settings::STANDARD_PORT_UDP,
-            rate_limit_max_calls_allowed: 1000,
-            rate_limit_interval_seconds: 60,
-            run_mode: settings::RunMode::Single,
-            gossip_interval_ms: 25,
-            gossip_fanout: 4,
-            topology: HashSet::new(),
-            failure_timeout_secs: 30,
-            hash_replication_factor: 1,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn rl_settings() -> settings::RateLimitSettings {
-        settings::RateLimitSettings {
-            rate_limit_max_calls_allowed: 1000,
-            rate_limit_interval_seconds: 60,
-        }
     }
 }

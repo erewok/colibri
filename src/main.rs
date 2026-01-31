@@ -1,6 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
 
-use clap::Parser;
 use tokio::time::{self, Duration};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -23,15 +22,15 @@ async fn main() -> Result<()> {
         .init();
 
     // Parse args and env vars
-    let args = cli::Cli::parse();
+    let args = cli::Cli::parse_with_file();
     let settings = args.into_settings();
 
     // Socket server listen address setup
     let listen_address: IpAddr = settings
-        .listen_address
+        .client_listen_address
         .parse::<IpAddr>()
         .expect("Invalid ip address");
-    let socket_address = SocketAddr::from((listen_address, settings.listen_port_api));
+    let socket_address = SocketAddr::from((listen_address, settings.client_listen_port));
     let listener = tokio::net::TcpListener::bind(socket_address)
         .await
         .expect("Failed to bind TCP listener");

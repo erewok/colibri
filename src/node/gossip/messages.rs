@@ -1,29 +1,23 @@
 //! Gossip Message Protocol
 //!
-//! Defines all message types for cluster communication. All messages use serde traits
-//! for serialization but are serialized differently based on context:
-//!
-//! - INTERNAL cluster communication (UDP gossip): Uses bincode for compact binary format
-//! - EXTERNAL API communication (HTTP): Uses serde_json for human-readable format
-//!
+//! Defines all message types for cluster communication.
 use std::net::SocketAddr;
 
-use bincode::{Decode, Encode};
 use crdts::VClock;
-use tokio::sync::oneshot;
+use postcard::{from_bytes, to_allocvec};
+use serde::{Deserialize, Serialize};
 
 use crate::limiters::distributed_bucket::DistributedBucketExternal;
-use crate::node::{CheckCallsResponse, NodeId};
+use crate::limiters::NamedRateLimitRule;
+use crate::node::NodeId;
 
 /// Gossip message types for production delta-state protocol
-#[derive(Debug, Clone, Decode, Encode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GossipMessage {
     /// Delta-state synchronization - only recently updated keys
     DeltaStateSync {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         updates: Vec<DistributedBucketExternal>, // Only changed keys
-        #[bincode(with_serde)]
         sender_node_id: NodeId,
         propagation_factor: u8, // To limit spread
     },
@@ -32,16 +26,13 @@ pub enum GossipMessage {
     StateRequest {
         missing_keys: Option<Vec<String>>, // None = full sync
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         requesting_node_id: NodeId,
     },
 
     /// Response to state request with missing data
     StateResponse {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         responding_node_id: NodeId,
-        #[bincode(with_serde)]
         requested_data: DistributedBucketExternal,
     },
 
@@ -49,26 +40,21 @@ pub enum GossipMessage {
     Heartbeat {
         response_addr: SocketAddr,
         timestamp: u64,
-        #[bincode(with_serde)]
         node_id: NodeId,
-        #[bincode(with_serde)]
         vclock: VClock<NodeId>,
     },
 
     /// Rate limit configuration synchronization messages
     RateLimitConfigCreate {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         sender_node_id: NodeId,
         rule_name: String,
-        #[bincode(with_serde)]
         settings: crate::settings::RateLimitSettings,
         timestamp: u64,
     },
 
     RateLimitConfigDelete {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         sender_node_id: NodeId,
         rule_name: String,
         timestamp: u64,
@@ -76,22 +62,19 @@ pub enum GossipMessage {
 
     RateLimitConfigRequest {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         requesting_node_id: NodeId,
         rule_name: Option<String>, // None = request all rules
     },
 
     RateLimitConfigResponse {
         response_addr: SocketAddr,
-        #[bincode(with_serde)]
         responding_node_id: NodeId,
-        #[bincode(with_serde)]
-        rules: Vec<crate::settings::NamedRateLimitRule>,
+        rules: Vec<NamedRateLimitRule>,
     },
 }
 
 /// GossipPacket wraps messages for network transmission
-#[derive(Debug, Clone, Decode, Encode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipPacket {
     pub message: GossipMessage,
     pub packet_id: u64, // For deduplication
@@ -112,84 +95,37 @@ impl GossipPacket {
     }
 
     /// Serialize for INTERNAL cluster communication (UDP gossip)
-    pub fn serialize(&self) -> Result<bytes::Bytes, bincode::error::EncodeError> {
-        let config = bincode::config::standard().with_big_endian();
-        bincode::encode_to_vec(self, config).map(bytes::Bytes::from)
+    pub fn serialize(&self) -> Result<bytes::Bytes, postcard::Error> {
+        to_allocvec(self).map(bytes::Bytes::from)
     }
 
     /// Deserialize from INTERNAL cluster communication (UDP gossip)
-    pub fn deserialize(data: &[u8]) -> Result<Self, bincode::error::DecodeError> {
-        let config = bincode::config::standard().with_big_endian();
-        let (result, _) = bincode::decode_from_slice(data, config)?;
-        Ok(result)
+    pub fn deserialize(data: &[u8]) -> Result<Self, postcard::Error> {
+        from_bytes(data)
     }
 }
 
-pub enum GossipCommand {
-    ExpireKeys,
-    CheckLimit {
-        client_id: String,
-        resp_chan: oneshot::Sender<crate::error::Result<CheckCallsResponse>>,
-    },
-    RateLimit {
-        client_id: String,
-        resp_chan: oneshot::Sender<crate::error::Result<Option<CheckCallsResponse>>>,
-    },
-    GossipMessageReceived {
-        data: bytes::Bytes,
-        peer_addr: SocketAddr,
-    },
-
-    // Rate limit configuration commands
-    CreateNamedRule {
-        rule_name: String,
-        settings: crate::settings::RateLimitSettings,
-        resp_chan: oneshot::Sender<crate::error::Result<()>>,
-    },
-    DeleteNamedRule {
-        rule_name: String,
-        resp_chan: oneshot::Sender<crate::error::Result<()>>,
-    },
-    GetNamedRule {
-        rule_name: String,
-        resp_chan:
-            oneshot::Sender<crate::error::Result<Option<crate::settings::NamedRateLimitRule>>>,
-    },
-    ListNamedRules {
-        resp_chan: oneshot::Sender<crate::error::Result<Vec<crate::settings::NamedRateLimitRule>>>,
-    },
-    RateLimitCustom {
-        rule_name: String,
-        key: String,
-        resp_chan: oneshot::Sender<crate::error::Result<Option<CheckCallsResponse>>>,
-    },
-    CheckLimitCustom {
-        rule_name: String,
-        key: String,
-        resp_chan: oneshot::Sender<crate::error::Result<CheckCallsResponse>>,
-    },
-}
-
-impl GossipCommand {
-    pub fn from_incoming_message(data: bytes::Bytes, peer_addr: SocketAddr) -> Self {
-        GossipCommand::GossipMessageReceived { data, peer_addr }
-    }
-}
+// impl GossipCommand {
+//     pub fn from_incoming_message(data: bytes::Bytes, peer_addr: SocketAddr) -> Self {
+//         GossipCommand::GossipMessageReceived { data, peer_addr }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::NodeName;
 
     #[test]
     fn test_gossip_packet_serialization() {
         let message = GossipMessage::StateRequest {
-            requesting_node_id: NodeId::new(1),
+            requesting_node_id: NodeName::from("node-1").node_id(),
             missing_keys: None,
             response_addr: "127.0.0.1:8410".parse().unwrap(),
         };
         let packet = GossipPacket::new(message);
 
-        // Test bincode serialization (for internal cluster communication)
+        // Test postcard serialization (for internal cluster communication)
         let serialized = packet.serialize().expect("Failed to serialize packet");
         let deserialized =
             GossipPacket::deserialize(&serialized).expect("Failed to deserialize packet");
@@ -200,7 +136,7 @@ mod tests {
                 missing_keys,
                 response_addr,
             } => {
-                assert_eq!(requesting_node_id, NodeId::new(1));
+                assert_eq!(requesting_node_id, NodeName::from("node-1").node_id());
                 assert!(missing_keys.is_none());
                 assert_eq!(response_addr, "127.0.0.1:8410".parse().unwrap());
             }

@@ -1,25 +1,31 @@
 //! Token bucket rate limiting algorithm
-use bincode::{Decode, Encode};
 use chrono::Utc;
 use papaya::HashMap;
+use serde::{Deserialize, Serialize};
 
 use crate::node::NodeId;
 use crate::settings;
 
 /// Rate limiter bucket interface
 pub trait Bucket {
-    fn new(node_id: NodeId, max_calls: u32) -> Self;
+    fn new(max_calls: u32, node_id: NodeId) -> Self
+    where
+        Self: Sized;
     fn add_tokens_to_bucket(
         &mut self,
         rate_limit_settings: &settings::RateLimitSettings,
-    ) -> &mut Self;
+    ) -> &mut Self
+    where
+        Self: Sized;
     fn check_if_allowed(&self) -> bool;
-    fn decrement(&mut self) -> &mut Self;
+    fn decrement(&mut self) -> &mut Self
+    where
+        Self: Sized;
     fn tokens_to_u32(&self) -> u32;
 }
 
 /// Token bucket for rate limiting
-#[derive(Clone, Debug, Decode, Encode)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenBucket {
     pub tokens: f64,
     pub last_call: i64,
@@ -35,7 +41,7 @@ impl Default for TokenBucket {
 }
 
 impl Bucket for TokenBucket {
-    fn new(_node_id: NodeId, max_calls: u32) -> Self {
+    fn new(max_calls: u32, _: NodeId) -> Self {
         TokenBucket {
             tokens: max_calls as f64,
             last_call: Utc::now().timestamp_millis(),
@@ -84,17 +90,15 @@ impl Bucket for TokenBucket {
 /// Each rate-limited item will be stored in here.
 /// To check if a limit has been exceeded we will ask an instance of `TokenBucket`
 /// Rate limiter managing multiple token buckets
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenBucketLimiter {
-    node_id: NodeId,
     settings: settings::RateLimitSettings,
     cache: HashMap<String, TokenBucket>,
 }
 
 impl TokenBucketLimiter {
-    pub fn new(node_id: NodeId, rate_limit_settings: settings::RateLimitSettings) -> Self {
+    pub fn new(rate_limit_settings: settings::RateLimitSettings) -> Self {
         Self {
-            node_id,
             settings: rate_limit_settings,
             cache: HashMap::new(),
         }
@@ -107,7 +111,10 @@ impl TokenBucketLimiter {
     }
 
     pub fn new_bucket(&self) -> TokenBucket {
-        TokenBucket::new(self.node_id, self.settings.rate_limit_max_calls_allowed)
+        TokenBucket::new(
+            self.settings.rate_limit_max_calls_allowed,
+            NodeId::default(),
+        )
     }
 
     // It's possible that updates happen around this object
@@ -206,7 +213,7 @@ impl TokenBucketLimiter {
         } else {
             // Create new bucket - first call is always allowed
             let mut new_bucket =
-                TokenBucket::new(self.node_id, settings.rate_limit_max_calls_allowed);
+                TokenBucket::new(settings.rate_limit_max_calls_allowed, NodeId::default());
             // Set tokens to max for the provided settings
             new_bucket.tokens = f64::from(settings.rate_limit_max_calls_allowed);
             new_bucket.decrement(); // Use one token
@@ -467,7 +474,7 @@ mod tests {
     }
 
     fn new_rate_limiter() -> TokenBucketLimiter {
-        TokenBucketLimiter::new(NodeId::new(1), get_settings())
+        TokenBucketLimiter::new(get_settings())
     }
 
     #[tokio::test]
@@ -597,8 +604,7 @@ mod tests {
             rate_limit_interval_seconds: 1,
         };
 
-        let mut limiter: TokenBucketLimiter =
-            TokenBucketLimiter::new(NodeId::new(1), zero_settings);
+        let mut limiter: TokenBucketLimiter = TokenBucketLimiter::new(zero_settings);
 
         // default is 0
         assert_eq!(limiter.check_calls_remaining_for_client("test_client"), 0);
@@ -621,7 +627,7 @@ mod tests {
             rate_limit_interval_seconds: 60,
         };
 
-        let mut limiter: TokenBucketLimiter = TokenBucketLimiter::new(NodeId::new(1), high_limit);
+        let mut limiter: TokenBucketLimiter = TokenBucketLimiter::new(high_limit);
         assert_eq!(limiter.check_calls_remaining_for_client("test"), 100);
 
         // Make 10 requests

@@ -1,51 +1,75 @@
 # Colibri: Rate-Limiting as a Service
 
-Colibri is a simple HTTP service built in Rust that implements an in-memory data structure for rate-limiting services. Rate counts are stored _in memory_ so that Colibri can respond quickly.
+HTTP service for distributed rate limiting with in-memory token bucket storage.
 
-**Note**: Restarting a Colibri node will restart any rate-limit counts.
+**Note**: Rate limit counts reset when nodes restart.
 
 ## Design
 
-Colibri implements the [Token Bucket algorithm](https://en.wikipedia.org/wiki/Token_bucket) for rate-limiting clients. Currently, all Colibri data structures are held in memory without persistence so that it can quickly respond to incoming requests.
+Implements [Token Bucket algorithm](https://en.wikipedia.org/wiki/Token_bucket) with in-memory storage for fast response times.
 
-Colibri can be run in single-node mode or in multi-node mode. In single-node mode each Colibri node will keep track of rate-limits individually without using any distributed properties. This strategy could potentially work behind a round-robin load balancer that fairly distributes traffic but it gets quickly confusing with interleaved client requests.
+Colibri supports three distinct operational modes:
 
-In multi-node mode Colibri functions as a distributed hash table, assigning responsibility for distinct client IDs to individual nodes using consistent hashing. This is experimental; for instance, it's not currently designed to work around network partitions or dynamic cluster resizing.
+1. **Single-Node Mode**: Each Colibri node tracks rate limits independently. Simple but isolated behavior across distributed requests (such as behind a load balancer)
+
+2. **Gossip Mode**: Nodes share rate limiting state through a gossip protocol, eventually converging to consistent token counts across all nodes. Provides eventual consistency with resilience to network partitions.
+
+3. **Hashring Mode**: Uses consistent hashing to assign client responsibility to specific nodes, functioning as a distributed hash table. Provides strong consistency but requires all nodes to be reachable.
 
 ## Quick Start
 
 After cloning this repo, you can quickly launch Colibri using the provided justfile recipes:
-
-### Single-Node Mode (Simplest)
 
 ```sh
 # Start a single node on port 8000
 ❯ just run
 ```
 
-### Multi-Node Cluster (3 nodes)
+## Demo Scripts & Validation
+
+The `demo/` directory contains various demo scenarios along with vallidation to test all three operational modes:
 
 ```sh
-# Start a 3-node cluster on ports 8001, 8002, 8003
-❯ just run-cluster
+# Gossip mode: 3-node cluster with eventual consistency
+❯ just demo gossip
+
+# Hashring mode: 3-node cluster using consistent hashing
+❯ just demo hashring
+
+# Single node
+❯ just demo single
 ```
 
-Then test the rate limiting:
+### Demo Validation Scripts
+
+The demos include validation scripts to try to quickly determine of Colibri is functioning properly:
+
+- **Rate Limiting**: Token consumption, exhaustion, and recovery
+- **Timing**: Token bucket refill and burst capacity
+- **Consistency**: Distributed state management across nodes
+
+### Quick Manual Test
 
 ```sh
-❯ curl -XPOST -i http://localhost:8002/rl/test-client
+❯ just run
+
+# Test rate limiting (consumes tokens)
+❯ curl -XPOST -i http://localhost:8410/rl/test-client
 HTTP/1.1 200 OK
 content-type: application/json
-content-length: 50
+content-length: 49
+date: Tue, 09 Dec 2025 21:44:44 GMT
 
 {"client_id":"test-client","calls_remaining":999}
 
-❯ curl -XPOST -i http://localhost:8001/rl/test-client
+# Check remaining tokens (doesn't consume)
+❯ curl -XGET -i http://localhost:8410/rl-check/test-client
 HTTP/1.1 200 OK
 content-type: application/json
-content-length: 50
+content-length: 49
+date: Tue, 09 Dec 2025 21:44:57 GMT
 
-{"client_id":"test-client","calls_remaining":998}
+{"client_id":"test-client","calls_remaining":999}
 ```
 
 ### Available Development Recipes
@@ -58,43 +82,53 @@ Use `just --list` to see all available recipes:
 - `just test-cluster` - Automated testing of multi-node functionality
 - `just test` - Run all unit and integration tests
 
-[Click here for a terminal demo](./rate-limiting-demo.gif).
+## API Endpoints
 
-## Binary Arguments
+### Rate Limiting
 
-The following configuration options are available for running Colibri:
+- `POST /rl/{client_id}` - Apply rate limit (consumes tokens)
+- `GET /rl-check/{client_id}` - Check remaining tokens (no consumption)
 
-```sh
-Usage: colibri [OPTIONS]
+### Health & Status
 
-Options:
-      --listen-address <LISTEN_ADDRESS>
-          IP Address to listen on [env: LISTEN_ADDRESS=] [default: 0.0.0.0]
-      --listen-port <LISTEN_PORT>
-          Port to bind Colibri server to [env: LISTEN_PORT=] [default: 8000]
-      --rate-limit-max-calls-allowed <RATE_LIMIT_MAX_CALLS_ALLOWED>
-          Max calls allowed per interval [env: RATE_LIMIT_MAX_CALLS_ALLOWED=] [default: 1000]
-      --rate-limit-interval-seconds <RATE_LIMIT_INTERVAL_SECONDS>
-          Interval in seconds to check limit [env: RATE_LIMIT_INTERVAL_SECONDS=] [default: 60]
-      --topology <TOPOLOGY>
-          Other node addresses in the cluster (e.g., http://node1:8000,http://node2:8000). If empty, runs in single-node mode. [env: TOPOLOGY=]
-  -h, --help
-          Print help
-```
+- `GET /health` - Health check endpoint
+- `GET /about` - Application version info
 
-## Manual Single-Node
+### Custom Rules
 
-```sh
-$ cargo run
-```
+- `POST /rl-config` - Create named rate limit rule
+- `GET /rl-config` - List all rules
+- `GET /rl-config/{rule_name}` - Get specific rule
+- `DELETE /rl-config/{rule_name}` - Delete rule
+- `POST /rl/{rule_name}/{key}` - Apply custom rate limit
+- `GET /rl-check/{rule_name}/{key}` - Check custom rule tokens
 
-### Manual Multi-Node Cluster
+## Configuration Options
+
+Key command-line options for running Colibri:
 
 ```sh
-# Run each in separate terminals
-$ cargo run -- --listen-port 8001 --topology http://localhost:8002 --topology http://localhost:8003
-$ cargo run -- --listen-port 8002 --topology http://localhost:8001 --topology http://localhost:8003
-$ cargo run -- --listen-port 8003 --topology http://localhost:8001 --topology http://localhost:8002
+# Basic single-node mode
+❯ cargo run
+
+# Multi-node with custom settings
+❯ cargo run -- --listen-port 8001 --rate-limit-max-calls-allowed 100 --rate-limit-interval-seconds 10 --run-mode gossip --topology "127.0.0.1:8401" --topology "127.0.0.1:8402"
 ```
 
-Note: The `--topology` flag specifies OTHER nodes in the cluster (not including the current node).
+### Important Options
+
+- `--run-mode`: `single`, `gossip`, or `hashring`
+- `--rate-limit-max-calls-allowed`: Token bucket size (default: 1000)
+- `--rate-limit-interval-seconds`: Refill interval (default: 60)
+- `--topology`: Other nodes in cluster (for distributed modes)
+- `--listen-port`: HTTP port (default: 8410)
+- `--listen-port-udp`: TCP port for hashring communication (default: 8411)
+- `--listen-port-udp`: UDP port for gossip communication (default: 8412)
+
+Use `cargo run -- --help` for complete options list.
+
+## Expected Behavior
+
+- **Single Mode**: Each node maintains independent rate limits
+- **Gossip Mode**: Nodes eventually converge to consistent token counts (~3s)
+- **Hashring Mode**: Requests route to consistent bucket owners

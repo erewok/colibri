@@ -19,26 +19,6 @@ pub mod custom {
     pub const CHECK: &str = "/rl-check/{rule_name}/{key}";
 }
 
-pub mod cluster {
-    pub const HEALTH: &str = "/cluster/health";
-    pub const EXPORT_BUCKET: &str = "/cluster/bucket/{bucket_id}/export";
-    pub const IMPORT_BUCKET: &str = "/cluster/bucket/{bucket_id}/import";
-    pub const TOPOLOGY: &str = "/cluster/topology";
-    pub const PREPARE_CHANGE: &str = "/cluster/prepare-change";
-    pub const COMMIT_CHANGE: &str = "/cluster/commit-change";
-    pub const ABORT_CHANGE: &str = "/cluster/abort-change";
-    pub const STATUS: &str = "/cluster/status";
-
-    pub fn export_bucket_path(bucket_id: u32) -> String {
-        let path = EXPORT_BUCKET.replace("{bucket_id}", &bucket_id.to_string());
-        super::drop_leading_slash(&path).to_string()
-    }
-    pub fn import_bucket_path(bucket_id: u32) -> String {
-        let path = IMPORT_BUCKET.replace("{bucket_id}", &bucket_id.to_string());
-        super::drop_leading_slash(&path).to_string()
-    }
-}
-
 pub fn drop_leading_slash(path: &str) -> &str {
     if let Some(stripped) = path.strip_prefix('/') {
         stripped

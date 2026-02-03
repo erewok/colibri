@@ -149,6 +149,7 @@ impl Node for HashringNode {
             client_id,
             rule_name: None,
             consume_token: false,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -165,6 +166,7 @@ impl Node for HashringNode {
             client_id,
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -243,6 +245,7 @@ impl Node for HashringNode {
             client_id: key,
             rule_name: Some(rule_name),
             consume_token: true,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -269,6 +272,7 @@ impl Node for HashringNode {
             client_id: key,
             rule_name: Some(rule_name),
             consume_token: false,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 

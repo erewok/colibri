@@ -85,12 +85,16 @@ pub fn deserialize<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T> {
     from_bytes(data).map_err(ColibriError::from)
 }
 
+/// Maximum forwarding depth to prevent loops in case of topology inconsistency
+pub const MAX_FORWARDING_DEPTH: u8 = 3;
+
 /// Request message for rate limiting over internal cluster transport
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckCallsRequest {
     pub client_id: String,         // key we rate limit against
     pub rule_name: Option<String>, // None = default rule
     pub consume_token: bool,       // true for rate_limit, false for check_limit
+    pub forwarding_depth: u8,      // track forwarding hops to prevent loops
 }
 
 /// Response message for rate limiting.
@@ -507,6 +511,7 @@ mod message_tests {
                 client_id: "test_client".to_string(),
                 rule_name: None,
                 consume_token: false,
+                forwarding_depth: 0,
             }),
             Message::CreateRateLimitRule {
                 rule_name: "test_rule".to_string(),
@@ -538,6 +543,7 @@ mod message_tests {
             client_id: "user123".to_string(),
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         });
 
         let serialized = msg.serialize().unwrap();
@@ -588,6 +594,7 @@ mod message_tests {
             client_id: "user456".to_string(),
             rule_name: Some("api_limit".to_string()),
             consume_token: true,
+            forwarding_depth: 0,
         };
 
         let old_msg = ClusterMessage::RateLimitRequest(request.clone());
@@ -632,6 +639,7 @@ mod message_tests {
             client_id: "test".to_string(),
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         });
 
         let envelope = MessageEnvelopeV2::new(
@@ -694,6 +702,7 @@ mod message_tests {
             client_id: "test-key".to_string(),
             rule_name: None,
             consume_token: false,
+            forwarding_depth: 0,
         });
 
         let (command, mut rx) = Command::new(

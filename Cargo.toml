@@ -32,6 +32,7 @@ bytes = "1.11.0"
 chrono = { version = "0.4.42", features = ["clock"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }
 crdts = "7.3.2"
+dashmap = "5.5"
 figment = { version = "0.10.19", features = ["toml"] }
 gxhash = "3.4"
 hostname = "0.4.2"
@@ -49,6 +50,7 @@ tokio = { version = "1.49.0", features = [
     "rt-multi-thread",
     "time",
     "net",
+    "sync",
 ] }
 toml = "0.9.8"
 tower = { version = "0.5.3", features = [

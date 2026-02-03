@@ -345,6 +345,7 @@ mod tests {
             client_id: "test-key".to_string(),
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         });
 
         let serialized = message.serialize();
@@ -372,6 +373,7 @@ mod tests {
             client_id: "test".to_string(),
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         });
 
         // This should return immediately even if peer is not available

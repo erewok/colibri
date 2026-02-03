@@ -6,7 +6,6 @@ use crate::settings::RateLimitSettings;
 
 pub const DEFAULT_RULE_NAME: &str = "<_default>";
 
-
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct NamedRateLimitRule {
     pub name: String,
@@ -31,13 +30,11 @@ impl RateLimitConfig {
     pub fn new(default_settings: RateLimitSettings) -> Self {
         let mut named_rules = HashMap::new();
         named_rules.insert(DEFAULT_RULE_NAME.to_string(), default_settings);
-        Self {
-            named_rules,
-        }
+        Self { named_rules }
     }
 
     pub fn get_default_settings(&self) -> &RateLimitSettings {
-        &self.named_rules
+        self.named_rules
             .get(DEFAULT_RULE_NAME)
             .expect("Default rule must exist")
     }

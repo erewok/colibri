@@ -135,6 +135,7 @@ impl Node for GossipNode {
             client_id: client_id.clone(),
             rule_name: None,
             consume_token: false,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -152,6 +153,7 @@ impl Node for GossipNode {
             client_id: client_id.clone(),
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -177,6 +179,7 @@ impl Node for GossipNode {
             client_id: key.clone(),
             rule_name: Some(rule_name),
             consume_token: false,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -196,6 +199,7 @@ impl Node for GossipNode {
             client_id: key.clone(),
             rule_name: Some(rule_name),
             consume_token: true,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 

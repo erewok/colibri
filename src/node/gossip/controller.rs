@@ -478,12 +478,16 @@ impl GossipController {
             self.send_gossip_packet(packet).await?;
         } else {
             // Send heartbeat if no updates to share
-            let vclock = self.rate_limiter.lock().map_err(|e| {
-                tracing::error!("Failed to acquire rate_limiter lock: {}", e);
-                crate::error::ColibriError::Concurrency(
-                    "Failed to acquire rate_limiter lock".to_string(),
-                )
-            })?.get_latest_updated_vclock();
+            let vclock = self
+                .rate_limiter
+                .lock()
+                .map_err(|e| {
+                    tracing::error!("Failed to acquire rate_limiter lock: {}", e);
+                    crate::error::ColibriError::Concurrency(
+                        "Failed to acquire rate_limiter lock".to_string(),
+                    )
+                })?
+                .get_latest_updated_vclock();
 
             let message = GossipMessage::Heartbeat {
                 node_id: self.node_id,

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{token_bucket, NamedRateLimitRule, DEFAULT_RULE_NAME, RateLimitConfig};
+use crate::limiters::{token_bucket, NamedRateLimitRule, RateLimitConfig, DEFAULT_RULE_NAME};
 use crate::node::{messages::CheckCallsResponse, Node, NodeName};
 use crate::settings::{RateLimitSettings, Settings};
 
@@ -35,7 +35,8 @@ impl Node for SingleNode {
         );
         let rate_limit_config = RateLimitConfig::new(settings.rate_limit_settings());
 
-        let mut named_rules: HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>> = HashMap::new();
+        let mut named_rules: HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>> =
+            HashMap::new();
         named_rules.insert(
             DEFAULT_RULE_NAME.to_string(),
             Arc::new(Mutex::new(token_bucket::TokenBucketLimiter::new(
@@ -50,11 +51,13 @@ impl Node for SingleNode {
         })
     }
     async fn check_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        self.check_limit_custom(DEFAULT_RULE_NAME.to_string(), client_id).await
+        self.check_limit_custom(DEFAULT_RULE_NAME.to_string(), client_id)
+            .await
     }
 
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        self.rate_limit_custom(DEFAULT_RULE_NAME.to_string(), client_id).await
+        self.rate_limit_custom(DEFAULT_RULE_NAME.to_string(), client_id)
+            .await
     }
 
     async fn rate_limit_custom(
@@ -215,10 +218,13 @@ impl Node for SingleNode {
                     self.rate_limit_config
                         .write()
                         .map_err(|e| {
-                            ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+                            ColibriError::Concurrency(format!(
+                                "Failed to acquire config lock: {}",
+                                e
+                            ))
                         })?
                         .remove_named_rule(rule_name);
-                },
+                }
             }
         }
         Ok(())

@@ -1,13 +1,13 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use dashmap::DashMap;
 use tokio::sync::mpsc;
-use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tokio::sync::{broadcast, RwLock};
+use tracing::{debug, info, warn};
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{NamedRateLimitRule, RateLimitConfig, TokenBucketLimiter};
+use crate::limiters::{NamedRateLimitRule, TokenBucketLimiter};
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, Message, Queueable, Status, StatusResponse,
     TopologyResponse,
@@ -15,7 +15,7 @@ use crate::node::messages::{
 use crate::node::{NodeAddress, NodeName};
 use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::traits::Sender;
-use crate::transport::{TcpTransport, TcpReceiver, tcp_receiver::TcpRequest};
+use crate::transport::{tcp_receiver::TcpRequest, TcpReceiver, TcpTransport};
 
 use super::consistent_hashing;
 
@@ -27,13 +27,22 @@ pub struct HashringController {
     number_of_buckets: u32,
     topology: Arc<RwLock<ClusterTopology>>,
     transport: Arc<TcpTransport>,
-    pub rate_limit_config: Arc<Mutex<RateLimitConfig>>,
-    pub named_rate_limiters: Arc<Mutex<HashMap<String, Arc<Mutex<TokenBucketLimiter>>>>>,
-    /// Receiver handle
+    /// Lock-free concurrent HashMap for rate limiters
+    pub named_rate_limiters: Arc<DashMap<String, Arc<Mutex<TokenBucketLimiter>>>>,
+    /// Receiver address for logging (used in Phase 2)
+    #[allow(dead_code)]
+    receiver_addr: SocketAddr,
+    /// Receiver for incoming TCP messages (used in Phase 2)
+    #[allow(dead_code)]
     receiver: Arc<Mutex<TcpReceiver>>,
-    receive_chan: Arc<Mutex<mpsc::Receiver<TcpRequest>>>,
-    /// Receiver handle
+    /// Channel ownership transfer pattern (used in Phase 2)
+    #[allow(dead_code)]
+    receive_chan: Arc<Mutex<Option<mpsc::Receiver<TcpRequest>>>>,
+    /// Spawned task handle for message processing
     pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Shutdown signaling (used in Phase 2)
+    #[allow(dead_code)]
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl std::fmt::Debug for HashringController {
@@ -66,18 +75,25 @@ impl HashringController {
         let bucket =
             consistent_hashing::jump_consistent_hash(node_name.as_str(), number_of_buckets);
 
-        // Build the configuration dict
-        let rate_limit_config = RateLimitConfig::new(settings.rate_limit_settings());
+        // Initialize DashMap with default limiter
+        let named_rate_limiters = DashMap::new();
+        let rate_limit_settings = settings.rate_limit_settings();
+        let default_limiter = TokenBucketLimiter::new(rate_limit_settings.clone());
+        named_rate_limiters.insert(
+            "<_default>".to_string(),
+            Arc::new(Mutex::new(default_limiter)),
+        );
 
         let transport_config = settings.transport_config();
         let transport = TcpTransport::new(&transport_config).await?;
 
-        // Start TCP receiver to handle incoming cluster messages
+        // Create TCP receiver and channel
         let receiver_addr = settings.transport_config().peer_listen_url();
         let (message_tx, receive_chan) = tokio::sync::mpsc::channel(1000);
+        let receiver = TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
 
-        let receiver =
-            TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
+        // Create shutdown channel
+        let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             node_name,
@@ -85,15 +101,17 @@ impl HashringController {
             number_of_buckets,
             topology: Arc::new(RwLock::new(cluster_topology)),
             transport: Arc::new(transport),
-            rate_limit_config: Arc::new(Mutex::new(rate_limit_config)),
-            named_rate_limiters: Arc::new(Mutex::new(HashMap::new())),
+            named_rate_limiters: Arc::new(named_rate_limiters),
+            receiver_addr,
             receiver: Arc::new(Mutex::new(receiver)),
-            receiver_handle: None,
+            receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
+            receiver_handle: Arc::new(Mutex::new(None)),
+            shutdown_tx,
         })
     }
 
     /// Start the main controller loop
-    pub async fn start(mut self, mut command_rx: mpsc::Receiver<Queueable>) {
+    pub async fn start(self, mut command_rx: mpsc::Receiver<Queueable>) {
         info!("HashringController started for node {}", self.node_name);
 
         while let Some(_command) = command_rx.recv().await {}
@@ -101,47 +119,15 @@ impl HashringController {
         info!("HashringController stopped for node {}", self.node_name);
     }
 
-    /// Start the receiver task
-    pub async fn start_receiver(&mut self) -> Result<()> {
-        let receiver = self.receiver.lock().unwrap();
-        receiver.start().await;
+    /// Get rate limiter for a given rule name (or default if None)
+    fn get_limiter(&self, rule_name: Option<String>) -> Result<Arc<Mutex<TokenBucketLimiter>>> {
+        let rule_name = rule_name.unwrap_or_else(|| "<_default>".to_string());
 
-        self.receiver_handle = Some(tokio::spawn(async move {
-            info!("Hashring TCP receiver started on {}", receiver_addr);
-            while let Some(request) = message_rx.recv().await {
-                // Deserialize and process message
-                match crate::node::messages::Message::deserialize(&request.data) {
-                    Ok(message) => {
-                        let response = match self.handle_message(message).await {
-                            Ok(response) => response,
-                            Err(e) => {
-                                error!("Error handling hashring message: {}", e);
-                                // Send an error response
-                                continue;
-                            }
-                        };
-
-                        // Serialize response and send it back
-                        match response.serialize() {
-                            Ok(response_data) => {
-                                // Convert Bytes to Vec<u8>
-                                let response_vec = response_data.to_vec();
-                                if request.response_tx.send(response_vec).is_err() {
-                                    error!("Failed to send response back to peer");
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to serialize response: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize message: {}", e);
-                    }
-                }
-            }
-        }));
-        Ok(())
+        // DashMap provides lock-free concurrent access
+        self.named_rate_limiters
+            .get(&rule_name)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| ColibriError::Api(format!("Rate limit rule '{}' not found", rule_name)))
     }
 
     fn owns_bucket_for_client(&self, client_id: &str) -> bool {
@@ -185,13 +171,27 @@ impl HashringController {
 
     async fn handle_rate_limit_request(
         &self,
-        request: CheckCallsRequest,
+        mut request: CheckCallsRequest,
     ) -> Result<CheckCallsResponse> {
+        // Prevent forwarding loops
+        if request.forwarding_depth >= crate::node::messages::MAX_FORWARDING_DEPTH {
+            warn!(
+                "Max forwarding depth {} exceeded for client {}",
+                crate::node::messages::MAX_FORWARDING_DEPTH,
+                request.client_id
+            );
+            return Err(ColibriError::Transport(
+                "Max forwarding depth exceeded - possible topology inconsistency".to_string(),
+            ));
+        }
+
         if !self.owns_bucket_for_client(&request.client_id) {
             let owner = self.find_bucket_owner(&request.client_id).await?;
+            request.forwarding_depth = request.forwarding_depth.saturating_add(1);
+
             debug!(
-                "Forwarding rate limit request for {} to {}",
-                request.client_id, owner
+                "Forwarding rate limit request for {} to {} (depth: {})",
+                request.client_id, owner, request.forwarding_depth
             );
 
             let response = self
@@ -208,7 +208,11 @@ impl HashringController {
             }
         }
 
-        let mut limiter = self.rate_limiter.lock().unwrap();
+        // Get the appropriate limiter (default or named rule)
+        let limiter_arc = self.get_limiter(request.rule_name.clone())?;
+        let mut limiter = limiter_arc
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
 
         let calls_remaining = if request.consume_token {
             limiter.limit_calls_for_client(request.client_id.clone())
@@ -293,22 +297,20 @@ impl HashringController {
         rule_name: String,
         settings: RateLimitSettings,
     ) -> Result<()> {
-        let mut named_limiters = self.named_rate_limiters.lock().unwrap();
-
         // Only create if it doesn't already exist
-        if named_limiters.contains_key(&rule_name) {
+        if self.named_rate_limiters.contains_key(&rule_name) {
             return Ok(());
         }
 
         let limiter = TokenBucketLimiter::new(settings.clone());
-        named_limiters.insert(rule_name.clone(), Arc::new(Mutex::new(limiter)));
+        self.named_rate_limiters
+            .insert(rule_name.clone(), Arc::new(Mutex::new(limiter)));
         tracing::info!("Created named rule '{}' in hashring node", rule_name);
         Ok(())
     }
 
     async fn delete_rate_limit_rule(&self, rule_name: String) -> Result<()> {
-        let mut named_limiters = self.named_rate_limiters.lock().unwrap();
-        if named_limiters.remove(&rule_name).is_some() {
+        if self.named_rate_limiters.remove(&rule_name).is_some() {
             tracing::info!("Deleted named rule '{}' from hashring node", rule_name);
         } else {
             tracing::warn!("Attempted to delete non-existent rule '{}'", rule_name);
@@ -317,21 +319,22 @@ impl HashringController {
     }
 
     async fn get_rate_limit_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
-        if rule_name == "default" {
-            return Ok(Some(NamedRateLimitRule {
-                name: "default".to_string(),
-                settings: self.rate_limit_settings.clone(),
-            }));
-        }
+        // Translate "default" to internal key "<_default>"
+        let internal_key = if rule_name == "default" {
+            "<_default>".to_string()
+        } else {
+            rule_name.clone()
+        };
 
-        let named_limiters = self.named_rate_limiters.lock().unwrap();
-
-        if let Some(limiter_arc) = named_limiters.get(&rule_name) {
-            let limiter = limiter_arc.lock().unwrap();
+        // Use DashMap - no lock needed
+        if let Some(limiter_arc) = self.named_rate_limiters.get(&internal_key) {
+            let limiter = limiter_arc
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
             let settings = limiter.get_settings().clone();
 
             return Ok(Some(NamedRateLimitRule {
-                name: rule_name,
+                name: rule_name, // Return user-facing name "default", not internal "<_default>"
                 settings,
             }));
         }
@@ -340,17 +343,25 @@ impl HashringController {
     }
 
     async fn list_rate_limit_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let mut rules = vec![NamedRateLimitRule {
-            name: "default".to_string(),
-            settings: self.rate_limit_settings.clone(),
-        }];
+        let mut rules = Vec::new();
 
-        let named_limiters = self.named_rate_limiters.lock().unwrap();
+        // DashMap iter doesn't require lock
+        for entry in self.named_rate_limiters.iter() {
+            let name = entry.key();
+            let limiter_arc = entry.value();
+            let limiter = limiter_arc
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
 
-        for (name, limiter_arc) in named_limiters.iter() {
-            let limiter = limiter_arc.lock().unwrap();
+            // Translate internal "<_default>" key to user-facing "default"
+            let user_facing_name = if name == "<_default>" {
+                "default".to_string()
+            } else {
+                name.clone()
+            };
+
             rules.push(NamedRateLimitRule {
-                name: name.clone(),
+                name: user_facing_name,
                 settings: limiter.get_settings().clone(),
             });
         }

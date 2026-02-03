@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::{NamedRateLimitRule, TokenBucketLimiter};
@@ -29,18 +29,15 @@ pub struct HashringController {
     transport: Arc<TcpTransport>,
     /// Lock-free concurrent HashMap for rate limiters
     pub named_rate_limiters: Arc<DashMap<String, Arc<Mutex<TokenBucketLimiter>>>>,
-    /// Receiver address for logging (used in Phase 2)
-    #[allow(dead_code)]
+    /// Receiver address for logging
     receiver_addr: SocketAddr,
-    /// Receiver for incoming TCP messages (used in Phase 2)
-    #[allow(dead_code)]
-    receiver: Arc<Mutex<TcpReceiver>>,
-    /// Channel ownership transfer pattern (used in Phase 2)
-    #[allow(dead_code)]
+    /// Receiver for incoming TCP messages
+    receiver: Arc<TcpReceiver>,
+    /// Channel ownership transfer pattern
     receive_chan: Arc<Mutex<Option<mpsc::Receiver<TcpRequest>>>>,
     /// Spawned task handle for message processing
     pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Shutdown signaling (used in Phase 2)
+    /// Shutdown signaling (will be used for graceful shutdown)
     #[allow(dead_code)]
     shutdown_tx: broadcast::Sender<()>,
 }
@@ -103,7 +100,7 @@ impl HashringController {
             transport: Arc::new(transport),
             named_rate_limiters: Arc::new(named_rate_limiters),
             receiver_addr,
-            receiver: Arc::new(Mutex::new(receiver)),
+            receiver: Arc::new(receiver),
             receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
             receiver_handle: Arc::new(Mutex::new(None)),
             shutdown_tx,
@@ -117,6 +114,89 @@ impl HashringController {
         while let Some(_command) = command_rx.recv().await {}
 
         info!("HashringController stopped for node {}", self.node_name);
+    }
+
+    /// Start the TCP receiver and message processing loop
+    pub async fn start_receiver(&self) -> Result<()> {
+        // Start the TCP receiver
+        self.receiver.start().await;
+
+        // Take ownership of the receive channel
+        let mut receive_chan = {
+            let mut chan_opt = self
+                .receive_chan
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            chan_opt
+                .take()
+                .ok_or_else(|| ColibriError::Transport("Receiver already started".to_string()))?
+        };
+
+        // Clone necessary data for the spawned task
+        let receiver_addr = self.receiver_addr;
+        let controller = self.clone();
+
+        // Spawn message processing task
+        let handle = tokio::spawn(async move {
+            info!("Hashring TCP receiver started on {}", receiver_addr);
+
+            while let Some(request) = receive_chan.recv().await {
+                // Deserialize incoming message
+                match Message::deserialize(&request.data) {
+                    Ok(message) => {
+                        // Handle message via controller
+                        let response = match controller.handle_message(message).await {
+                            Ok(response) => response,
+                            Err(e) => {
+                                error!("Error handling hashring message: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // Serialize and send response
+                        match response.serialize() {
+                            Ok(response_data) => {
+                                let response_vec = response_data.to_vec();
+                                if request.response_tx.send(response_vec).is_err() {
+                                    error!("Failed to send response back to peer");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize response: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize message: {}", e);
+                    }
+                }
+            }
+
+            info!("Hashring TCP receiver stopped");
+        });
+
+        // Store the handle
+        {
+            let mut receiver_handle = self
+                .receiver_handle
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            *receiver_handle = Some(handle);
+        }
+
+        Ok(())
+    }
+
+    /// Stop the TCP receiver task
+    pub fn stop_receiver(&self) {
+        if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
+            if let Some(handle) = receiver_handle.take() {
+                handle.abort();
+                info!("Hashring TCP receiver task stopped");
+            }
+        } else {
+            error!("Failed to acquire lock on receiver_handle during shutdown");
+        }
     }
 
     /// Get rate limiter for a given rule name (or default if None)

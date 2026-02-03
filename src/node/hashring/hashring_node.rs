@@ -1,7 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use super::HashringController;
 use crate::error::{ColibriError, Result};
@@ -27,24 +27,14 @@ pub enum ReplicationFactor {
 pub struct HashringNode {
     pub node_name: NodeName,
 
-    /// The hashring controller
+    /// The hashring controller (manages all TCP communication)
     pub controller: Arc<HashringController>,
-
-    /// Receiver handle
-    pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl HashringNode {
     /// Stop the hashring receiver task
     pub fn stop_receiver(&self) {
-        if let Ok(mut handle) = self.receiver_handle.lock() {
-            if let Some(join_handle) = handle.take() {
-                join_handle.abort();
-                info!("Hashring receiver task stopped");
-            }
-        } else {
-            error!("Failed to acquire lock on receiver_handle during shutdown");
-        }
+        self.controller.stop_receiver();
     }
 
     /// Stop all background tasks
@@ -55,12 +45,8 @@ impl HashringNode {
 
 impl Drop for HashringNode {
     fn drop(&mut self) {
-        // Clean up receiver task when the node is dropped
-        if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
-            if let Some(handle) = receiver_handle.take() {
-                handle.abort();
-            }
-        }
+        // Clean up receiver task via controller when the node is dropped
+        self.controller.stop_receiver();
     }
 }
 
@@ -91,56 +77,12 @@ impl Node for HashringNode {
         // Create controller
         let controller = Arc::new(HashringController::new(settings.clone()).await?);
 
-        // Start TCP receiver to handle incoming cluster messages
-        let receiver_addr = settings.transport_config().peer_listen_url();
-        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1000);
-
-        let receiver =
-            crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
-        receiver.start().await;
-
-        // Spawn task to process incoming messages
-        let controller_for_receiver = controller.clone();
-        let receiver_handle = tokio::spawn(async move {
-            info!("Hashring TCP receiver started on {}", receiver_addr);
-            while let Some(request) = message_rx.recv().await {
-                // Deserialize and process message
-                match crate::node::messages::Message::deserialize(&request.data) {
-                    Ok(message) => {
-                        let response = match controller_for_receiver.handle_message(message).await {
-                            Ok(response) => response,
-                            Err(e) => {
-                                error!("Error handling hashring message: {}", e);
-                                // Send an error response
-                                continue;
-                            }
-                        };
-
-                        // Serialize response and send it back
-                        match response.serialize() {
-                            Ok(response_data) => {
-                                // Convert Bytes to Vec<u8>
-                                let response_vec = response_data.to_vec();
-                                if request.response_tx.send(response_vec).is_err() {
-                                    error!("Failed to send response back to peer");
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to serialize response: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize message: {}", e);
-                    }
-                }
-            }
-        });
+        // Start the controller's TCP receiver
+        controller.start_receiver().await?;
 
         Ok(Self {
             node_name,
             controller,
-            receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })
     }
 

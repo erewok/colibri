@@ -292,7 +292,7 @@ impl HashringNode {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                node_type: crate::settings::RunMode::Hashring,
+                node_type: settings::RunMode::Hashring,
                 bucket_count: 0,
             },
         };

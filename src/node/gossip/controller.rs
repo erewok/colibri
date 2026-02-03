@@ -447,13 +447,6 @@ impl GossipController {
         // We are taking a single reference to this mutex here
         loop {
             tokio::select! {
-                // Handle incoming messages from network
-                // TODO: Re-enable when network receiver is implemented
-                // Some(cmd) = gossip_command_rx.recv() => {
-                //     if let Err(e) = self.handle_command(cmd).await {
-                //         debug!("[{}] Error processing incoming message: {}", node_id, e);
-                //     }
-                // }
                 // Gossip timer - send delta updates
                 _ = gossip_timer.tick() => {
                     if let Err(e) = self.handle_gossip_tick().await {

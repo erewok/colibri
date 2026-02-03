@@ -28,8 +28,6 @@ pub struct GossipNode {
 }
 
 impl GossipNode {
-    // Note: run_gossip_receiver removed - gossip protocol now handled internally by controller
-
     /// Stop the gossip receiver task
     pub fn stop_receiver(&self) {
         if let Ok(mut handle) = self.receiver_handle.lock() {

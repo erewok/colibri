@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::{NamedRateLimitRule, RateLimitConfig, TokenBucketLimiter};
@@ -15,7 +15,7 @@ use crate::node::messages::{
 use crate::node::{NodeAddress, NodeName};
 use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::traits::Sender;
-use crate::transport::TcpTransport;
+use crate::transport::{TcpTransport, TcpReceiver, tcp_receiver::TcpRequest};
 
 use super::consistent_hashing;
 
@@ -27,10 +27,13 @@ pub struct HashringController {
     number_of_buckets: u32,
     topology: Arc<RwLock<ClusterTopology>>,
     transport: Arc<TcpTransport>,
-    rate_limit_settings: RateLimitSettings,
-    pub rate_limiter: Arc<Mutex<TokenBucketLimiter>>,
     pub rate_limit_config: Arc<Mutex<RateLimitConfig>>,
     pub named_rate_limiters: Arc<Mutex<HashMap<String, Arc<Mutex<TokenBucketLimiter>>>>>,
+    /// Receiver handle
+    receiver: Arc<Mutex<TcpReceiver>>,
+    receive_chan: Arc<Mutex<mpsc::Receiver<TcpRequest>>>,
+    /// Receiver handle
+    pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for HashringController {
@@ -63,12 +66,18 @@ impl HashringController {
         let bucket =
             consistent_hashing::jump_consistent_hash(node_name.as_str(), number_of_buckets);
 
-        let rl_settings = settings.rate_limit_settings();
-        let rate_limiter = TokenBucketLimiter::new(rl_settings.clone());
-        let rate_limit_config = RateLimitConfig::new(rl_settings.clone());
+        // Build the configuration dict
+        let rate_limit_config = RateLimitConfig::new(settings.rate_limit_settings());
 
         let transport_config = settings.transport_config();
         let transport = TcpTransport::new(&transport_config).await?;
+
+        // Start TCP receiver to handle incoming cluster messages
+        let receiver_addr = settings.transport_config().peer_listen_url();
+        let (message_tx, receive_chan) = tokio::sync::mpsc::channel(1000);
+
+        let receiver =
+            TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
 
         Ok(Self {
             node_name,
@@ -76,20 +85,63 @@ impl HashringController {
             number_of_buckets,
             topology: Arc::new(RwLock::new(cluster_topology)),
             transport: Arc::new(transport),
-            rate_limit_settings: rl_settings,
-            rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(Mutex::new(rate_limit_config)),
             named_rate_limiters: Arc::new(Mutex::new(HashMap::new())),
+            receiver: Arc::new(Mutex::new(receiver)),
+            receiver_handle: None,
         })
     }
 
     /// Start the main controller loop
-    pub async fn start(self, mut command_rx: mpsc::Receiver<Queueable>) {
+    pub async fn start(mut self, mut command_rx: mpsc::Receiver<Queueable>) {
         info!("HashringController started for node {}", self.node_name);
 
         while let Some(_command) = command_rx.recv().await {}
 
         info!("HashringController stopped for node {}", self.node_name);
+    }
+
+    /// Start the receiver task
+    pub async fn start_receiver(&mut self) -> Result<()> {
+        let receiver = self.receiver.lock().unwrap();
+        receiver.start().await;
+
+        self.receiver_handle = Some(tokio::spawn(async move {
+            info!("Hashring TCP receiver started on {}", receiver_addr);
+            while let Some(request) = message_rx.recv().await {
+                // Deserialize and process message
+                match crate::node::messages::Message::deserialize(&request.data) {
+                    Ok(message) => {
+                        let response = match self.handle_message(message).await {
+                            Ok(response) => response,
+                            Err(e) => {
+                                error!("Error handling hashring message: {}", e);
+                                // Send an error response
+                                continue;
+                            }
+                        };
+
+                        // Serialize response and send it back
+                        match response.serialize() {
+                            Ok(response_data) => {
+                                // Convert Bytes to Vec<u8>
+                                let response_vec = response_data.to_vec();
+                                if request.response_tx.send(response_vec).is_err() {
+                                    error!("Failed to send response back to peer");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize response: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize message: {}", e);
+                    }
+                }
+            }
+        }));
+        Ok(())
     }
 
     fn owns_bucket_for_client(&self, client_id: &str) -> bool {
@@ -362,91 +414,4 @@ impl HashringController {
             ))),
         }
     }
-
-    // Note: Direct message handling via handle_message() is now the primary interface
-    //     match command {
-    //         ClusterCommand::CheckLimit {
-    //             request,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_check_limit(request.client_id).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::RateLimit {
-    //             request,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_rate_limit(request.client_id).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::ExpireKeys => {
-    //             self.handle_expire_keys().await?;
-    //         }
-    //         ClusterCommand::CreateNamedRule {
-    //             rule_name,
-    //             settings,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_create_named_rule(rule_name, settings).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::DeleteNamedRule {
-    //             rule_name,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_delete_named_rule(rule_name).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::ListNamedRules { resp_chan } => {
-    //             let result = self.handle_list_named_rules().await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::GetNamedRule {
-    //             rule_name,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_get_named_rule(rule_name).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::AdminCommand {
-    //             command,
-    //             source,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_admin_command(command, source).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
-    // ===== Legacy methods removed in Phase 3 Task 2 =====
-    // The following 14 methods were removed (lines 155-718):
-    // - handle_check_limit() - referenced non-existent messages module
-    // - handle_rate_limit() - referenced non-existent messages module
-    // - handle_expire_keys() - deferred to future phase
-    // - handle_create_named_rule() - replaced by handle_message()
-    // - handle_delete_named_rule() - replaced by handle_message()
-    // - handle_list_named_rules() - replaced by handle_message()
-    // - handle_get_named_rule() - replaced by handle_message()
-    // - handle_rate_limit_custom() - replaced by handle_message()
-    // - handle_check_limit_custom() - replaced by handle_message()
-    // - handle_admin_command() - referenced non-existent AdminResponse type
-    // - handle_export_buckets() - incomplete, deferred
-    // - handle_import_buckets() - incomplete, deferred
-    // - handle_cluster_health() - replaced by handle_message()
-    // - handle_get_topology() - replaced by handle_message()
-    // - handle_new_topology() - replaced by handle_message()
-    //
-    // Use the new handle_message() method from Phase 2 (lines 117-199) instead.
-    // These legacy methods contained ~22 compilation errors from missing types.
 }
-
-// ===== Tests temporarily disabled in Phase 3 Task 3 =====
-// These tests reference old types (ClusterCommand, messages module, cluster::ClusterMember)
-// that were removed in Phase 3 Task 2. Tests need to be rewritten to use:
-// - New Message enum instead of ClusterCommand
-// - BaseController and handle_message() architecture
-// - TcpTransport instead of cluster::ClusterMember
-//
-// TODO: Rewrite these tests in a future phase when node implementations are updated

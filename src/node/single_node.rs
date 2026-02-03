@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{token_bucket, NamedRateLimitRule, RateLimitConfig};
+use crate::limiters::{token_bucket, NamedRateLimitRule, DEFAULT_RULE_NAME, RateLimitConfig};
 use crate::node::{messages::CheckCallsResponse, Node, NodeName};
 use crate::settings::{RateLimitSettings, Settings};
 
@@ -13,7 +13,6 @@ use crate::settings::{RateLimitSettings, Settings};
 #[derive(Clone, Debug)]
 pub struct SingleNode {
     pub node_name: NodeName,
-    pub rate_limiter: Arc<Mutex<token_bucket::TokenBucketLimiter>>,
     pub rate_limit_config: Arc<RwLock<RateLimitConfig>>,
     pub named_rate_limiters:
         Arc<RwLock<HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>>>>,
@@ -34,22 +33,28 @@ impl Node for SingleNode {
             "[Node<{}>] Starting at {} in single-node mode",
             node_name, listen_api
         );
-        let rate_limiter: token_bucket::TokenBucketLimiter =
-            token_bucket::TokenBucketLimiter::new(settings.rate_limit_settings());
         let rate_limit_config = RateLimitConfig::new(settings.rate_limit_settings());
+
+        let mut named_rules: HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>> = HashMap::new();
+        named_rules.insert(
+            DEFAULT_RULE_NAME.to_string(),
+            Arc::new(Mutex::new(token_bucket::TokenBucketLimiter::new(
+                settings.rate_limit_settings(),
+            ))),
+        );
+
         Ok(Self {
             node_name,
-            rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             rate_limit_config: Arc::new(RwLock::new(rate_limit_config)),
-            named_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
+            named_rate_limiters: Arc::new(RwLock::new(named_rules)),
         })
     }
     async fn check_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        local_check_limit(None, client_id, self.rate_limiter.clone()).await
+        self.check_limit_custom(DEFAULT_RULE_NAME.to_string(), client_id).await
     }
 
     async fn rate_limit(&self, client_id: String) -> Result<Option<CheckCallsResponse>> {
-        local_rate_limit(client_id, self.rate_limiter.clone()).await
+        self.rate_limit_custom(DEFAULT_RULE_NAME.to_string(), client_id).await
     }
 
     async fn rate_limit_custom(
@@ -191,10 +196,31 @@ impl Node for SingleNode {
     }
 
     async fn expire_keys(&self) -> Result<()> {
-        let mut rate_limiter = self.rate_limiter.lock().map_err(|e| {
+        let mut rate_limiters = self.named_rate_limiters.write().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire rate_limiter lock: {}", e))
         })?;
-        rate_limiter.expire_keys();
+        for (rule_name, rate_limiter) in rate_limiters.iter_mut() {
+            match rate_limiter.lock() {
+                Err(e) => {
+                    tracing::error!("Failed to acquire rate_limiter lock: {}", e);
+                    return Err(crate::error::ColibriError::Concurrency(
+                        "Failed to acquire rate_limiter lock".to_string(),
+                    ));
+                }
+                Ok(mut rl) => {
+                    rl.expire_keys();
+                    if rule_name == DEFAULT_RULE_NAME {
+                        continue;
+                    }
+                    self.rate_limit_config
+                        .write()
+                        .map_err(|e| {
+                            ColibriError::Concurrency(format!("Failed to acquire config lock: {}", e))
+                        })?
+                        .remove_named_rule(rule_name);
+                },
+            }
+        }
         Ok(())
     }
 }

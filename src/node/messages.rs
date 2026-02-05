@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{DistributedBucketExternal, NamedRateLimitRule, TokenBucketLimiter};
-use crate::node::{NodeAddress, NodeName};
+use crate::limiters::{DistributedBucketExternal, TokenBucketLimiter, rules};
+use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{RateLimitSettings, RunMode};
 
 // Controllers and Nodes use queuable messages to send/receive messages internally.
@@ -182,8 +182,8 @@ pub enum ClusterMessageResponse {
     RateLimitResponse(CheckCallsResponse),
     RateLimitConfigCreateResponse,
     RateLimitConfigDeleteResponse,
-    RateLimitConfigGetResponse(Option<NamedRateLimitRule>),
-    RateLimitConfigListResponse(Vec<NamedRateLimitRule>),
+    RateLimitConfigGetResponse(Option<rules::SerializableRule>),
+    RateLimitConfigListResponse(Vec<rules::SerializableRule>),
     /// Response to state request with missing data
     TokenBucketStateResponse(Vec<TokenBucketLimiter>),
     DistributedBucketStateResponse(Vec<DistributedBucketExternal>),
@@ -297,31 +297,28 @@ pub enum Message {
     ExpireKeys, // Internal message to trigger key expiry
     // ===== Configuration operations =====
     /// Create a new named rate limit rule
-    CreateRateLimitRule {
-        rule_name: String,
-        settings: RateLimitSettings,
-    },
+    CreateRateLimitRule(rules::SerializableRule),
     /// Acknowledge rule creation
     CreateRateLimitRuleResponse,
 
     /// Delete a named rate limit rule
     DeleteRateLimitRule {
-        rule_name: String,
+        rule_name: rules::RuleName,
     },
     /// Acknowledge rule deletion
     DeleteRateLimitRuleResponse,
 
     /// Get a specific named rate limit rule
     GetRateLimitRule {
-        rule_name: String,
+        rule_name: rules::RuleName,
     },
     /// Response with rule details (or None if not found)
-    GetRateLimitRuleResponse(Option<NamedRateLimitRule>),
+    GetRateLimitRuleResponse(Option<rules::SerializableRule>),
 
     /// List all named rate limit rules
     ListRateLimitRules,
     /// Response with all rules
-    ListRateLimitRulesResponse(Vec<NamedRateLimitRule>),
+    ListRateLimitRulesResponse(rules::RuleList),
 
     // ===== Cluster operations (both modes) =====
     /// Request current cluster topology
@@ -354,7 +351,7 @@ pub enum Message {
     /// Heartbeat with vector clock for anti-entropy
     GossipHeartbeat {
         timestamp: u64,
-        vclock: crdts::VClock<crate::node::NodeId>,
+        vclock: crdts::VClock<NodeId>,
     },
 
     // ===== Admin operations (both modes) =====

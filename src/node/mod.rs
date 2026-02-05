@@ -10,7 +10,6 @@ pub mod node_id;
 pub mod single_node;
 
 use crate::error::Result;
-use crate::limiters::NamedRateLimitRule;
 use crate::settings;
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{token_bucket, NamedRateLimitRule, RateLimitConfig, DEFAULT_RULE_NAME};
+use crate::limiters::{rules, token_bucket};
 use crate::node::{messages::CheckCallsResponse, Node, NodeName};
 use crate::settings::{RateLimitSettings, Settings};
 
@@ -13,7 +13,7 @@ use crate::settings::{RateLimitSettings, Settings};
 #[derive(Clone, Debug)]
 pub struct SingleNode {
     pub node_name: NodeName,
-    pub rate_limit_config: Arc<RwLock<RateLimitConfig>>,
+    pub rate_limit_config: Arc<RwLock<rules::TokenBucketRules>>,
     pub named_rate_limiters:
         Arc<RwLock<HashMap<String, Arc<Mutex<token_bucket::TokenBucketLimiter>>>>>,
 }

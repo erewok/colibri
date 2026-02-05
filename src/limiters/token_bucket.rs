@@ -1,10 +1,12 @@
 //! Token bucket rate limiting algorithm
 use chrono::Utc;
-use papaya::HashMap;
+use papaya::{Guard, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::node::NodeId;
 use crate::settings;
+use super::rules::RuleName;
+
 
 /// Rate limiter bucket interface
 pub trait Bucket {
@@ -93,6 +95,7 @@ impl Bucket for TokenBucket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenBucketLimiter {
     settings: settings::RateLimitSettings,
+    // client identifier -> token bucket
     cache: HashMap<String, TokenBucket>,
 }
 
@@ -272,6 +275,53 @@ impl TokenBucketLimiter {
         self.cache.pin().len()
     }
 }
+
+
+#[derive(Clone, Debug)]
+pub struct TokenBucketRules {
+    // rule name -> settings
+    named_rules: HashMap<RuleName, TokenBucketLimiter>,
+}
+
+impl TokenBucketRules {
+    pub fn new(default_settings: settings::RateLimitSettings) -> Self {
+        let named_rules = HashMap::new();
+        named_rules.pin().insert(
+            RuleName::default(),
+            TokenBucketLimiter::new(default_settings),
+        );
+        Self { named_rules }
+    }
+
+    pub fn guard(&self) -> impl Guard + '_ {
+        self.named_rules.guard()
+    }
+
+    pub fn get_default_limiter<'guard>(&self, guard: &'guard impl Guard) -> Option<&'guard TokenBucketLimiter> {
+        self.named_rules.get(&RuleName::default(), guard)
+    }
+
+    pub fn get_named_rule_limiter<'guard>(&self, rule_name: &str, guard: &'guard impl Guard) -> Option<&'guard TokenBucketLimiter> {
+        self.named_rules.get(&RuleName::from(rule_name), guard)
+    }
+
+    pub fn add_named_rule(&mut self, rule: &RuleName, limiter: TokenBucketLimiter) {
+        self.named_rules.pin().insert(rule.clone(), limiter);
+    }
+
+    pub fn remove_named_rule<'guard>(&self, rule_name: &str, guard: &'guard impl Guard) -> Option<&'guard TokenBucketLimiter> {
+        self.named_rules.remove(&RuleName::from(rule_name), guard)
+    }
+
+    pub fn list_named_rules(&self) -> Vec<RuleName> {
+        self.named_rules
+            .pin()
+            .keys()
+            .map(|name| name.clone())
+            .collect()
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

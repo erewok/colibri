@@ -211,16 +211,15 @@ impl GossipController {
         rule_name: String,
         settings: RateLimitSettings,
     ) -> Result<()> {
-        // Handle empty rule name gracefully - treat as default
-        let rule_name = if rule_name.is_empty() {
+        // Reject empty or whitespace-only rule names
+        let rule_name = rule_name.trim();
+        if rule_name.is_empty() {
             warn!(
-                "[{}] Received create_rate_limit_rule with empty rule name, treating as default",
+                "[{}] Ignoring create_rate_limit_rule with empty rule name",
                 self.node_id
             );
-            "default".to_string()
-        } else {
-            rule_name
-        };
+            return Ok(());
+        }
 
         // Don't allow creating/overwriting the default rule
         if rule_name == "default" || rule_name == "<_default>" {
@@ -232,7 +231,8 @@ impl GossipController {
         }
 
         let limiter = DistributedBucketLimiter::new(self.node_id, settings.clone());
-        self.named_rate_limiters.insert(rule_name.clone(), limiter);
+        self.named_rate_limiters
+            .insert(rule_name.to_string(), limiter);
         tracing::info!("Created named rule '{}' in gossip node", rule_name);
         Ok(())
     }

@@ -340,6 +340,10 @@ impl DistributedBucketLimiter {
         }
     }
 
+    pub fn get_settings(&self) -> &settings::RateLimitSettings {
+        &self.rate_limit_settings
+    }
+
     pub fn check_calls_remaining_for_client(&self, key: &String) -> u32 {
         self.node_counters
             .pin()

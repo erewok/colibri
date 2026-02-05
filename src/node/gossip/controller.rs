@@ -2,13 +2,15 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use dashmap::DashMap;
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::{
     distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter},
-    NamedRateLimitRule, RateLimitConfig,
+    NamedRateLimitRule,
 };
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
@@ -16,8 +18,7 @@ use crate::node::messages::{
 use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::traits::Sender;
-use crate::transport::TcpTransport;
-use tokio::sync::RwLock;
+use crate::transport::{tcp_receiver::TcpRequest, TcpReceiver, TcpTransport};
 
 use super::{GossipMessage, GossipPacket};
 
@@ -29,14 +30,22 @@ pub struct GossipController {
     node_id: NodeId,
     topology: Arc<RwLock<ClusterTopology>>,
     transport: Arc<TcpTransport>,
-    pub rate_limit_settings: settings::RateLimitSettings,
-    pub rate_limiter: Arc<Mutex<DistributedBucketLimiter>>,
-    pub rate_limit_config: Arc<Mutex<RateLimitConfig>>,
-    pub named_rate_limiters:
-        Arc<Mutex<std::collections::HashMap<String, DistributedBucketLimiter>>>,
+    /// Lock-free concurrent HashMap for rate limiters (DashMap provides interior mutability)
+    pub named_rate_limiters: DashMap<String, DistributedBucketLimiter>,
     pub response_addr: SocketAddr,
     pub gossip_interval_ms: u64,
     pub gossip_fanout: usize,
+    /// Receiver address for logging
+    receiver_addr: SocketAddr,
+    /// Receiver for incoming TCP messages
+    receiver: Arc<TcpReceiver>,
+    /// Channel ownership transfer pattern
+    receive_chan: Arc<Mutex<Option<mpsc::Receiver<TcpRequest>>>>,
+    /// Spawned task handle for message processing
+    pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Shutdown signaling
+    #[allow(dead_code)]
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl std::fmt::Debug for GossipController {
@@ -63,52 +72,73 @@ impl GossipController {
             settings.peer_listen_port
         );
 
+        // Initialize DashMap with default limiter (DashMap provides interior mutability)
+        let named_rate_limiters = DashMap::new();
         let rl_settings = settings.rate_limit_settings();
-        let rate_limiter = DistributedBucketLimiter::new(node_name.node_id(), rl_settings.clone());
+        let default_limiter = DistributedBucketLimiter::new(node_id, rl_settings.clone());
+        named_rate_limiters.insert("<_default>".to_string(), default_limiter);
 
         let transport_config = settings.transport_config();
         let transport = TcpTransport::new(&transport_config).await?;
         let response_addr = settings.transport_config().peer_listen_url();
+
+        // Create TCP receiver and channel
+        let receiver_addr = settings.transport_config().peer_listen_url();
+        let (message_tx, receive_chan) = tokio::sync::mpsc::channel(1000);
+        let receiver = TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
+
+        // Create shutdown channel
+        let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             node_name,
             node_id,
             topology: Arc::new(RwLock::new(topology)),
             transport: Arc::new(transport),
-            rate_limit_settings: rl_settings.clone(),
-            rate_limiter: Arc::new(Mutex::new(rate_limiter)),
-            rate_limit_config: Arc::new(Mutex::new(RateLimitConfig::new(rl_settings))),
-            named_rate_limiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            named_rate_limiters,
             response_addr,
             gossip_interval_ms: settings.gossip_interval_ms,
             gossip_fanout: settings.gossip_fanout,
+            receiver_addr,
+            receiver: Arc::new(receiver),
+            receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
+            receiver_handle: Arc::new(Mutex::new(None)),
+            shutdown_tx,
         })
+    }
+
+    /// Get mutable reference to rate limiter for a given rule name (or default if None)
+    /// Uses DashMap's interior mutability via get_mut() for lock-free access
+    fn get_limiter_mut(
+        &self,
+        rule_name: Option<String>,
+    ) -> Result<dashmap::mapref::one::RefMut<'_, String, DistributedBucketLimiter>> {
+        let rule_name = rule_name.unwrap_or_else(|| "<_default>".to_string());
+
+        // DashMap provides lock-free mutable access via RefMut
+        self.named_rate_limiters
+            .get_mut(&rule_name)
+            .ok_or_else(|| ColibriError::Api(format!("Rate limit rule '{}' not found", rule_name)))
     }
 
     async fn handle_rate_limit_request(
         &self,
         request: CheckCallsRequest,
     ) -> Result<CheckCallsResponse> {
-        match self.rate_limiter.lock() {
-            Err(e) => {
-                tracing::error!("Failed to acquire rate_limiter lock: {}", e);
-                Err(crate::error::ColibriError::Concurrency(
-                    "Failed to acquire rate_limiter lock".to_string(),
-                ))
-            }
-            Ok(mut limiter) => {
-                let calls_remaining = if request.consume_token {
-                    limiter.limit_calls_for_client(request.client_id.clone())
-                } else {
-                    Some(limiter.check_calls_remaining_for_client(&request.client_id))
-                };
-                Ok(CheckCallsResponse {
-                    client_id: request.client_id,
-                    rule_name: request.rule_name,
-                    calls_remaining: calls_remaining.unwrap_or(0),
-                })
-            }
-        }
+        // Use DashMap's interior mutability - no external lock needed
+        let mut limiter = self.get_limiter_mut(request.rule_name.clone())?;
+
+        let calls_remaining = if request.consume_token {
+            limiter.limit_calls_for_client(request.client_id.clone())
+        } else {
+            Some(limiter.check_calls_remaining_for_client(&request.client_id))
+        };
+
+        Ok(CheckCallsResponse {
+            client_id: request.client_id,
+            rule_name: request.rule_name,
+            calls_remaining: calls_remaining.unwrap_or(0),
+        })
     }
 
     async fn get_status(&self) -> Result<StatusResponse> {
@@ -181,32 +211,41 @@ impl GossipController {
         rule_name: String,
         settings: RateLimitSettings,
     ) -> Result<()> {
-        let mut named_limiters = self.named_rate_limiters.lock().map_err(|e| {
-            tracing::error!("Failed to acquire named_rate_limiters lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire named_rate_limiters lock".to_string(),
-            )
-        })?;
+        // Handle empty rule name gracefully - treat as default
+        let rule_name = if rule_name.is_empty() {
+            warn!(
+                "[{}] Received create_rate_limit_rule with empty rule name, treating as default",
+                self.node_id
+            );
+            "default".to_string()
+        } else {
+            rule_name
+        };
 
-        // Only create if it doesn't already exist
-        if named_limiters.contains_key(&rule_name) {
+        // Don't allow creating/overwriting the default rule
+        if rule_name == "default" || rule_name == "<_default>" {
+            debug!(
+                "[{}] Ignoring request to create/modify default rule",
+                self.node_id
+            );
             return Ok(());
         }
 
         let limiter = DistributedBucketLimiter::new(self.node_id, settings.clone());
-        named_limiters.insert(rule_name.clone(), limiter);
+        self.named_rate_limiters.insert(rule_name.clone(), limiter);
         tracing::info!("Created named rule '{}' in gossip node", rule_name);
         Ok(())
     }
 
     async fn delete_rate_limit_rule(&self, rule_name: String) -> Result<()> {
-        let mut named_limiters = self.named_rate_limiters.lock().map_err(|e| {
-            tracing::error!("Failed to acquire named_rate_limiters lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire named_rate_limiters lock".to_string(),
-            )
-        })?;
-        if named_limiters.remove(&rule_name).is_some() {
+        // Don't allow deleting the default rule
+        if rule_name == "default" || rule_name == "<_default>" {
+            return Err(ColibriError::Api(
+                "Cannot delete the default rule".to_string(),
+            ));
+        }
+
+        if self.named_rate_limiters.remove(&rule_name).is_some() {
             tracing::info!("Deleted named rule '{}' from gossip node", rule_name);
         } else {
             tracing::warn!("Attempted to delete non-existent rule '{}'", rule_name);
@@ -215,46 +254,142 @@ impl GossipController {
     }
 
     async fn get_rate_limit_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
-        if rule_name == "default" {
-            return Ok(Some(NamedRateLimitRule {
-                name: "default".to_string(),
-                settings: self.rate_limit_settings.clone(),
-            }));
-        }
+        // Translate "default" to internal key "<_default>"
+        let internal_key = if rule_name == "default" {
+            "<_default>".to_string()
+        } else {
+            rule_name.clone()
+        };
 
-        let named_limiters = self.named_rate_limiters.lock().map_err(|e| {
-            tracing::error!("Failed to acquire named_rate_limiters lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire named_rate_limiters lock".to_string(),
-            )
-        })?;
-        if named_limiters.contains_key(&rule_name) {
-            tracing::warn!(
-                "Rule '{}' exists but settings not retrievable yet",
-                rule_name
-            );
+        // Use DashMap's immutable Ref - no external lock needed
+        if let Some(limiter_ref) = self.named_rate_limiters.get(&internal_key) {
+            let settings = limiter_ref.get_settings().clone();
+
+            return Ok(Some(NamedRateLimitRule {
+                name: rule_name, // Return user-facing name "default", not internal "<_default>"
+                settings,
+            }));
         }
 
         Ok(None)
     }
 
     async fn list_rate_limit_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let rules = vec![NamedRateLimitRule {
-            name: "default".to_string(),
-            settings: self.rate_limit_settings.clone(),
-        }];
+        let mut rules = Vec::new();
 
-        let named_limiters = self.named_rate_limiters.lock().map_err(|e| {
-            tracing::error!("Failed to acquire named_rate_limiters lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire named_rate_limiters lock".to_string(),
-            )
-        })?;
-        for name in named_limiters.keys() {
-            tracing::debug!("Named rule exists but settings not retrievable: {}", name);
+        // DashMap iter returns immutable Refs - no external lock needed
+        for entry in self.named_rate_limiters.iter() {
+            let name = entry.key();
+            let limiter = entry.value();
+
+            // Translate internal "<_default>" key to user-facing "default"
+            let user_facing_name = if name == "<_default>" {
+                "default".to_string()
+            } else {
+                name.clone()
+            };
+
+            rules.push(NamedRateLimitRule {
+                name: user_facing_name,
+                settings: limiter.get_settings().clone(),
+            });
         }
 
         Ok(rules)
+    }
+
+    /// Start the TCP receiver and message processing loop
+    pub async fn start_receiver(&self) -> Result<()> {
+        // Start the TCP receiver
+        self.receiver.start().await;
+
+        // Take ownership of the receive channel
+        let mut receive_chan = {
+            let mut chan_opt = self
+                .receive_chan
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            chan_opt
+                .take()
+                .ok_or_else(|| ColibriError::Transport("Receiver already started".to_string()))?
+        };
+
+        // Clone necessary data for the spawned task
+        let receiver_addr = self.receiver_addr;
+        let controller = self.clone();
+
+        // Spawn message processing task
+        let handle = tokio::spawn(async move {
+            info!("Gossip TCP receiver started on {}", receiver_addr);
+
+            while let Some(request) = receive_chan.recv().await {
+                // Deserialize incoming message
+                match Message::deserialize(&request.data) {
+                    Ok(message) => {
+                        // Handle message via controller
+                        let response = match controller.handle_message(message).await {
+                            Ok(response) => response,
+                            Err(e) => {
+                                error!("Error handling gossip message: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // Send response only if response_tx is present (request-response protocol)
+                        if let Some(response_tx) = request.response_tx {
+                            // Serialize and send response
+                            match response.serialize() {
+                                Ok(response_data) => {
+                                    let response_vec = response_data.to_vec();
+                                    if response_tx.send(response_vec).is_err() {
+                                        warn!(
+                                            "Failed to send response back to peer (channel closed)"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to serialize response: {}", e);
+                                }
+                            }
+                        } else {
+                            // Fire-and-forget message, no response needed
+                            debug!(
+                                "Processed fire-and-forget message from {}",
+                                request.peer_addr
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize message: {}", e);
+                    }
+                }
+            }
+
+            info!("Gossip TCP receiver stopped");
+        });
+
+        // Store the handle
+        {
+            let mut receiver_handle = self
+                .receiver_handle
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            *receiver_handle = Some(handle);
+        }
+
+        Ok(())
+    }
+
+    /// Stop the TCP receiver task
+    pub fn stop_receiver(&self) {
+        if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
+            if let Some(handle) = receiver_handle.take() {
+                handle.abort();
+                info!("Gossip TCP receiver task stopped");
+            }
+        } else {
+            error!("Failed to acquire lock on receiver_handle during shutdown");
+        }
     }
 
     pub async fn handle_message(&self, message: Message) -> Result<Message> {
@@ -288,6 +423,12 @@ impl GossipController {
                 rule_name,
                 settings,
             } => {
+                debug!(
+                    "[{}] Received CreateRateLimitRule message: rule_name='{}' (len={})",
+                    self.node_id,
+                    rule_name,
+                    rule_name.len()
+                );
                 self.create_rate_limit_rule(rule_name, settings).await?;
                 Ok(Message::Ack)
             }
@@ -338,22 +479,16 @@ impl GossipController {
         updates: Vec<DistributedBucketExternal>,
         propagation_factor: u8,
     ) -> Result<()> {
-        // Merge updates into local rate limiter
+        // Merge updates into local rate limiter using DashMap's interior mutability
         {
-            let mut limiter = self.rate_limiter.lock().map_err(|e| {
-                tracing::error!("Failed to acquire rate_limiter lock: {}", e);
-                crate::error::ColibriError::Concurrency(
-                    "Failed to acquire rate_limiter lock".to_string(),
-                )
-            })?;
-
+            let mut limiter = self.get_limiter_mut(None)?;
             limiter.accept_delta_state(&updates);
             debug!(
                 "[{}] Merged {} delta updates from gossip",
                 self.node_id,
                 updates.len()
             );
-        } // Drop the lock here
+        } // RefMut dropped here
 
         // Propagate to random peers if propagation_factor > 0
         if propagation_factor > 0 {
@@ -387,12 +522,10 @@ impl GossipController {
         &self,
         missing_keys: Option<Vec<String>>,
     ) -> Result<Vec<DistributedBucketExternal>> {
-        let limiter = self.rate_limiter.lock().map_err(|e| {
-            tracing::error!("Failed to acquire rate_limiter lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire rate_limiter lock".to_string(),
-            )
-        })?;
+        let limiter = self
+            .named_rate_limiters
+            .get("<_default>")
+            .ok_or_else(|| ColibriError::Api("Default rate limiter not found".to_string()))?;
 
         if let Some(_keys) = missing_keys {
             // For now, return all delta state since we don't have per-key lookup
@@ -420,10 +553,10 @@ impl GossipController {
 
     /// Log current statistics about the gossip node state for debugging
     pub async fn log_stats(&self) {
-        let bucket_count = match self.rate_limiter.lock() {
-            Ok(limiter) => limiter.len(),
-            Err(e) => {
-                error!("Failed to acquire rate_limiter lock: {}", e);
+        let bucket_count = match self.named_rate_limiters.get("<_default>") {
+            Some(limiter) => limiter.len(),
+            None => {
+                error!("Failed to get default limiter");
                 0
             }
         };
@@ -478,16 +611,15 @@ impl GossipController {
             self.send_gossip_packet(packet).await?;
         } else {
             // Send heartbeat if no updates to share
-            let vclock = self
-                .rate_limiter
-                .lock()
-                .map_err(|e| {
-                    tracing::error!("Failed to acquire rate_limiter lock: {}", e);
+            let vclock = {
+                let limiter = self.named_rate_limiters.get("<_default>").ok_or_else(|| {
+                    tracing::error!("Failed to get default limiter");
                     crate::error::ColibriError::Concurrency(
-                        "Failed to acquire rate_limiter lock".to_string(),
+                        "Failed to get default limiter".to_string(),
                     )
-                })?
-                .get_latest_updated_vclock();
+                })?;
+                limiter.get_latest_updated_vclock()
+            }; // Ref dropped here
 
             let message = GossipMessage::Heartbeat {
                 node_id: self.node_id,
@@ -508,12 +640,10 @@ impl GossipController {
 
     /// Collect buckets that have been updated and should be gossiped
     pub async fn collect_gossip_updates(&self) -> Result<Vec<DistributedBucketExternal>> {
-        let rl = self.rate_limiter.lock().map_err(|e| {
-            tracing::error!("Failed to acquire rate_limiter lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire rate_limiter lock".to_string(),
-            )
-        })?;
+        let rl = self
+            .named_rate_limiters
+            .get("<_default>")
+            .ok_or_else(|| ColibriError::Api("Default rate limiter not found".to_string()))?;
         Ok(rl.gossip_delta_state())
     }
 
@@ -793,13 +923,13 @@ impl GossipController {
             node_id,
             entries.len()
         );
-        match self.rate_limiter.lock() {
+        match self.get_limiter_mut(None) {
             Ok(mut limiter) => {
                 limiter.accept_delta_state(entries);
                 debug!("[{}] merge_gossip_state_static completed", node_id);
             }
             Err(e) => {
-                error!("[{}] Failed to acquire rate_limiter lock: {}", node_id, e);
+                error!("[{}] Failed to get default limiter: {}", node_id, e);
             }
         }
     }
@@ -810,33 +940,30 @@ impl GossipController {
         rule_name: String,
         settings: settings::RateLimitSettings,
     ) -> Result<()> {
-        // first check if already exists
+        // Validate rule name
+        if rule_name.is_empty() {
+            warn!(
+                "[{}] Received gossip request to create rule with empty name, ignoring",
+                self.node_id
+            );
+            return Ok(());
+        }
+
+        // Translate "default" to internal key "<_default>"
+        let internal_key = if rule_name == "default" {
+            "<_default>".to_string()
+        } else {
+            rule_name.clone()
+        };
+
+        // Check if already exists
         if self.get_named_rule_local(&rule_name).await?.is_some() {
             return Ok(());
         }
 
-        let mut config = self.rate_limit_config.lock().map_err(|e| {
-            tracing::error!("Failed to acquire rate_limit_config lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire rate_limit_config lock".to_string(),
-            )
-        })?;
-        let rule = NamedRateLimitRule {
-            name: rule_name.clone(),
-            settings: settings.clone(),
-        };
-        config.add_named_rule(&rule);
-
-        // Create the rate limiter for this rule
-        let mut limiters = self.named_rate_limiters.lock().map_err(|e| {
-            tracing::error!("Failed to acquire named_rate_limiters lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire named_rate_limiters lock".to_string(),
-            )
-        })?;
-
+        // Create the rate limiter for this rule and insert into DashMap
         let rate_limiter = DistributedBucketLimiter::new(self.node_id, settings);
-        limiters.insert(rule_name, rate_limiter);
+        self.named_rate_limiters.insert(internal_key, rate_limiter);
 
         Ok(())
     }
@@ -845,40 +972,35 @@ impl GossipController {
         &self,
         rule_name: &str,
     ) -> Result<Option<NamedRateLimitRule>> {
-        let rlconf = self.rate_limit_config.lock().map_err(|e| {
-            tracing::error!("Failed to acquire rate_limit_config lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire rate_limit_config lock".to_string(),
-            )
-        })?;
-        Ok(rlconf
-            .get_named_rule_settings(rule_name)
-            .cloned()
-            .map(|rl_settings| NamedRateLimitRule {
+        // Translate "default" to internal key "<_default>"
+        let internal_key = if rule_name == "default" {
+            "<_default>".to_string()
+        } else {
+            rule_name.to_string()
+        };
+
+        if let Some(limiter_ref) = self.named_rate_limiters.get(&internal_key) {
+            let settings = limiter_ref.get_settings().clone();
+
+            return Ok(Some(NamedRateLimitRule {
                 name: rule_name.to_string(),
-                settings: rl_settings,
-            }))
+                settings,
+            }));
+        }
+
+        Ok(None)
     }
 
     /// Delete a named rate limit rule locally (without gossiping)
     pub async fn delete_named_rule_local(&self, rule_name: String) -> Result<()> {
-        let mut config = self.rate_limit_config.lock().map_err(|e| {
-            tracing::error!("Failed to acquire rate_limit_config lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire rate_limit_config lock".to_string(),
-            )
-        })?;
+        // Don't allow deleting the default rule
+        if rule_name == "default" || rule_name == "<_default>" {
+            return Err(ColibriError::Api(
+                "Cannot delete the default rule".to_string(),
+            ));
+        }
 
-        if config.remove_named_rule(&rule_name).is_some() {
-            // Remove the rate limiter for this rule
-            let mut limiters = self.named_rate_limiters.lock().map_err(|e| {
-                tracing::error!("Failed to acquire named_rate_limiters lock: {}", e);
-                crate::error::ColibriError::Concurrency(
-                    "Failed to acquire named_rate_limiters lock".to_string(),
-                )
-            })?;
-
-            limiters.remove(&rule_name);
+        if self.named_rate_limiters.remove(&rule_name).is_some() {
             Ok(())
         } else {
             Err(ColibriError::Api(format!("Rule '{}' not found", rule_name)))
@@ -887,14 +1009,26 @@ impl GossipController {
 
     /// List all named rate limit rules locally
     pub async fn list_named_rules_local(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let config = self.rate_limit_config.lock().map_err(|e| {
-            tracing::error!("Failed to acquire rate_limit_config lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire rate_limit_config lock".to_string(),
-            )
-        })?;
+        let mut rules = Vec::new();
 
-        Ok(config.list_named_rules())
+        for entry in self.named_rate_limiters.iter() {
+            let name = entry.key();
+            let limiter = entry.value();
+
+            // Translate internal "<_default>" key to user-facing "default"
+            let user_facing_name = if name == "<_default>" {
+                "default".to_string()
+            } else {
+                name.clone()
+            };
+
+            rules.push(NamedRateLimitRule {
+                name: user_facing_name,
+                settings: limiter.get_settings().clone(),
+            });
+        }
+
+        Ok(rules)
     }
 
     /// Apply rate limiting using a custom named rule locally
@@ -903,30 +1037,18 @@ impl GossipController {
         rule_name: String,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
-        let mut limiters = self.named_rate_limiters.lock().map_err(|e| {
-            tracing::error!("Failed to acquire named_rate_limiters lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire named_rate_limiters lock".to_string(),
-            )
-        })?;
+        let mut limiter = self.get_limiter_mut(Some(rule_name.clone()))?;
 
-        if let Some(rate_limiter) = limiters.get_mut(&rule_name) {
-            let calls_left = rate_limiter.limit_calls_for_client(key.clone());
-            calls_left
-                .map(|calls_remaining| {
-                    Ok(Some(CheckCallsResponse {
-                        client_id: key,
-                        calls_remaining,
-                        rule_name: Some(rule_name),
-                    }))
-                })
-                .unwrap_or_else(|| Ok(None))
-        } else {
-            Err(ColibriError::Api(format!(
-                "Rate limit rule '{}' not found",
-                rule_name
-            )))
-        }
+        let calls_left = limiter.limit_calls_for_client(key.clone());
+        calls_left
+            .map(|calls_remaining| {
+                Ok(Some(CheckCallsResponse {
+                    client_id: key,
+                    calls_remaining,
+                    rule_name: Some(rule_name),
+                }))
+            })
+            .unwrap_or_else(|| Ok(None))
     }
 
     /// Check remaining calls using a custom named rule locally
@@ -935,26 +1057,17 @@ impl GossipController {
         rule_name: String,
         key: String,
     ) -> Result<CheckCallsResponse> {
-        let limiters = self.named_rate_limiters.lock().map_err(|e| {
-            tracing::error!("Failed to acquire named_rate_limiters lock: {}", e);
-            crate::error::ColibriError::Concurrency(
-                "Failed to acquire named_rate_limiters lock".to_string(),
-            )
+        let rule_key = rule_name.clone();
+        let limiter = self.named_rate_limiters.get(&rule_key).ok_or_else(|| {
+            ColibriError::Api(format!("Rate limit rule '{}' not found", rule_key))
         })?;
 
-        if let Some(rate_limiter) = limiters.get(&rule_name) {
-            let calls_remaining = rate_limiter.check_calls_remaining_for_client(&key);
-            Ok(CheckCallsResponse {
-                client_id: key,
-                calls_remaining,
-                rule_name: Some(rule_name),
-            })
-        } else {
-            Err(ColibriError::Api(format!(
-                "Rate limit rule '{}' not found",
-                rule_name
-            )))
-        }
+        let calls_remaining = limiter.check_calls_remaining_for_client(&key);
+        Ok(CheckCallsResponse {
+            client_id: key,
+            calls_remaining,
+            rule_name: Some(rule_name),
+        })
     }
 }
 

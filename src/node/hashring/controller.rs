@@ -27,8 +27,8 @@ pub struct HashringController {
     number_of_buckets: u32,
     topology: Arc<RwLock<ClusterTopology>>,
     transport: Arc<TcpTransport>,
-    /// Lock-free concurrent HashMap for rate limiters
-    pub named_rate_limiters: Arc<DashMap<String, Arc<Mutex<TokenBucketLimiter>>>>,
+    /// Lock-free concurrent HashMap for rate limiters (DashMap provides interior mutability)
+    pub named_rate_limiters: DashMap<String, TokenBucketLimiter>,
     /// Receiver address for logging
     receiver_addr: SocketAddr,
     /// Receiver for incoming TCP messages
@@ -72,14 +72,11 @@ impl HashringController {
         let bucket =
             consistent_hashing::jump_consistent_hash(node_name.as_str(), number_of_buckets);
 
-        // Initialize DashMap with default limiter
+        // Initialize DashMap with default limiter (DashMap provides interior mutability)
         let named_rate_limiters = DashMap::new();
         let rate_limit_settings = settings.rate_limit_settings();
         let default_limiter = TokenBucketLimiter::new(rate_limit_settings.clone());
-        named_rate_limiters.insert(
-            "<_default>".to_string(),
-            Arc::new(Mutex::new(default_limiter)),
-        );
+        named_rate_limiters.insert("<_default>".to_string(), default_limiter);
 
         let transport_config = settings.transport_config();
         let transport = TcpTransport::new(&transport_config).await?;
@@ -98,7 +95,7 @@ impl HashringController {
             number_of_buckets,
             topology: Arc::new(RwLock::new(cluster_topology)),
             transport: Arc::new(transport),
-            named_rate_limiters: Arc::new(named_rate_limiters),
+            named_rate_limiters,
             receiver_addr,
             receiver: Arc::new(receiver),
             receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
@@ -141,6 +138,18 @@ impl HashringController {
             info!("Hashring TCP receiver started on {}", receiver_addr);
 
             while let Some(request) = receive_chan.recv().await {
+                // Hashring mode only supports request-response protocol
+                let response_tx = match request.response_tx {
+                    Some(tx) => tx,
+                    None => {
+                        warn!(
+                            "Received fire-and-forget message in hashring mode from {}, ignoring",
+                            request.peer_addr
+                        );
+                        continue;
+                    }
+                };
+
                 // Deserialize incoming message
                 match Message::deserialize(&request.data) {
                     Ok(message) => {
@@ -157,8 +166,8 @@ impl HashringController {
                         match response.serialize() {
                             Ok(response_data) => {
                                 let response_vec = response_data.to_vec();
-                                if request.response_tx.send(response_vec).is_err() {
-                                    error!("Failed to send response back to peer");
+                                if response_tx.send(response_vec).is_err() {
+                                    warn!("Failed to send response back to peer (channel closed)");
                                 }
                             }
                             Err(e) => {
@@ -199,14 +208,17 @@ impl HashringController {
         }
     }
 
-    /// Get rate limiter for a given rule name (or default if None)
-    fn get_limiter(&self, rule_name: Option<String>) -> Result<Arc<Mutex<TokenBucketLimiter>>> {
+    /// Get mutable reference to rate limiter for a given rule name (or default if None)
+    /// Uses DashMap's interior mutability via get_mut() for lock-free access
+    fn get_limiter_mut(
+        &self,
+        rule_name: Option<String>,
+    ) -> Result<dashmap::mapref::one::RefMut<'_, String, TokenBucketLimiter>> {
         let rule_name = rule_name.unwrap_or_else(|| "<_default>".to_string());
 
-        // DashMap provides lock-free concurrent access
+        // DashMap provides lock-free mutable access via RefMut
         self.named_rate_limiters
-            .get(&rule_name)
-            .map(|entry| Arc::clone(entry.value()))
+            .get_mut(&rule_name)
             .ok_or_else(|| ColibriError::Api(format!("Rate limit rule '{}' not found", rule_name)))
     }
 
@@ -288,11 +300,8 @@ impl HashringController {
             }
         }
 
-        // Get the appropriate limiter (default or named rule)
-        let limiter_arc = self.get_limiter(request.rule_name.clone())?;
-        let mut limiter = limiter_arc
-            .lock()
-            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+        // Get the appropriate limiter (default or named rule) using DashMap's interior mutability
+        let mut limiter = self.get_limiter_mut(request.rule_name.clone())?;
 
         let calls_remaining = if request.consume_token {
             limiter.limit_calls_for_client(request.client_id.clone())
@@ -377,14 +386,25 @@ impl HashringController {
         rule_name: String,
         settings: RateLimitSettings,
     ) -> Result<()> {
+        // Validate rule name
+        if rule_name.is_empty() {
+            return Err(ColibriError::Api("Rule name cannot be empty".to_string()));
+        }
+
+        // Don't allow creating/overwriting the default rule
+        if rule_name == "default" || rule_name == "<_default>" {
+            return Err(ColibriError::Api(
+                "Cannot create or modify the default rule".to_string(),
+            ));
+        }
+
         // Only create if it doesn't already exist
         if self.named_rate_limiters.contains_key(&rule_name) {
             return Ok(());
         }
 
         let limiter = TokenBucketLimiter::new(settings.clone());
-        self.named_rate_limiters
-            .insert(rule_name.clone(), Arc::new(Mutex::new(limiter)));
+        self.named_rate_limiters.insert(rule_name.clone(), limiter);
         tracing::info!("Created named rule '{}' in hashring node", rule_name);
         Ok(())
     }
@@ -406,12 +426,9 @@ impl HashringController {
             rule_name.clone()
         };
 
-        // Use DashMap - no lock needed
-        if let Some(limiter_arc) = self.named_rate_limiters.get(&internal_key) {
-            let limiter = limiter_arc
-                .lock()
-                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-            let settings = limiter.get_settings().clone();
+        // Use DashMap's immutable Ref - no external lock needed
+        if let Some(limiter_ref) = self.named_rate_limiters.get(&internal_key) {
+            let settings = limiter_ref.get_settings().clone();
 
             return Ok(Some(NamedRateLimitRule {
                 name: rule_name, // Return user-facing name "default", not internal "<_default>"
@@ -425,13 +442,10 @@ impl HashringController {
     async fn list_rate_limit_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
         let mut rules = Vec::new();
 
-        // DashMap iter doesn't require lock
+        // DashMap iter returns immutable Refs - no external lock needed
         for entry in self.named_rate_limiters.iter() {
             let name = entry.key();
-            let limiter_arc = entry.value();
-            let limiter = limiter_arc
-                .lock()
-                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            let limiter = entry.value();
 
             // Translate internal "<_default>" key to user-facing "default"
             let user_facing_name = if name == "<_default>" {

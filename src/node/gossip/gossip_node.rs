@@ -1,7 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use super::GossipController;
 use crate::error::{ColibriError, Result};
@@ -20,24 +20,14 @@ pub struct GossipNode {
     /// Node name
     pub node_name: NodeName,
 
-    /// Controller - handles all operations via handle_message()
+    /// Controller - handles all operations via handle_message() and TCP communication
     pub controller: Arc<GossipController>,
-
-    /// Receiver handler
-    pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl GossipNode {
     /// Stop the gossip receiver task
     pub fn stop_receiver(&self) {
-        if let Ok(mut handle) = self.receiver_handle.lock() {
-            if let Some(join_handle) = handle.take() {
-                join_handle.abort();
-                info!("Gossip receiver task stopped");
-            }
-        } else {
-            error!("Failed to acquire lock on receiver_handle during shutdown");
-        }
+        self.controller.stop_receiver();
     }
 
     /// Stop all background tasks
@@ -48,12 +38,8 @@ impl GossipNode {
 
 impl Drop for GossipNode {
     fn drop(&mut self) {
-        // Clean up tasks when the node is dropped
-        if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
-            if let Some(handle) = receiver_handle.take() {
-                handle.abort();
-            }
-        }
+        // Clean up tasks via controller when the node is dropped
+        self.controller.stop_receiver();
     }
 }
 
@@ -91,41 +77,12 @@ impl Node for GossipNode {
             controller_clone.start().await;
         });
 
-        // Start TCP receiver to handle incoming cluster messages
-        let receiver_addr = settings.transport_config().peer_listen_url();
-        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1000);
-
-        let receiver =
-            crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
-        receiver.start().await;
-
-        // Spawn task to process incoming messages
-        let controller_for_receiver = controller.clone();
-        let receiver_handle = tokio::spawn(async move {
-            info!("Gossip TCP receiver started on {}", receiver_addr);
-            while let Some(request) = message_rx.recv().await {
-                // Deserialize and process message
-                match crate::node::messages::Message::deserialize(&request.data) {
-                    Ok(message) => {
-                        if let Err(e) = controller_for_receiver.handle_message(message).await {
-                            error!("Error handling message: {}", e);
-                        }
-                        // Gossip is fire-and-forget, send empty ack
-                        let _ = request.response_tx.send(vec![]);
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize message: {}", e);
-                        // Still send empty response to avoid blocking sender
-                        let _ = request.response_tx.send(vec![]);
-                    }
-                }
-            }
-        });
+        // Start the controller's TCP receiver
+        controller.start_receiver().await?;
 
         Ok(Self {
             node_name,
             controller,
-            receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })
     }
 
@@ -355,7 +312,7 @@ mod tests {
         // Should create successfully
         let node = GossipNode::new(settings).await.unwrap();
         // Controller is Arc so just verify it's set up
-        assert!(node.receiver_handle.lock().unwrap().is_some());
+        assert!(node.controller.receiver_handle.lock().unwrap().is_some());
     }
 
     #[tokio::test]
@@ -424,10 +381,10 @@ mod tests {
 
         // Verify controller and receiver are initialized
         // Controller is Arc so just check it's not null by trying to use it
-        assert!(node.receiver_handle.lock().unwrap().is_some());
+        assert!(node.controller.receiver_handle.lock().unwrap().is_some());
 
         // Test stop_all_tasks method
         node.stop_all_tasks();
-        assert!(node.receiver_handle.lock().unwrap().is_none());
+        assert!(node.controller.receiver_handle.lock().unwrap().is_none());
     }
 }

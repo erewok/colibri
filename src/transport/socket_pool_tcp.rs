@@ -13,6 +13,7 @@ use tokio::time::timeout;
 use tracing::{debug, error};
 
 use super::stats::SocketPoolStats;
+use super::tcp_receiver::ProtocolType;
 use crate::error::{ColibriError, Result};
 use crate::node::NodeId;
 use crate::settings::TransportConfig;
@@ -58,6 +59,35 @@ impl TcpSocketPool {
             .ok_or_else(|| ColibriError::Transport(format!("Peer not found: {:?}", target)))?;
 
         let mut connection = self.get_or_create_connection(target, *peer_addr).await?;
+
+        // Write protocol type byte first
+        match timeout(self.connection_timeout, async {
+            use tokio::io::AsyncWriteExt;
+            connection
+                .write_all(&[ProtocolType::RequestResponse.to_byte()])
+                .await?;
+            Result::<()>::Ok(())
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                self.stats
+                    .errors
+                    .send_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+            Err(_) => {
+                self.stats
+                    .errors
+                    .timeout_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(ColibriError::Transport(
+                    "Protocol byte write timeout".to_string(),
+                ));
+            }
+        }
 
         // Send request with length prefix
         let request_len = request_data.len() as u32;
@@ -245,5 +275,91 @@ impl TcpSocketPool {
     /// Get socket pool statistics
     pub fn get_stats(&self) -> &SocketPoolStats {
         &self.stats
+    }
+
+    /// Send data to a peer without waiting for response (fire-and-forget)
+    pub async fn send_fire_and_forget(&self, target: NodeId, data: &[u8]) -> Result<()> {
+        let peer_addr = self
+            .get_peer_address(target)
+            .ok_or_else(|| ColibriError::Transport(format!("Peer not found: {:?}", target)))?;
+
+        // Connect to peer
+        let mut stream = match timeout(
+            self.connection_timeout,
+            tokio::net::TcpStream::connect(peer_addr),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                debug!(
+                    "Created fire-and-forget connection to {:?} at {}",
+                    target, peer_addr
+                );
+                stream
+            }
+            Ok(Err(e)) => {
+                error!("Failed to connect to {:?} at {}: {}", target, peer_addr, e);
+                self.stats
+                    .errors
+                    .send_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(ColibriError::Transport(format!("Connection failed: {}", e)));
+            }
+            Err(_) => {
+                self.stats
+                    .errors
+                    .timeout_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(ColibriError::Transport("Connection timeout".to_string()));
+            }
+        };
+
+        // Send protocol type byte (Gossip = fire-and-forget)
+        use tokio::io::AsyncWriteExt;
+        stream
+            .write_all(&[ProtocolType::Gossip.to_byte()])
+            .await
+            .map_err(|e| {
+                self.stats
+                    .errors
+                    .send_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                ColibriError::Transport(format!("Failed to write protocol byte: {}", e))
+            })?;
+
+        // Send length prefix
+        let len = data.len() as u32;
+        stream.write_all(&len.to_be_bytes()).await.map_err(|e| {
+            self.stats
+                .errors
+                .send_errors
+                .fetch_add(1, Ordering::Relaxed);
+            ColibriError::Transport(format!("Failed to write length: {}", e))
+        })?;
+
+        // Send data
+        stream.write_all(data).await.map_err(|e| {
+            self.stats
+                .errors
+                .send_errors
+                .fetch_add(1, Ordering::Relaxed);
+            ColibriError::Transport(format!("Failed to write data: {}", e))
+        })?;
+
+        stream.flush().await.map_err(|e| {
+            self.stats
+                .errors
+                .send_errors
+                .fetch_add(1, Ordering::Relaxed);
+            ColibriError::Transport(format!("Failed to flush: {}", e))
+        })?;
+
+        self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+        debug!("Successfully sent fire-and-forget message to {:?}", target);
+
+        // Close connection immediately (fire-and-forget)
+        drop(stream);
+
+        Ok(())
     }
 }

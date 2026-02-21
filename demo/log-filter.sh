@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Log filter to show only key rate limiting validation messages
 # Usage: ./your-demo-script.sh 2>&1 | ./demo/log-filter.sh

@@ -1,4 +1,4 @@
-#!/bin/bash -eu
+#!/usr/bin/env bash
 export mode="single"
 export max_calls=5
 export interval_seconds=3

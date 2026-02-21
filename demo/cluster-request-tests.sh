@@ -1,4 +1,4 @@
-#!/bin/bash -eu
+#!/usr/bin/env bash
 echo -e "\nSending test requests to nodes:"
 res1=$(curl -iX POST http://localhost:8001/rl/test-client)
 echo -e "\nResponse: $res1\n"

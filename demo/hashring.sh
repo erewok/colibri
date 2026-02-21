@@ -1,4 +1,4 @@
-#!/bin/bash -eu
+#!/usr/bin/env bash
 export RUST_LOG=info
 export mode="hashring"
 export max_calls=5

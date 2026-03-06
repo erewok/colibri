@@ -8,7 +8,7 @@ use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
 use crate::limiters::distributed_bucket::DistributedBucketExternal;
-use crate::limiters::NamedRateLimitRule;
+use crate::limiters::{RuleList, RuleName, SerializableRule};
 use crate::node::NodeId;
 
 /// Gossip message types for production delta-state protocol
@@ -48,28 +48,27 @@ pub enum GossipMessage {
     RateLimitConfigCreate {
         response_addr: SocketAddr,
         sender_node_id: NodeId,
-        rule_name: String,
-        settings: crate::settings::RateLimitSettings,
+        rule: SerializableRule,
         timestamp: u64,
     },
 
     RateLimitConfigDelete {
         response_addr: SocketAddr,
         sender_node_id: NodeId,
-        rule_name: String,
+        rule_name: RuleName,
         timestamp: u64,
     },
 
     RateLimitConfigRequest {
         response_addr: SocketAddr,
         requesting_node_id: NodeId,
-        rule_name: Option<String>, // None = request all rules
+        rule_name: Option<RuleName>, // None = request all rules
     },
 
     RateLimitConfigResponse {
         response_addr: SocketAddr,
         responding_node_id: NodeId,
-        rules: Vec<NamedRateLimitRule>,
+        rules: RuleList,
     },
 }
 

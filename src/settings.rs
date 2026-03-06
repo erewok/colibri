@@ -16,7 +16,7 @@ pub const DEFAULT_PORT_HTTP: &str = "8411";
 pub const STANDARD_PORT_PEERS: u16 = 8412;
 pub const DEFAULT_PORT_PEERS: &str = "8412";
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash, PartialOrd, Ord)]
 pub struct RateLimitSettings {
     pub rate_limit_max_calls_allowed: u32,
     pub rate_limit_interval_seconds: u32,
@@ -96,14 +96,6 @@ impl RateLimitSettings {
 
 /// Single source of truth for cluster membership.
 /// Maintains name-to-address mapping and provides bucket assignment operations.
-///
-/// This replaces the multiple topology representations that previously existed:
-/// - Settings.topology (HashMap<String, String>)
-/// - TransportConfig.topology (IndexMap<NodeId, SocketAddr>)
-/// - ClusterNodes.nodes (HashSet<SocketAddr>)
-///
-/// Design: Uses IndexMap to preserve insertion order for deterministic iteration,
-/// which is critical for consistent bucket assignment across all nodes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterTopology {
     /// This node's name

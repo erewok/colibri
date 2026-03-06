@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use dashmap::DashMap;
+use papaya::HashMap;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, warn};

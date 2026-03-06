@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use super::HashringController;
 use crate::error::{ColibriError, Result};
-use crate::limiters::NamedRateLimitRule;
+use crate::limiters::{RuleList, RuleName, SerializableRule};
 use crate::node::messages::{
     BucketExport, CheckCallsRequest, CheckCallsResponse, ExportMetadata, Message, StatusResponse,
     TopologyChangeRequest, TopologyResponse,
@@ -133,13 +133,9 @@ impl Node for HashringNode {
 
     async fn create_named_rule(
         &self,
-        rule_name: String,
-        settings: settings::RateLimitSettings,
+        rule: SerializableRule,
     ) -> Result<()> {
-        let message = Message::CreateRateLimitRule {
-            rule_name,
-            settings,
-        };
+        let message = Message::CreateRateLimitRule(rule);
         match self.controller.handle_message(message).await? {
             Message::CreateRateLimitRuleResponse => Ok(()),
             _ => Err(ColibriError::Api(
@@ -148,7 +144,7 @@ impl Node for HashringNode {
         }
     }
 
-    async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
+    async fn delete_named_rule(&self, rule_name: RuleName) -> Result<()> {
         let message = Message::DeleteRateLimitRule { rule_name };
         match self.controller.handle_message(message).await? {
             Message::DeleteRateLimitRuleResponse => Ok(()),
@@ -158,7 +154,7 @@ impl Node for HashringNode {
         }
     }
 
-    async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
+    async fn list_named_rules(&self) -> Result<RuleList> {
         let message = Message::ListRateLimitRules;
         match self.controller.handle_message(message).await? {
             Message::ListRateLimitRulesResponse(rules) => Ok(rules),
@@ -168,7 +164,7 @@ impl Node for HashringNode {
         }
     }
 
-    async fn get_named_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
+    async fn get_named_rule(&self, rule_name: RuleName) -> Result<Option<SerializableRule>> {
         let message = Message::GetRateLimitRule { rule_name };
         match self.controller.handle_message(message).await? {
             Message::GetRateLimitRuleResponse(rule) => Ok(rule),
@@ -180,7 +176,7 @@ impl Node for HashringNode {
 
     async fn rate_limit_custom(
         &self,
-        rule_name: String,
+        rule_name: RuleName,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
         let request = CheckCallsRequest {
@@ -207,7 +203,7 @@ impl Node for HashringNode {
 
     async fn check_limit_custom(
         &self,
-        rule_name: String,
+        rule_name: RuleName,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
         let request = CheckCallsRequest {

@@ -1,19 +1,20 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use dashmap::DashMap;
+use papaya::HashMap;
 use tokio::sync::mpsc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{NamedRateLimitRule, TokenBucketLimiter};
+use crate::limiters::rules::{self, RuleName, SerializableRule};
+use crate::limiters::TokenBucketLimiter;
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, Message, Queueable, Status, StatusResponse,
     TopologyResponse,
 };
 use crate::node::{NodeAddress, NodeName};
-use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
+use crate::settings::{self, ClusterTopology, RunMode};
 use crate::transport::traits::Sender;
 use crate::transport::{tcp_receiver::TcpRequest, TcpReceiver, TcpTransport};
 
@@ -27,8 +28,8 @@ pub struct HashringController {
     number_of_buckets: u32,
     topology: Arc<RwLock<ClusterTopology>>,
     transport: Arc<TcpTransport>,
-    /// Lock-free concurrent HashMap for rate limiters (DashMap provides interior mutability)
-    pub named_rate_limiters: DashMap<String, TokenBucketLimiter>,
+    /// Concurrent HashMap for rate limiters (papaya provides lock-free reads)
+    pub named_rate_limiters: HashMap<String, Arc<Mutex<TokenBucketLimiter>>>,
     /// Receiver address for logging
     receiver_addr: SocketAddr,
     /// Receiver for incoming TCP messages
@@ -72,11 +73,11 @@ impl HashringController {
         let bucket =
             consistent_hashing::jump_consistent_hash(node_name.as_str(), number_of_buckets);
 
-        // Initialize DashMap with default limiter (DashMap provides interior mutability)
-        let named_rate_limiters = DashMap::new();
+        // Initialize HashMap with default limiter
+        let named_rate_limiters = HashMap::new();
         let rate_limit_settings = settings.rate_limit_settings();
-        let default_limiter = TokenBucketLimiter::new(rate_limit_settings.clone());
-        named_rate_limiters.insert("<_default>".to_string(), default_limiter);
+        let default_limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(rate_limit_settings.clone())));
+        named_rate_limiters.pin().insert("<_default>".to_string(), default_limiter);
 
         let transport_config = settings.transport_config();
         let transport = TcpTransport::new(&transport_config).await?;
@@ -209,17 +210,26 @@ impl HashringController {
     }
 
     /// Get mutable reference to rate limiter for a given rule name (or default if None)
-    /// Uses DashMap's interior mutability via get_mut() for lock-free access
-    fn get_limiter_mut(
+    fn with_limiter_mut<F, R>(
         &self,
-        rule_name: Option<String>,
-    ) -> Result<dashmap::mapref::one::RefMut<'_, String, TokenBucketLimiter>> {
-        let rule_name = rule_name.unwrap_or_else(|| "<_default>".to_string());
+        rule_name: Option<&RuleName>,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut TokenBucketLimiter) -> R,
+    {
+        let key = rule_name
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_else(|| "<_default>".to_string());
 
-        // DashMap provides lock-free mutable access via RefMut
-        self.named_rate_limiters
-            .get_mut(&rule_name)
-            .ok_or_else(|| ColibriError::Api(format!("Rate limit rule '{}' not found", rule_name)))
+        let guard = self.named_rate_limiters.pin();
+        let limiter_mutex = guard
+            .get(&key)
+            .ok_or_else(|| ColibriError::Api(format!("Rate limit rule '{}' not found", key)))?;
+        let mut limiter = limiter_mutex.lock().map_err(|e| {
+            ColibriError::Concurrency(format!("Failed to acquire limiter lock: {}", e))
+        })?;
+        Ok(f(&mut limiter))
     }
 
     fn owns_bucket_for_client(&self, client_id: &str) -> bool {
@@ -300,14 +310,14 @@ impl HashringController {
             }
         }
 
-        // Get the appropriate limiter (default or named rule) using DashMap's interior mutability
-        let mut limiter = self.get_limiter_mut(request.rule_name.clone())?;
-
-        let calls_remaining = if request.consume_token {
-            limiter.limit_calls_for_client(request.client_id.clone())
-        } else {
-            Some(limiter.check_calls_remaining_for_client(&request.client_id))
-        };
+        // Get the appropriate limiter (default or named rule)
+        let calls_remaining = self.with_limiter_mut(request.rule_name.as_ref(), |limiter| {
+            if request.consume_token {
+                limiter.limit_calls_for_client(request.client_id.clone())
+            } else {
+                Some(limiter.check_calls_remaining_for_client(&request.client_id))
+            }
+        })?;
 
         Ok(CheckCallsResponse {
             client_id: request.client_id,
@@ -383,55 +393,53 @@ impl HashringController {
 
     async fn create_rate_limit_rule(
         &self,
-        rule_name: String,
-        settings: RateLimitSettings,
+        rule: SerializableRule,
     ) -> Result<()> {
+        let rule_name_str = rule.name.as_str().to_string();
         // Validate rule name
-        if rule_name.is_empty() {
+        if rule_name_str.is_empty() {
             return Err(ColibriError::Api("Rule name cannot be empty".to_string()));
         }
 
         // Don't allow creating/overwriting the default rule
-        if rule_name == "default" || rule_name == "<_default>" {
+        if rule_name_str == "default" || rule_name_str == "<_default>" {
             return Err(ColibriError::Api(
                 "Cannot create or modify the default rule".to_string(),
             ));
         }
 
         // Only create if it doesn't already exist
-        if self.named_rate_limiters.contains_key(&rule_name) {
+        if self.named_rate_limiters.pin().contains_key(&rule_name_str) {
             return Ok(());
         }
 
-        let limiter = TokenBucketLimiter::new(settings.clone());
-        self.named_rate_limiters.insert(rule_name.clone(), limiter);
-        tracing::info!("Created named rule '{}' in hashring node", rule_name);
+        let limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(rule.settings)));
+        self.named_rate_limiters.pin().insert(rule_name_str.clone(), limiter);
+        tracing::info!("Created named rule '{}' in hashring node", rule_name_str);
         Ok(())
     }
 
-    async fn delete_rate_limit_rule(&self, rule_name: String) -> Result<()> {
-        if self.named_rate_limiters.remove(&rule_name).is_some() {
-            tracing::info!("Deleted named rule '{}' from hashring node", rule_name);
+    async fn delete_rate_limit_rule(&self, rule_name: RuleName) -> Result<()> {
+        let key = rule_name.as_str().to_string();
+        if self.named_rate_limiters.pin().remove(&key).is_some() {
+            tracing::info!("Deleted named rule '{}' from hashring node", key);
         } else {
-            tracing::warn!("Attempted to delete non-existent rule '{}'", rule_name);
+            tracing::warn!("Attempted to delete non-existent rule '{}'", key);
         }
         Ok(())
     }
 
-    async fn get_rate_limit_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
-        // Translate "default" to internal key "<_default>"
-        let internal_key = if rule_name == "default" {
-            "<_default>".to_string()
-        } else {
-            rule_name.clone()
-        };
+    async fn get_rate_limit_rule(&self, rule_name: RuleName) -> Result<Option<SerializableRule>> {
+        let key = rule_name.as_str().to_string();
 
-        // Use DashMap's immutable Ref - no external lock needed
-        if let Some(limiter_ref) = self.named_rate_limiters.get(&internal_key) {
-            let settings = limiter_ref.get_settings().clone();
-
-            return Ok(Some(NamedRateLimitRule {
-                name: rule_name, // Return user-facing name "default", not internal "<_default>"
+        let guard = self.named_rate_limiters.pin();
+        if let Some(limiter_mutex) = guard.get(&key) {
+            let limiter = limiter_mutex.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiter lock: {}", e))
+            })?;
+            let settings = limiter.get_settings().clone();
+            return Ok(Some(SerializableRule {
+                name: rule_name,
                 settings,
             }));
         }
@@ -439,28 +447,21 @@ impl HashringController {
         Ok(None)
     }
 
-    async fn list_rate_limit_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let mut rules = Vec::new();
+    async fn list_rate_limit_rules(&self) -> Result<rules::RuleList> {
+        let mut rule_list = Vec::new();
 
-        // DashMap iter returns immutable Refs - no external lock needed
-        for entry in self.named_rate_limiters.iter() {
-            let name = entry.key();
-            let limiter = entry.value();
-
-            // Translate internal "<_default>" key to user-facing "default"
-            let user_facing_name = if name == "<_default>" {
-                "default".to_string()
-            } else {
-                name.clone()
-            };
-
-            rules.push(NamedRateLimitRule {
-                name: user_facing_name,
+        let guard = self.named_rate_limiters.pin();
+        for (name, limiter_mutex) in guard.iter() {
+            let limiter = limiter_mutex.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiter lock: {}", e))
+            })?;
+            rule_list.push(SerializableRule {
+                name: RuleName::from(name.as_str()),
                 settings: limiter.get_settings().clone(),
             });
         }
 
-        Ok(rules)
+        Ok(rules::RuleList(rule_list))
     }
 
     pub async fn handle_message(&self, message: Message) -> Result<Message> {
@@ -490,21 +491,18 @@ impl HashringController {
                 Ok(Message::Ack)
             }
 
-            Message::CreateRateLimitRule {
-                rule_name,
-                settings,
-            } => {
-                self.create_rate_limit_rule(rule_name, settings).await?;
+            Message::CreateRateLimitRule(rule) => {
+                self.create_rate_limit_rule(rule).await?;
                 Ok(Message::CreateRateLimitRuleResponse)
             }
 
             Message::DeleteRateLimitRule { rule_name } => {
-                self.delete_rate_limit_rule(rule_name).await?;
+                self.delete_rate_limit_rule(rule_name.clone()).await?;
                 Ok(Message::DeleteRateLimitRuleResponse)
             }
 
             Message::GetRateLimitRule { rule_name } => {
-                let rule = self.get_rate_limit_rule(rule_name).await?;
+                let rule = self.get_rate_limit_rule(rule_name.clone()).await?;
                 Ok(Message::GetRateLimitRuleResponse(rule))
             }
 

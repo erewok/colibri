@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::node::NodeId;
 use crate::settings;
-use super::rules::RuleName;
+use super::rules;
 
 
 /// Rate limiter bucket interface
@@ -188,48 +188,7 @@ impl TokenBucketLimiter {
                 None
             }
         }
-    }
-
-    /// Check rate limit and decrement if call is allowed using provided settings
-    /// Returns Some(remaining_tokens) if allowed, None if rate limited
-    pub fn limit_calls_for_client_with_settings(
-        &mut self,
-        key: String,
-        settings: &settings::RateLimitSettings,
-    ) -> Option<u32> {
-        if let Some(bucket) = self.cache.pin().get(&key) {
-            // Update existing bucket with provided settings
-            let mut updated_bucket = bucket.clone();
-            updated_bucket.add_tokens_to_bucket(settings);
-
-            if updated_bucket.check_if_allowed() {
-                // Call is allowed - decrement and update
-                updated_bucket.decrement();
-                let remaining = updated_bucket.tokens_to_u32();
-                self.cache.pin().insert(key, updated_bucket);
-                Some(remaining)
-            } else {
-                // Call not allowed - update bucket state but don't decrement
-                self.cache.pin().insert(key, updated_bucket);
-                None
-            }
-        } else {
-            // Create new bucket - first call is always allowed
-            let mut new_bucket =
-                TokenBucket::new(settings.rate_limit_max_calls_allowed, NodeId::default());
-            // Set tokens to max for the provided settings
-            new_bucket.tokens = f64::from(settings.rate_limit_max_calls_allowed);
-            new_bucket.decrement(); // Use one token
-            let is_allowed = new_bucket.check_if_allowed();
-            let remaining = Some(new_bucket.tokens_to_u32());
-            self.cache.pin().insert(key, new_bucket);
-            if is_allowed {
-                remaining
-            } else {
-                None
-            }
-        }
-    }
+    } 
 
     /// Export all token buckets for cluster migration
     pub fn export_all_buckets(&self) -> std::collections::HashMap<String, TokenBucket> {
@@ -280,14 +239,14 @@ impl TokenBucketLimiter {
 #[derive(Clone, Debug)]
 pub struct TokenBucketRules {
     // rule name -> settings
-    named_rules: HashMap<RuleName, TokenBucketLimiter>,
+    named_rules: HashMap<rules::RuleName, TokenBucketLimiter>,
 }
 
 impl TokenBucketRules {
     pub fn new(default_settings: settings::RateLimitSettings) -> Self {
         let named_rules = HashMap::new();
         named_rules.pin().insert(
-            RuleName::default(),
+            rules::RuleName::from(rules::DEFAULT_RULE_NAME),
             TokenBucketLimiter::new(default_settings),
         );
         Self { named_rules }
@@ -298,22 +257,22 @@ impl TokenBucketRules {
     }
 
     pub fn get_default_limiter<'guard>(&self, guard: &'guard impl Guard) -> Option<&'guard TokenBucketLimiter> {
-        self.named_rules.get(&RuleName::default(), guard)
+        self.named_rules.get(&rules::RuleName::from(rules::DEFAULT_RULE_NAME), guard)
     }
 
     pub fn get_named_rule_limiter<'guard>(&self, rule_name: &str, guard: &'guard impl Guard) -> Option<&'guard TokenBucketLimiter> {
-        self.named_rules.get(&RuleName::from(rule_name), guard)
+        self.named_rules.get(&rules::RuleName::from(rule_name), guard)
     }
 
-    pub fn add_named_rule(&mut self, rule: &RuleName, limiter: TokenBucketLimiter) {
+    pub fn add_named_rule(&mut self, rule: &rules::RuleName, limiter: TokenBucketLimiter) {
         self.named_rules.pin().insert(rule.clone(), limiter);
     }
 
     pub fn remove_named_rule<'guard>(&self, rule_name: &str, guard: &'guard impl Guard) -> Option<&'guard TokenBucketLimiter> {
-        self.named_rules.remove(&RuleName::from(rule_name), guard)
+        self.named_rules.remove(&rules::RuleName::from(rule_name), guard)
     }
 
-    pub fn list_named_rules(&self) -> Vec<RuleName> {
+    pub fn list_named_rules(&self) -> Vec<rules::RuleName> {
         self.named_rules
             .pin()
             .keys()

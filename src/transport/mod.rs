@@ -10,9 +10,12 @@
 use serde::{Deserialize, Serialize};
 
 pub mod socket_pool_tcp;
+pub mod socket_pool_udp;
 pub mod stats;
 pub mod tcp_connection;
+pub mod udp_connection;
 pub mod tcp_receiver;
+pub mod udp_receiver;
 pub mod traits;
 
 // Re-export traits for easy access

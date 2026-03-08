@@ -50,7 +50,7 @@ pub struct SerializableRule {
 }
 
 // For serialization
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RuleList(pub Vec<SerializableRule>);
 
 impl IntoIterator for RuleList {
@@ -59,11 +59,5 @@ impl IntoIterator for RuleList {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
-    }
-}
-
-impl Default for RuleList {
-    fn default() -> Self {
-        RuleList(Vec::new())
     }
 }

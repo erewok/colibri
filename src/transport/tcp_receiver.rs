@@ -233,9 +233,6 @@ impl TcpReceiver {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpStream;
-    use tokio::time::{sleep, timeout, Duration};
 
     use super::*;
 

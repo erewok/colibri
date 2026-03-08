@@ -285,11 +285,7 @@ impl TokenBucketRules {
     }
 
     pub fn list_named_rules(&self) -> Vec<rules::RuleName> {
-        self.named_rules
-            .pin()
-            .keys()
-            .map(|name| name.clone())
-            .collect()
+        self.named_rules.pin().keys().cloned().collect()
     }
 }
 

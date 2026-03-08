@@ -21,6 +21,8 @@ use crate::transport::{UdpReceiver, UdpTransport};
 
 use super::{GossipMessage, GossipPacket};
 
+type GossipReceiveChannel = Arc<Mutex<Option<mpsc::Receiver<(Bytes, SocketAddr)>>>>;
+
 /// A gossip-based node that maintains all client state locally
 /// and syncs with other nodes via gossip protocol.
 #[derive(Clone)]
@@ -39,7 +41,7 @@ pub struct GossipController {
     /// Receiver for incoming UDP datagrams
     receiver: Arc<UdpReceiver>,
     /// Channel ownership transfer pattern
-    receive_chan: Arc<Mutex<Option<mpsc::Receiver<(Bytes, SocketAddr)>>>>,
+    receive_chan: GossipReceiveChannel,
     /// Spawned task handle for message processing
     pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Shutdown signaling

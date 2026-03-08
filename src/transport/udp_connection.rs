@@ -82,6 +82,9 @@ impl UdpSocketPool {
 
     /// Send data to a random peer
     pub async fn send_to_random(&self, data: &[u8]) -> Result<SocketAddr> {
+        if self.peers.is_empty() {
+            return Err(ColibriError::Transport("No peers available".to_string()));
+        }
         let random_usize: usize = rand::rng().random_range(0..self.peers.len());
         match self.peers.get_index(random_usize) {
             Some((target, _)) => {
@@ -101,10 +104,12 @@ impl UdpSocketPool {
         }
         // Now send to each peer without holding the main lock
         let mut successful_sends = Vec::new();
-        // Do not allow the random thread_range to be used across await points: generate all random indexes now.
-        let rand_indexs = {
+        // Do not allow the random rng to be used across await points: generate all random indexes now.
+        let rand_indexs: Vec<usize> = {
             let mut rng = rand::rng();
-            [..count].map(|_| rng.random_range(0..self.peers.len()))
+            (0..count)
+                .map(|_| rng.random_range(0..self.peers.len()))
+                .collect()
         };
         for random_usize in rand_indexs {
             if let Some((target, _)) = self.peers.get_index(random_usize) {
@@ -144,6 +149,9 @@ impl UdpSocketPool {
     /// Remove a peer from the pool
     pub async fn remove_peer(&mut self, peer_addr: SocketAddr) -> Result<()> {
         self.peers.swap_remove(&peer_addr);
+        self.stats
+            .peer_count
+            .store(self.peers.len(), Ordering::Relaxed);
         Ok(())
     }
 

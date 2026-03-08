@@ -314,52 +314,37 @@ impl TcpSocketPool {
             }
         };
 
-        // Send protocol type byte (Gossip = fire-and-forget)
-        use tokio::io::AsyncWriteExt;
-        stream
-            .write_all(&[ProtocolType::Gossip.to_byte()])
-            .await
-            .map_err(|e| {
+        // Send protocol byte + length prefix + data + flush, all within the connection timeout
+        let len = data.len() as u32;
+        match timeout(self.connection_timeout, async {
+            use tokio::io::AsyncWriteExt;
+            stream.write_all(&[ProtocolType::Gossip.to_byte()]).await?;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(data).await?;
+            stream.flush().await?;
+            std::io::Result::Ok(())
+        })
+        .await
+        {
+            Ok(Ok(_)) => {
+                self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+                debug!("Successfully sent fire-and-forget message to {:?}", target);
+                Ok(())
+            }
+            Ok(Err(e)) => {
                 self.stats
                     .errors
                     .send_errors
                     .fetch_add(1, Ordering::Relaxed);
-                ColibriError::Transport(format!("Failed to write protocol byte: {}", e))
-            })?;
-
-        // Send length prefix
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await.map_err(|e| {
-            self.stats
-                .errors
-                .send_errors
-                .fetch_add(1, Ordering::Relaxed);
-            ColibriError::Transport(format!("Failed to write length: {}", e))
-        })?;
-
-        // Send data
-        stream.write_all(data).await.map_err(|e| {
-            self.stats
-                .errors
-                .send_errors
-                .fetch_add(1, Ordering::Relaxed);
-            ColibriError::Transport(format!("Failed to write data: {}", e))
-        })?;
-
-        stream.flush().await.map_err(|e| {
-            self.stats
-                .errors
-                .send_errors
-                .fetch_add(1, Ordering::Relaxed);
-            ColibriError::Transport(format!("Failed to flush: {}", e))
-        })?;
-
-        self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-        debug!("Successfully sent fire-and-forget message to {:?}", target);
-
-        // Close connection immediately (fire-and-forget)
-        drop(stream);
-
-        Ok(())
+                Err(ColibriError::Transport(format!("Write failed: {}", e)))
+            }
+            Err(_) => {
+                self.stats
+                    .errors
+                    .timeout_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(ColibriError::Transport("Write timeout".to_string()))
+            }
+        }
     }
 }

@@ -243,7 +243,7 @@ impl HashringController {
             consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
 
         let topology = self.topology.read().await;
-        let all_nodes: Vec<_> = topology.all_nodes().into_iter().collect();
+        let all_nodes: Vec<_> = topology.sorted_nodes().into_iter().collect();
 
         if client_bucket as usize >= all_nodes.len() {
             return Err(ColibriError::Node(format!(
@@ -454,8 +454,14 @@ impl HashringController {
             let limiter = limiter_mutex.lock().map_err(|e| {
                 ColibriError::Concurrency(format!("Failed to acquire limiter lock: {}", e))
             })?;
+            // Normalize the internal sentinel key to the user-facing name
+            let display_name = if name.as_str() == "<_default>" {
+                "default"
+            } else {
+                name.as_str()
+            };
             rule_list.push(SerializableRule {
-                name: RuleName::from(name.as_str()),
+                name: RuleName::from(display_name),
                 settings: limiter.get_settings().clone(),
             });
         }

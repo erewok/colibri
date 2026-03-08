@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tracing::error;
 
 use crate::error::{ColibriError, Result};
 use crate::transport::stats::ReceiverStats;
@@ -66,7 +67,7 @@ impl UdpReceiver {
                     }
                     Err(e) => {
                         stats.receive_errors.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("UDP receive error: {}", e);
+                        error!("UDP receive error: {}", e);
                         // Continue receiving despite errors
                     }
                 }

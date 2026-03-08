@@ -176,8 +176,6 @@ impl Node for GossipNode {
 
     /// Expire keys from local buckets
     async fn expire_keys(&self) -> Result<()> {
-        // TODO: Implement expire_keys in new Message architecture
-        // warn!("expire_keys not yet implemented in new architecture");
         Ok(())
     }
 

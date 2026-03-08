@@ -606,7 +606,6 @@ impl GossipController {
                             "[{}] Received StateRequest - not yet implemented",
                             self.node_id
                         );
-                        // TODO: Implement state request handling
                     }
                     GossipMessage::DeltaStateSync {
                         updates,

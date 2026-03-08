@@ -274,10 +274,8 @@ impl From<SerializationError> for ColibriError {
     }
 }
 
-// Convert from anyhow::Error for gradual migration
 impl From<anyhow::Error> for ColibriError {
     fn from(err: anyhow::Error) -> Self {
-        // For the gradual migration from anyhow, we'll just categorize based on the string
         let err_str = err.to_string();
 
         if err_str.contains("I/O") || err_str.contains("io") {

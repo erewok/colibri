@@ -104,12 +104,6 @@ impl GossipPacket {
     }
 }
 
-// impl GossipCommand {
-//     pub fn from_incoming_message(data: bytes::Bytes, peer_addr: SocketAddr) -> Self {
-//         GossipCommand::GossipMessageReceived { data, peer_addr }
-//     }
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;

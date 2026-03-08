@@ -20,8 +20,6 @@ pub struct UdpReceiver {
     message_tx: Arc<mpsc::Sender<(bytes::Bytes, SocketAddr)>>,
 }
 
-
-
 impl UdpReceiver {
     /// Create a new UDP receiver
     pub async fn new(

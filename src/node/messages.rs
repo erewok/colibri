@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{DistributedBucketExternal, TokenBucketLimiter, rules};
+use crate::limiters::{rules, DistributedBucketExternal, TokenBucketLimiter};
 use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{RateLimitSettings, RunMode};
 
@@ -52,7 +52,6 @@ impl Command {
             rx,
         )
     }
-
 }
 
 /// Serialize using postcard
@@ -73,17 +72,17 @@ pub const MAX_FORWARDING_DEPTH: u8 = 3;
 /// Request message for rate limiting over internal cluster transport
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckCallsRequest {
-    pub client_id: String,         // key we rate limit against
+    pub client_id: String,                  // key we rate limit against
     pub rule_name: Option<rules::RuleName>, // None = default rule
-    pub consume_token: bool,       // true for rate_limit, false for check_limit
-    pub forwarding_depth: u8,      // track forwarding hops to prevent loops
+    pub consume_token: bool,                // true for rate_limit, false for check_limit
+    pub forwarding_depth: u8,               // track forwarding hops to prevent loops
 }
 
 /// Response message for rate limiting.
 /// Serialized to API clients as JSON as well as used internally so derive Serialize/Deserialize.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckCallsResponse {
-    pub client_id: String,         // key we rate limit against
+    pub client_id: String,                  // key we rate limit against
     pub rule_name: Option<rules::RuleName>, // None = default rule
     pub calls_remaining: u32,
 }
@@ -237,7 +236,6 @@ impl MessageEnvelopeV2 {
     pub fn to_bytes(&self) -> Result<bytes::Bytes> {
         serialize(self)
     }
-
 }
 
 // ============================================================================
@@ -372,7 +370,6 @@ impl Message {
     }
 }
 
-
 // ============================================================================
 // TESTS
 // ============================================================================
@@ -396,12 +393,10 @@ mod message_tests {
                 consume_token: false,
                 forwarding_depth: 0,
             }),
-            Message::CreateRateLimitRule(
-                rules::SerializableRule {
-                    name: "test_rule".into(),
-                    settings: RateLimitSettings::default(),
-                }
-            ),
+            Message::CreateRateLimitRule(rules::SerializableRule {
+                name: "test_rule".into(),
+                settings: RateLimitSettings::default(),
+            }),
             Message::ListRateLimitRules,
             Message::AddNode {
                 name: NodeName::new("test_node".to_string()),

@@ -76,8 +76,12 @@ impl HashringController {
         // Initialize HashMap with default limiter
         let named_rate_limiters = HashMap::new();
         let rate_limit_settings = settings.rate_limit_settings();
-        let default_limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(rate_limit_settings.clone())));
-        named_rate_limiters.pin().insert("<_default>".to_string(), default_limiter);
+        let default_limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(
+            rate_limit_settings.clone(),
+        )));
+        named_rate_limiters
+            .pin()
+            .insert("<_default>".to_string(), default_limiter);
 
         let transport_config = settings.transport_config();
         let transport = TcpTransport::new(&transport_config).await?;
@@ -210,11 +214,7 @@ impl HashringController {
     }
 
     /// Get mutable reference to rate limiter for a given rule name (or default if None)
-    fn with_limiter_mut<F, R>(
-        &self,
-        rule_name: Option<&RuleName>,
-        f: F,
-    ) -> Result<R>
+    fn with_limiter_mut<F, R>(&self, rule_name: Option<&RuleName>, f: F) -> Result<R>
     where
         F: FnOnce(&mut TokenBucketLimiter) -> R,
     {
@@ -391,10 +391,7 @@ impl HashringController {
         Ok(())
     }
 
-    async fn create_rate_limit_rule(
-        &self,
-        rule: SerializableRule,
-    ) -> Result<()> {
+    async fn create_rate_limit_rule(&self, rule: SerializableRule) -> Result<()> {
         let rule_name_str = rule.name.as_str().to_string();
         // Validate rule name
         if rule_name_str.is_empty() {
@@ -414,7 +411,9 @@ impl HashringController {
         }
 
         let limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(rule.settings)));
-        self.named_rate_limiters.pin().insert(rule_name_str.clone(), limiter);
+        self.named_rate_limiters
+            .pin()
+            .insert(rule_name_str.clone(), limiter);
         tracing::info!("Created named rule '{}' in hashring node", rule_name_str);
         Ok(())
     }

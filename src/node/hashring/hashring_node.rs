@@ -131,10 +131,7 @@ impl Node for HashringNode {
         Ok(())
     }
 
-    async fn create_named_rule(
-        &self,
-        rule: SerializableRule,
-    ) -> Result<()> {
+    async fn create_named_rule(&self, rule: SerializableRule) -> Result<()> {
         let message = Message::CreateRateLimitRule(rule);
         match self.controller.handle_message(message).await? {
             Message::CreateRateLimitRuleResponse => Ok(()),

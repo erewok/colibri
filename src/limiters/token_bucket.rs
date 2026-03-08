@@ -3,10 +3,9 @@ use chrono::Utc;
 use papaya::{Guard, HashMap};
 use serde::{Deserialize, Serialize};
 
+use super::rules;
 use crate::node::NodeId;
 use crate::settings;
-use super::rules;
-
 
 /// Rate limiter bucket interface
 pub trait Bucket {
@@ -188,7 +187,7 @@ impl TokenBucketLimiter {
                 None
             }
         }
-    } 
+    }
 
     /// Export all token buckets for cluster migration
     pub fn export_all_buckets(&self) -> std::collections::HashMap<String, TokenBucket> {
@@ -235,7 +234,6 @@ impl TokenBucketLimiter {
     }
 }
 
-
 #[derive(Clone, Debug)]
 pub struct TokenBucketRules {
     // rule name -> settings
@@ -256,20 +254,34 @@ impl TokenBucketRules {
         self.named_rules.guard()
     }
 
-    pub fn get_default_limiter<'guard>(&self, guard: &'guard impl Guard) -> Option<&'guard TokenBucketLimiter> {
-        self.named_rules.get(&rules::RuleName::from(rules::DEFAULT_RULE_NAME), guard)
+    pub fn get_default_limiter<'guard>(
+        &self,
+        guard: &'guard impl Guard,
+    ) -> Option<&'guard TokenBucketLimiter> {
+        self.named_rules
+            .get(&rules::RuleName::from(rules::DEFAULT_RULE_NAME), guard)
     }
 
-    pub fn get_named_rule_limiter<'guard>(&self, rule_name: &str, guard: &'guard impl Guard) -> Option<&'guard TokenBucketLimiter> {
-        self.named_rules.get(&rules::RuleName::from(rule_name), guard)
+    pub fn get_named_rule_limiter<'guard>(
+        &self,
+        rule_name: &str,
+        guard: &'guard impl Guard,
+    ) -> Option<&'guard TokenBucketLimiter> {
+        self.named_rules
+            .get(&rules::RuleName::from(rule_name), guard)
     }
 
     pub fn add_named_rule(&mut self, rule: &rules::RuleName, limiter: TokenBucketLimiter) {
         self.named_rules.pin().insert(rule.clone(), limiter);
     }
 
-    pub fn remove_named_rule<'guard>(&self, rule_name: &str, guard: &'guard impl Guard) -> Option<&'guard TokenBucketLimiter> {
-        self.named_rules.remove(&rules::RuleName::from(rule_name), guard)
+    pub fn remove_named_rule<'guard>(
+        &self,
+        rule_name: &str,
+        guard: &'guard impl Guard,
+    ) -> Option<&'guard TokenBucketLimiter> {
+        self.named_rules
+            .remove(&rules::RuleName::from(rule_name), guard)
     }
 
     pub fn list_named_rules(&self) -> Vec<rules::RuleName> {
@@ -280,7 +292,6 @@ impl TokenBucketRules {
             .collect()
     }
 }
-
 
 #[cfg(test)]
 mod tests {

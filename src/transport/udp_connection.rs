@@ -15,7 +15,7 @@ use tracing::error;
 use crate::error::{ColibriError, Result};
 use crate::node::NodeId;
 use crate::settings::TransportConfig;
-use crate::transport::stats::{SocketPoolStats, SocketPoolErrors};
+use crate::transport::stats::{SocketPoolErrors, SocketPoolStats};
 
 /// Pool of UDP sockets for efficient peer communication
 #[derive(Clone, Debug)]
@@ -70,7 +70,10 @@ impl UdpSocketPool {
                 Ok(target)
             }
             Err(e) => {
-                self.stats.errors.send_errors.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .errors
+                    .send_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 error!("[{}] Failed to send UDP data: {}", target, e);
                 Err(ColibriError::Io(e))
             }
@@ -154,13 +157,21 @@ impl UdpSocketPool {
         SocketPoolStats {
             active_connections: AtomicUsize::new(self.peers.len()),
             peer_count: AtomicUsize::new(self.stats.peer_count.load(Ordering::Relaxed)),
-            total_connections: AtomicUsize::new(self.stats.total_connections.load(Ordering::Relaxed)),
-            responses_received: AtomicU64::new(self.stats.responses_received.load(Ordering::Relaxed)),
+            total_connections: AtomicUsize::new(
+                self.stats.total_connections.load(Ordering::Relaxed),
+            ),
+            responses_received: AtomicU64::new(
+                self.stats.responses_received.load(Ordering::Relaxed),
+            ),
             messages_sent: AtomicU64::new(self.stats.messages_sent.load(Ordering::Relaxed)),
             errors: SocketPoolErrors {
                 send_errors: AtomicU64::new(self.stats.errors.send_errors.load(Ordering::Relaxed)),
-                connection_errors: AtomicU64::new(self.stats.errors.connection_errors.load(Ordering::Relaxed)),
-                timeout_errors: AtomicU64::new(self.stats.errors.timeout_errors.load(Ordering::Relaxed)),
+                connection_errors: AtomicU64::new(
+                    self.stats.errors.connection_errors.load(Ordering::Relaxed),
+                ),
+                timeout_errors: AtomicU64::new(
+                    self.stats.errors.timeout_errors.load(Ordering::Relaxed),
+                ),
             },
         }
     }
@@ -168,8 +179,8 @@ impl UdpSocketPool {
 
 #[cfg(test)]
 mod tests {
-    use crate::node::NodeName;
     use super::*;
+    use crate::node::NodeName;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn empty_transport_config() -> TransportConfig {
@@ -184,9 +195,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_nonexistent_peer() {
         let config = empty_transport_config();
-        let pool = UdpSocketPool::new(&config)
-            .await
-            .unwrap();
+        let pool = UdpSocketPool::new(&config).await.unwrap();
 
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
         let result = pool.send_to(peer, b"test").await;
@@ -200,9 +209,18 @@ mod tests {
             peer_listen_address: "127.0.0.1".to_string(),
             peer_listen_port: 0,
             topology: IndexMap::from([
-                (NodeName::from("node-1").node_id(), SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001)),
-                (NodeName::from("node-2").node_id(), SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002)),
-                (NodeName::from("node-3").node_id(), SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8003)),
+                (
+                    NodeName::from("node-1").node_id(),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001),
+                ),
+                (
+                    NodeName::from("node-2").node_id(),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002),
+                ),
+                (
+                    NodeName::from("node-3").node_id(),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8003),
+                ),
             ]),
         };
 

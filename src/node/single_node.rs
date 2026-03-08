@@ -19,7 +19,10 @@ pub struct SingleNode {
 
 impl SingleNode {
     /// Get a limiter by rule name, returning a cloned Arc
-    fn get_limiter(&self, rule: &rules::RuleName) -> Result<Arc<Mutex<token_bucket::TokenBucketLimiter>>> {
+    fn get_limiter(
+        &self,
+        rule: &rules::RuleName,
+    ) -> Result<Arc<Mutex<token_bucket::TokenBucketLimiter>>> {
         let limiters = self.named_rate_limiters.read().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
         })?;
@@ -46,8 +49,10 @@ impl Node for SingleNode {
             node_name, listen_api
         );
 
-        let mut named_rules: HashMap<rules::RuleName, Arc<Mutex<token_bucket::TokenBucketLimiter>>> =
-            HashMap::new();
+        let mut named_rules: HashMap<
+            rules::RuleName,
+            Arc<Mutex<token_bucket::TokenBucketLimiter>>,
+        > = HashMap::new();
         named_rules.insert(
             rules::RuleName::default(),
             Arc::new(Mutex::new(token_bucket::TokenBucketLimiter::new(
@@ -89,10 +94,7 @@ impl Node for SingleNode {
         local_check_limit(Some(rule), key, rate_limiter).await
     }
 
-    async fn create_named_rule(
-        &self,
-        rule: rules::SerializableRule,
-    ) -> Result<()> {
+    async fn create_named_rule(&self, rule: rules::SerializableRule) -> Result<()> {
         let mut limiters = self.named_rate_limiters.write().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
         })?;
@@ -116,7 +118,10 @@ impl Node for SingleNode {
         Ok(())
     }
 
-    async fn get_named_rule(&self, rule_name: rules::RuleName) -> Result<Option<rules::SerializableRule>> {
+    async fn get_named_rule(
+        &self,
+        rule_name: rules::RuleName,
+    ) -> Result<Option<rules::SerializableRule>> {
         let limiters = self.named_rate_limiters.read().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
         })?;

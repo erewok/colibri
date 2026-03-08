@@ -44,9 +44,7 @@ pub async fn create_named_rate_limit_rule(
     State(state): State<node::NodeWrapper>,
     axum::Json(new_rule): axum::Json<limiters::SerializableRule>,
 ) -> Result<StatusCode> {
-    state
-        .create_named_rule(new_rule)
-        .await?;
+    state.create_named_rule(new_rule).await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -102,8 +100,5 @@ pub async fn check_limit_custom(
     State(state): State<node::NodeWrapper>,
 ) -> Result<axum::Json<Option<messages::CheckCallsResponse>>> {
     let rule = limiters::RuleName::from(rule_name);
-    state
-        .check_limit_custom(rule, key)
-        .await
-        .map(axum::Json)
+    state.check_limit_custom(rule, key).await.map(axum::Json)
 }

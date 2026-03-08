@@ -182,10 +182,7 @@ impl Node for GossipNode {
     }
 
     // Configurable rate limit methods
-    async fn create_named_rule(
-        &self,
-        rule: SerializableRule,
-    ) -> Result<()> {
+    async fn create_named_rule(&self, rule: SerializableRule) -> Result<()> {
         let message = Message::CreateRateLimitRule(rule);
 
         match self.controller.handle_message(message).await? {

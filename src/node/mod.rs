@@ -29,13 +29,13 @@ pub trait Node {
     async fn expire_keys(&self) -> Result<()>;
 
     // Servers can create arbitrary settings under custom rule names
-    async fn create_named_rule(
-        &self,
-        rule: rules::SerializableRule,
-    ) -> Result<()>;
+    async fn create_named_rule(&self, rule: rules::SerializableRule) -> Result<()>;
     async fn list_named_rules(&self) -> Result<limiters::RuleList>;
     async fn delete_named_rule(&self, rule_name: rules::RuleName) -> Result<()>;
-    async fn get_named_rule(&self, rule_name: rules::RuleName) -> Result<Option<rules::SerializableRule>>;
+    async fn get_named_rule(
+        &self,
+        rule_name: rules::RuleName,
+    ) -> Result<Option<rules::SerializableRule>>;
     async fn rate_limit_custom(
         &self,
         rule_name: rules::RuleName,
@@ -113,16 +113,14 @@ impl NodeWrapper {
         self.get_node_ref().rate_limit(client_id).await
     }
 
-    pub async fn create_named_rule(
-        &self,
-        rule: limiters::SerializableRule,
-    ) -> Result<()> {
-        self.get_node_ref()
-            .create_named_rule(rule)
-            .await
+    pub async fn create_named_rule(&self, rule: limiters::SerializableRule) -> Result<()> {
+        self.get_node_ref().create_named_rule(rule).await
     }
 
-    pub async fn get_named_rule(&self, rule_name: rules::RuleName) -> Result<Option<limiters::SerializableRule>> {
+    pub async fn get_named_rule(
+        &self,
+        rule_name: rules::RuleName,
+    ) -> Result<Option<limiters::SerializableRule>> {
         self.get_node_ref().get_named_rule(rule_name).await
     }
 

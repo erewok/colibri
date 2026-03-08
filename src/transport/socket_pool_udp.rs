@@ -2,7 +2,6 @@
 //!
 //! Provides a pool of UDP unicast sockets.
 
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -48,7 +47,7 @@ impl UdpTransport {
     }
 
     /// Add a new peer to the socket pool
-    pub async fn add_peer(&mut self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
+    pub async fn add_peer(&self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
         self.socket_pool
             .write()
             .await
@@ -89,12 +88,18 @@ mod tests {
 
     fn get_transport_config() -> settings::TransportConfig {
         let mut cluster_urls = IndexMap::new();
-        cluster_urls.insert(NodeName::from("node-1").node_id(), "127.0.0.1:8001".parse().unwrap());
-        cluster_urls.insert(NodeName::from("node-2").node_id(), "127.0.0.1:8002".parse().unwrap());
+        cluster_urls.insert(
+            NodeName::from("node-1").node_id(),
+            "127.0.0.1:8001".parse().unwrap(),
+        );
+        cluster_urls.insert(
+            NodeName::from("node-2").node_id(),
+            "127.0.0.1:8002".parse().unwrap(),
+        );
 
         settings::TransportConfig {
             node_name: NodeName::from("Test".to_string()),
-            peer_listen_address:  "127.0.0.1".parse().unwrap(),
+            peer_listen_address: "127.0.0.1".parse().unwrap(),
             peer_listen_port: 0,
             topology: cluster_urls,
         }
@@ -103,9 +108,7 @@ mod tests {
     #[tokio::test]
     async fn test_transport_creation() {
         let transport_config = get_transport_config();
-        let transport = UdpTransport::new(&transport_config)
-            .await
-            .unwrap();
+        let transport = UdpTransport::new(&transport_config).await.unwrap();
 
         assert_eq!(transport.get_peers().await.len(), 2);
     }

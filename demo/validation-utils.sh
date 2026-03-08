@@ -1,4 +1,4 @@
-#!/bin/bash -eu
+#!/usr/bin/env bash
 
 # Dependency checker for validation scripts
 check_dependencies() {

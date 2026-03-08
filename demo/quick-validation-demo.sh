@@ -1,4 +1,4 @@
-#!/bin/bash -eu
+#!/usr/bin/env bash
 
 # Example of how to use the improved validation system
 # This shows a quick demo run with filtered logging

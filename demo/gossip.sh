@@ -1,4 +1,4 @@
-#!/bin/bash -eux
+#!/usr/bin/env bash
 export RUST_LOG=info
 export max_calls=5
 export interval_seconds=3

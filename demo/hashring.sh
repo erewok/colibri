@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-export RUST_LOG=info
+#!/bin/bash -eu
+export RUST_LOG=debug
 export mode="hashring"
 export max_calls=5
 export interval_seconds=3

@@ -1,21 +1,21 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use papaya::HashMap;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{NamedRateLimitRule, RateLimitConfig, TokenBucketLimiter};
+use crate::limiters::rules::{self, RuleName, SerializableRule};
+use crate::limiters::TokenBucketLimiter;
 use crate::node::messages::{
-    CheckCallsRequest, CheckCallsResponse, Message, Queueable, Status, StatusResponse,
-    TopologyResponse,
+    CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
 };
 use crate::node::{NodeAddress, NodeName};
-use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
+use crate::settings::{self, ClusterTopology, RunMode};
 use crate::transport::traits::Sender;
-use crate::transport::TcpTransport;
+use crate::transport::{tcp_receiver::TcpRequest, TcpReceiver, TcpTransport};
 
 use super::consistent_hashing;
 
@@ -27,10 +27,18 @@ pub struct HashringController {
     number_of_buckets: u32,
     topology: Arc<RwLock<ClusterTopology>>,
     transport: Arc<TcpTransport>,
-    rate_limit_settings: RateLimitSettings,
-    pub rate_limiter: Arc<Mutex<TokenBucketLimiter>>,
-    pub rate_limit_config: Arc<Mutex<RateLimitConfig>>,
-    pub named_rate_limiters: Arc<Mutex<HashMap<String, Arc<Mutex<TokenBucketLimiter>>>>>,
+    /// Concurrent HashMap for rate limiters (papaya provides lock-free reads)
+    pub named_rate_limiters: HashMap<String, Arc<Mutex<TokenBucketLimiter>>>,
+    /// Receiver address for logging
+    receiver_addr: SocketAddr,
+    /// Receiver for incoming TCP messages
+    receiver: Arc<TcpReceiver>,
+    /// Channel ownership transfer pattern
+    receive_chan: Arc<Mutex<Option<mpsc::Receiver<TcpRequest>>>>,
+    /// Handle for the TCP accept loop (loops on socket.accept, pushes TcpRequests into the channel)
+    msg_receive_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the message evaluation loop (reads from channel, calls handle_message)
+    msg_eval_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for HashringController {
@@ -63,12 +71,23 @@ impl HashringController {
         let bucket =
             consistent_hashing::jump_consistent_hash(node_name.as_str(), number_of_buckets);
 
-        let rl_settings = settings.rate_limit_settings();
-        let rate_limiter = TokenBucketLimiter::new(rl_settings.clone());
-        let rate_limit_config = RateLimitConfig::new(rl_settings.clone());
+        // Initialize HashMap with default limiter
+        let named_rate_limiters = HashMap::new();
+        let rate_limit_settings = settings.rate_limit_settings();
+        let default_limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(
+            rate_limit_settings.clone(),
+        )));
+        named_rate_limiters
+            .pin()
+            .insert(rules::DEFAULT_RULE_NAME.to_string(), default_limiter);
 
         let transport_config = settings.transport_config();
         let transport = TcpTransport::new(&transport_config).await?;
+
+        // Create TCP receiver and channel
+        let receiver_addr = settings.transport_config().peer_listen_url();
+        let (message_tx, receive_chan) = tokio::sync::mpsc::channel(1000);
+        let receiver = TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
 
         Ok(Self {
             node_name,
@@ -76,20 +95,141 @@ impl HashringController {
             number_of_buckets,
             topology: Arc::new(RwLock::new(cluster_topology)),
             transport: Arc::new(transport),
-            rate_limit_settings: rl_settings,
-            rate_limiter: Arc::new(Mutex::new(rate_limiter)),
-            rate_limit_config: Arc::new(Mutex::new(rate_limit_config)),
-            named_rate_limiters: Arc::new(Mutex::new(HashMap::new())),
+            named_rate_limiters,
+            receiver_addr,
+            receiver: Arc::new(receiver),
+            receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
+            msg_receive_handle: Arc::new(Mutex::new(None)),
+            msg_eval_handle: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Start the main controller loop
-    pub async fn start(self, mut command_rx: mpsc::Receiver<Queueable>) {
-        info!("HashringController started for node {}", self.node_name);
+    /// Start the TCP receiver and message processing loop
+    pub async fn start_receiver(&self) -> Result<()> {
+        // Start the TCP accept loop and store its handle
+        let receive_handle = self.receiver.start();
+        {
+            let mut h = self
+                .msg_receive_handle
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            *h = Some(receive_handle);
+        }
 
-        while let Some(_command) = command_rx.recv().await {}
+        // Take ownership of the receive channel
+        let mut receive_chan = {
+            let mut chan_opt = self
+                .receive_chan
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            chan_opt
+                .take()
+                .ok_or_else(|| ColibriError::Transport("Receiver already started".to_string()))?
+        };
 
-        info!("HashringController stopped for node {}", self.node_name);
+        // Clone necessary data for the spawned task
+        let receiver_addr = self.receiver_addr;
+        let controller = self.clone();
+
+        // Spawn message processing task
+        let handle = tokio::spawn(async move {
+            info!("Hashring TCP receiver started on {}", receiver_addr);
+
+            while let Some(request) = receive_chan.recv().await {
+                // Hashring mode only supports request-response protocol
+                let response_tx = match request.response_tx {
+                    Some(tx) => tx,
+                    None => {
+                        warn!(
+                            "Received fire-and-forget message in hashring mode from {}, ignoring",
+                            request.peer_addr
+                        );
+                        continue;
+                    }
+                };
+
+                // Deserialize incoming message
+                match Message::deserialize(&request.data) {
+                    Ok(message) => {
+                        // Handle message via controller
+                        let response = match controller.handle_message(message).await {
+                            Ok(response) => response,
+                            Err(e) => {
+                                error!("Error handling hashring message: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // Serialize and send response
+                        match response.serialize() {
+                            Ok(response_data) => {
+                                let response_vec = response_data.to_vec();
+                                if response_tx.send(response_vec).is_err() {
+                                    warn!("Failed to send response back to peer (channel closed)");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize response: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize message: {}", e);
+                    }
+                }
+            }
+
+            info!("Hashring TCP receiver stopped");
+        });
+
+        // Store the eval handle
+        {
+            let mut h = self
+                .msg_eval_handle
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            *h = Some(handle);
+        }
+
+        Ok(())
+    }
+
+    /// Stop both the TCP accept loop and the message evaluation loop
+    pub fn stop_receiver(&self) {
+        if let Ok(mut h) = self.msg_receive_handle.lock() {
+            if let Some(handle) = h.take() {
+                handle.abort();
+            }
+        } else {
+            error!("Failed to acquire lock on msg_receive_handle during shutdown");
+        }
+        if let Ok(mut h) = self.msg_eval_handle.lock() {
+            if let Some(handle) = h.take() {
+                handle.abort();
+                info!("Hashring receiver stopped");
+            }
+        } else {
+            error!("Failed to acquire lock on msg_eval_handle during shutdown");
+        }
+    }
+
+    /// Get mutable reference to rate limiter for a given rule name (or default if None)
+    fn with_limiter_mut<F, R>(&self, rule_name: Option<&RuleName>, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut TokenBucketLimiter) -> R,
+    {
+        let key = rule_name
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_else(|| rules::DEFAULT_RULE_NAME.to_string());
+
+        let guard = self.named_rate_limiters.pin();
+        let limiter_mutex = guard
+            .get(&key)
+            .ok_or_else(|| ColibriError::Api(format!("Rate limit rule '{}' not found", key)))?;
+        let mut limiter = limiter_mutex.lock().map_err(|e| {
+            ColibriError::Concurrency(format!("Failed to acquire limiter lock: {}", e))
+        })?;
+        Ok(f(&mut limiter))
     }
 
     fn owns_bucket_for_client(&self, client_id: &str) -> bool {
@@ -103,7 +243,7 @@ impl HashringController {
             consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
 
         let topology = self.topology.read().await;
-        let all_nodes: Vec<_> = topology.all_nodes().into_iter().collect();
+        let all_nodes: Vec<_> = topology.sorted_nodes().into_iter().collect();
 
         if client_bucket as usize >= all_nodes.len() {
             return Err(ColibriError::Node(format!(
@@ -133,13 +273,27 @@ impl HashringController {
 
     async fn handle_rate_limit_request(
         &self,
-        request: CheckCallsRequest,
+        mut request: CheckCallsRequest,
     ) -> Result<CheckCallsResponse> {
+        // Prevent forwarding loops
+        if request.forwarding_depth >= crate::node::messages::MAX_FORWARDING_DEPTH {
+            warn!(
+                "Max forwarding depth {} exceeded for client {}",
+                crate::node::messages::MAX_FORWARDING_DEPTH,
+                request.client_id
+            );
+            return Err(ColibriError::Transport(
+                "Max forwarding depth exceeded - possible topology inconsistency".to_string(),
+            ));
+        }
+
         if !self.owns_bucket_for_client(&request.client_id) {
             let owner = self.find_bucket_owner(&request.client_id).await?;
+            request.forwarding_depth = request.forwarding_depth.saturating_add(1);
+
             debug!(
-                "Forwarding rate limit request for {} to {}",
-                request.client_id, owner
+                "Forwarding rate limit request for {} to {} (depth: {})",
+                request.client_id, owner, request.forwarding_depth
             );
 
             let response = self
@@ -156,13 +310,14 @@ impl HashringController {
             }
         }
 
-        let mut limiter = self.rate_limiter.lock().unwrap();
-
-        let calls_remaining = if request.consume_token {
-            limiter.limit_calls_for_client(request.client_id.clone())
-        } else {
-            Some(limiter.check_calls_remaining_for_client(&request.client_id))
-        };
+        // Get the appropriate limiter (default or named rule)
+        let calls_remaining = self.with_limiter_mut(request.rule_name.as_ref(), |limiter| {
+            if request.consume_token {
+                limiter.limit_calls_for_client(request.client_id.clone())
+            } else {
+                Some(limiter.check_calls_remaining_for_client(&request.client_id))
+            }
+        })?;
 
         Ok(CheckCallsResponse {
             client_id: request.client_id,
@@ -236,49 +391,53 @@ impl HashringController {
         Ok(())
     }
 
-    async fn create_rate_limit_rule(
-        &self,
-        rule_name: String,
-        settings: RateLimitSettings,
-    ) -> Result<()> {
-        let mut named_limiters = self.named_rate_limiters.lock().unwrap();
+    async fn create_rate_limit_rule(&self, rule: SerializableRule) -> Result<()> {
+        let rule_name_str = rule.name.as_str().to_string();
+        // Validate rule name
+        if rule_name_str.is_empty() {
+            return Err(ColibriError::Api("Rule name cannot be empty".to_string()));
+        }
+
+        // Don't allow creating/overwriting the default rule
+        if rule_name_str == rules::DEFAULT_RULE_NAME {
+            return Err(ColibriError::Api(
+                "Cannot create or modify the default rule".to_string(),
+            ));
+        }
 
         // Only create if it doesn't already exist
-        if named_limiters.contains_key(&rule_name) {
+        if self.named_rate_limiters.pin().contains_key(&rule_name_str) {
             return Ok(());
         }
 
-        let limiter = TokenBucketLimiter::new(settings.clone());
-        named_limiters.insert(rule_name.clone(), Arc::new(Mutex::new(limiter)));
-        tracing::info!("Created named rule '{}' in hashring node", rule_name);
+        let limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(rule.settings)));
+        self.named_rate_limiters
+            .pin()
+            .insert(rule_name_str.clone(), limiter);
+        tracing::info!("Created named rule '{}' in hashring node", rule_name_str);
         Ok(())
     }
 
-    async fn delete_rate_limit_rule(&self, rule_name: String) -> Result<()> {
-        let mut named_limiters = self.named_rate_limiters.lock().unwrap();
-        if named_limiters.remove(&rule_name).is_some() {
-            tracing::info!("Deleted named rule '{}' from hashring node", rule_name);
+    async fn delete_rate_limit_rule(&self, rule_name: RuleName) -> Result<()> {
+        let key = rule_name.as_str().to_string();
+        if self.named_rate_limiters.pin().remove(&key).is_some() {
+            tracing::info!("Deleted named rule '{}' from hashring node", key);
         } else {
-            tracing::warn!("Attempted to delete non-existent rule '{}'", rule_name);
+            tracing::warn!("Attempted to delete non-existent rule '{}'", key);
         }
         Ok(())
     }
 
-    async fn get_rate_limit_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
-        if rule_name == "default" {
-            return Ok(Some(NamedRateLimitRule {
-                name: "default".to_string(),
-                settings: self.rate_limit_settings.clone(),
-            }));
-        }
+    async fn get_rate_limit_rule(&self, rule_name: RuleName) -> Result<Option<SerializableRule>> {
+        let key = rule_name.as_str().to_string();
 
-        let named_limiters = self.named_rate_limiters.lock().unwrap();
-
-        if let Some(limiter_arc) = named_limiters.get(&rule_name) {
-            let limiter = limiter_arc.lock().unwrap();
+        let guard = self.named_rate_limiters.pin();
+        if let Some(limiter_mutex) = guard.get(&key) {
+            let limiter = limiter_mutex.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiter lock: {}", e))
+            })?;
             let settings = limiter.get_settings().clone();
-
-            return Ok(Some(NamedRateLimitRule {
+            return Ok(Some(SerializableRule {
                 name: rule_name,
                 settings,
             }));
@@ -287,23 +446,21 @@ impl HashringController {
         Ok(None)
     }
 
-    async fn list_rate_limit_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
-        let mut rules = vec![NamedRateLimitRule {
-            name: "default".to_string(),
-            settings: self.rate_limit_settings.clone(),
-        }];
+    async fn list_rate_limit_rules(&self) -> Result<rules::RuleList> {
+        let mut rule_list = Vec::new();
 
-        let named_limiters = self.named_rate_limiters.lock().unwrap();
-
-        for (name, limiter_arc) in named_limiters.iter() {
-            let limiter = limiter_arc.lock().unwrap();
-            rules.push(NamedRateLimitRule {
-                name: name.clone(),
+        let guard = self.named_rate_limiters.pin();
+        for (name, limiter_mutex) in guard.iter() {
+            let limiter = limiter_mutex.lock().map_err(|e| {
+                ColibriError::Concurrency(format!("Failed to acquire limiter lock: {}", e))
+            })?;
+            rule_list.push(SerializableRule {
+                name: RuleName::from(name.as_str()),
                 settings: limiter.get_settings().clone(),
             });
         }
 
-        Ok(rules)
+        Ok(rules::RuleList(rule_list))
     }
 
     pub async fn handle_message(&self, message: Message) -> Result<Message> {
@@ -333,21 +490,18 @@ impl HashringController {
                 Ok(Message::Ack)
             }
 
-            Message::CreateRateLimitRule {
-                rule_name,
-                settings,
-            } => {
-                self.create_rate_limit_rule(rule_name, settings).await?;
+            Message::CreateRateLimitRule(rule) => {
+                self.create_rate_limit_rule(rule).await?;
                 Ok(Message::CreateRateLimitRuleResponse)
             }
 
             Message::DeleteRateLimitRule { rule_name } => {
-                self.delete_rate_limit_rule(rule_name).await?;
+                self.delete_rate_limit_rule(rule_name.clone()).await?;
                 Ok(Message::DeleteRateLimitRuleResponse)
             }
 
             Message::GetRateLimitRule { rule_name } => {
-                let rule = self.get_rate_limit_rule(rule_name).await?;
+                let rule = self.get_rate_limit_rule(rule_name.clone()).await?;
                 Ok(Message::GetRateLimitRuleResponse(rule))
             }
 
@@ -362,91 +516,4 @@ impl HashringController {
             ))),
         }
     }
-
-    // Note: Direct message handling via handle_message() is now the primary interface
-    //     match command {
-    //         ClusterCommand::CheckLimit {
-    //             request,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_check_limit(request.client_id).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::RateLimit {
-    //             request,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_rate_limit(request.client_id).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::ExpireKeys => {
-    //             self.handle_expire_keys().await?;
-    //         }
-    //         ClusterCommand::CreateNamedRule {
-    //             rule_name,
-    //             settings,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_create_named_rule(rule_name, settings).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::DeleteNamedRule {
-    //             rule_name,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_delete_named_rule(rule_name).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::ListNamedRules { resp_chan } => {
-    //             let result = self.handle_list_named_rules().await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::GetNamedRule {
-    //             rule_name,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_get_named_rule(rule_name).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //         ClusterCommand::AdminCommand {
-    //             command,
-    //             source,
-    //             resp_chan,
-    //         } => {
-    //             let result = self.handle_admin_command(command, source).await;
-    //             let _ = resp_chan.send(result);
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
-    // ===== Legacy methods removed in Phase 3 Task 2 =====
-    // The following 14 methods were removed (lines 155-718):
-    // - handle_check_limit() - referenced non-existent messages module
-    // - handle_rate_limit() - referenced non-existent messages module
-    // - handle_expire_keys() - deferred to future phase
-    // - handle_create_named_rule() - replaced by handle_message()
-    // - handle_delete_named_rule() - replaced by handle_message()
-    // - handle_list_named_rules() - replaced by handle_message()
-    // - handle_get_named_rule() - replaced by handle_message()
-    // - handle_rate_limit_custom() - replaced by handle_message()
-    // - handle_check_limit_custom() - replaced by handle_message()
-    // - handle_admin_command() - referenced non-existent AdminResponse type
-    // - handle_export_buckets() - incomplete, deferred
-    // - handle_import_buckets() - incomplete, deferred
-    // - handle_cluster_health() - replaced by handle_message()
-    // - handle_get_topology() - replaced by handle_message()
-    // - handle_new_topology() - replaced by handle_message()
-    //
-    // Use the new handle_message() method from Phase 2 (lines 117-199) instead.
-    // These legacy methods contained ~22 compilation errors from missing types.
 }
-
-// ===== Tests temporarily disabled in Phase 3 Task 3 =====
-// These tests reference old types (ClusterCommand, messages module, cluster::ClusterMember)
-// that were removed in Phase 3 Task 2. Tests need to be rewritten to use:
-// - New Message enum instead of ClusterCommand
-// - BaseController and handle_message() architecture
-// - TcpTransport instead of cluster::ClusterMember
-//
-// TODO: Rewrite these tests in a future phase when node implementations are updated

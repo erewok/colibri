@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use super::GossipController;
 use crate::error::{ColibriError, Result};
-use crate::limiters::NamedRateLimitRule;
+use crate::limiters::{RuleList, RuleName, SerializableRule};
 use crate::node::messages::{
     BucketExport, CheckCallsRequest, CheckCallsResponse, ExportMetadata, Message, StatusResponse,
     TopologyChangeRequest, TopologyResponse,
@@ -20,26 +20,14 @@ pub struct GossipNode {
     /// Node name
     pub node_name: NodeName,
 
-    /// Controller - handles all operations via handle_message()
+    /// Controller - handles all operations via handle_message() and UDP network communication
     pub controller: Arc<GossipController>,
-
-    /// Receiver handler
-    pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl GossipNode {
-    // Note: run_gossip_receiver removed - gossip protocol now handled internally by controller
-
     /// Stop the gossip receiver task
     pub fn stop_receiver(&self) {
-        if let Ok(mut handle) = self.receiver_handle.lock() {
-            if let Some(join_handle) = handle.take() {
-                join_handle.abort();
-                info!("Gossip receiver task stopped");
-            }
-        } else {
-            error!("Failed to acquire lock on receiver_handle during shutdown");
-        }
+        self.controller.stop_receiver();
     }
 
     /// Stop all background tasks
@@ -50,12 +38,8 @@ impl GossipNode {
 
 impl Drop for GossipNode {
     fn drop(&mut self) {
-        // Clean up tasks when the node is dropped
-        if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
-            if let Some(handle) = receiver_handle.take() {
-                handle.abort();
-            }
-        }
+        // Clean up tasks via controller when the node is dropped
+        self.controller.stop_receiver();
     }
 }
 
@@ -93,41 +77,12 @@ impl Node for GossipNode {
             controller_clone.start().await;
         });
 
-        // Start TCP receiver to handle incoming cluster messages
-        let receiver_addr = settings.transport_config().peer_listen_url();
-        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1000);
-
-        let receiver =
-            crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
-        receiver.start().await;
-
-        // Spawn task to process incoming messages
-        let controller_for_receiver = controller.clone();
-        let receiver_handle = tokio::spawn(async move {
-            info!("Gossip TCP receiver started on {}", receiver_addr);
-            while let Some(request) = message_rx.recv().await {
-                // Deserialize and process message
-                match crate::node::messages::Message::deserialize(&request.data) {
-                    Ok(message) => {
-                        if let Err(e) = controller_for_receiver.handle_message(message).await {
-                            error!("Error handling message: {}", e);
-                        }
-                        // Gossip is fire-and-forget, send empty ack
-                        let _ = request.response_tx.send(vec![]);
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize message: {}", e);
-                        // Still send empty response to avoid blocking sender
-                        let _ = request.response_tx.send(vec![]);
-                    }
-                }
-            }
-        });
+        // Start the controller's UDP receiver
+        controller.start_receiver().await?;
 
         Ok(Self {
             node_name,
             controller,
-            receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })
     }
 
@@ -137,6 +92,7 @@ impl Node for GossipNode {
             client_id: client_id.clone(),
             rule_name: None,
             consume_token: false,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -154,6 +110,7 @@ impl Node for GossipNode {
             client_id: client_id.clone(),
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -172,13 +129,14 @@ impl Node for GossipNode {
     }
     async fn check_limit_custom(
         &self,
-        rule_name: String,
+        rule_name: RuleName,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
         let request = CheckCallsRequest {
             client_id: key.clone(),
             rule_name: Some(rule_name),
             consume_token: false,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -191,13 +149,14 @@ impl Node for GossipNode {
     }
     async fn rate_limit_custom(
         &self,
-        rule_name: String,
+        rule_name: RuleName,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
         let request = CheckCallsRequest {
             client_id: key.clone(),
             rule_name: Some(rule_name),
             consume_token: true,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -217,21 +176,12 @@ impl Node for GossipNode {
 
     /// Expire keys from local buckets
     async fn expire_keys(&self) -> Result<()> {
-        // TODO: Implement expire_keys in new Message architecture
-        // warn!("expire_keys not yet implemented in new architecture");
         Ok(())
     }
 
     // Configurable rate limit methods
-    async fn create_named_rule(
-        &self,
-        rule_name: String,
-        settings: settings::RateLimitSettings,
-    ) -> Result<()> {
-        let message = Message::CreateRateLimitRule {
-            rule_name,
-            settings,
-        };
+    async fn create_named_rule(&self, rule: SerializableRule) -> Result<()> {
+        let message = Message::CreateRateLimitRule(rule);
 
         match self.controller.handle_message(message).await? {
             Message::CreateRateLimitRuleResponse => Ok(()),
@@ -241,7 +191,7 @@ impl Node for GossipNode {
         }
     }
 
-    async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
+    async fn delete_named_rule(&self, rule_name: RuleName) -> Result<()> {
         let message = Message::DeleteRateLimitRule { rule_name };
 
         match self.controller.handle_message(message).await? {
@@ -252,7 +202,7 @@ impl Node for GossipNode {
         }
     }
 
-    async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
+    async fn list_named_rules(&self) -> Result<RuleList> {
         let message = Message::ListRateLimitRules;
 
         match self.controller.handle_message(message).await? {
@@ -262,7 +212,7 @@ impl Node for GossipNode {
             )),
         }
     }
-    async fn get_named_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
+    async fn get_named_rule(&self, rule_name: RuleName) -> Result<Option<SerializableRule>> {
         let message = Message::GetRateLimitRule { rule_name };
 
         match self.controller.handle_message(message).await? {
@@ -353,7 +303,7 @@ mod tests {
         // Should create successfully
         let node = GossipNode::new(settings).await.unwrap();
         // Controller is Arc so just verify it's set up
-        assert!(node.receiver_handle.lock().unwrap().is_some());
+        assert!(node.controller.msg_eval_handle.lock().unwrap().is_some());
     }
 
     #[tokio::test]
@@ -422,10 +372,10 @@ mod tests {
 
         // Verify controller and receiver are initialized
         // Controller is Arc so just check it's not null by trying to use it
-        assert!(node.receiver_handle.lock().unwrap().is_some());
+        assert!(node.controller.msg_eval_handle.lock().unwrap().is_some());
 
         // Test stop_all_tasks method
         node.stop_all_tasks();
-        assert!(node.receiver_handle.lock().unwrap().is_none());
+        assert!(node.controller.msg_eval_handle.lock().unwrap().is_none());
     }
 }

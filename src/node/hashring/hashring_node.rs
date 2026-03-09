@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use super::HashringController;
 use crate::error::{ColibriError, Result};
-use crate::limiters::NamedRateLimitRule;
+use crate::limiters::{RuleList, RuleName, SerializableRule};
 use crate::node::messages::{
     BucketExport, CheckCallsRequest, CheckCallsResponse, ExportMetadata, Message, StatusResponse,
     TopologyChangeRequest, TopologyResponse,
@@ -27,24 +27,14 @@ pub enum ReplicationFactor {
 pub struct HashringNode {
     pub node_name: NodeName,
 
-    /// The hashring controller
+    /// The hashring controller (manages all TCP communication)
     pub controller: Arc<HashringController>,
-
-    /// Receiver handle
-    pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl HashringNode {
     /// Stop the hashring receiver task
     pub fn stop_receiver(&self) {
-        if let Ok(mut handle) = self.receiver_handle.lock() {
-            if let Some(join_handle) = handle.take() {
-                join_handle.abort();
-                info!("Hashring receiver task stopped");
-            }
-        } else {
-            error!("Failed to acquire lock on receiver_handle during shutdown");
-        }
+        self.controller.stop_receiver();
     }
 
     /// Stop all background tasks
@@ -55,12 +45,8 @@ impl HashringNode {
 
 impl Drop for HashringNode {
     fn drop(&mut self) {
-        // Clean up receiver task when the node is dropped
-        if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
-            if let Some(handle) = receiver_handle.take() {
-                handle.abort();
-            }
-        }
+        // Clean up receiver task via controller when the node is dropped
+        self.controller.stop_receiver();
     }
 }
 
@@ -91,56 +77,12 @@ impl Node for HashringNode {
         // Create controller
         let controller = Arc::new(HashringController::new(settings.clone()).await?);
 
-        // Start TCP receiver to handle incoming cluster messages
-        let receiver_addr = settings.transport_config().peer_listen_url();
-        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1000);
-
-        let receiver =
-            crate::transport::TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
-        receiver.start().await;
-
-        // Spawn task to process incoming messages
-        let controller_for_receiver = controller.clone();
-        let receiver_handle = tokio::spawn(async move {
-            info!("Hashring TCP receiver started on {}", receiver_addr);
-            while let Some(request) = message_rx.recv().await {
-                // Deserialize and process message
-                match crate::node::messages::Message::deserialize(&request.data) {
-                    Ok(message) => {
-                        let response = match controller_for_receiver.handle_message(message).await {
-                            Ok(response) => response,
-                            Err(e) => {
-                                error!("Error handling hashring message: {}", e);
-                                // Send an error response
-                                continue;
-                            }
-                        };
-
-                        // Serialize response and send it back
-                        match response.serialize() {
-                            Ok(response_data) => {
-                                // Convert Bytes to Vec<u8>
-                                let response_vec = response_data.to_vec();
-                                if request.response_tx.send(response_vec).is_err() {
-                                    error!("Failed to send response back to peer");
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to serialize response: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize message: {}", e);
-                    }
-                }
-            }
-        });
+        // Start the controller's TCP receiver
+        controller.start_receiver().await?;
 
         Ok(Self {
             node_name,
             controller,
-            receiver_handle: Arc::new(Mutex::new(Some(receiver_handle))),
         })
     }
 
@@ -149,6 +91,7 @@ impl Node for HashringNode {
             client_id,
             rule_name: None,
             consume_token: false,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -165,6 +108,7 @@ impl Node for HashringNode {
             client_id,
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -187,15 +131,8 @@ impl Node for HashringNode {
         Ok(())
     }
 
-    async fn create_named_rule(
-        &self,
-        rule_name: String,
-        settings: settings::RateLimitSettings,
-    ) -> Result<()> {
-        let message = Message::CreateRateLimitRule {
-            rule_name,
-            settings,
-        };
+    async fn create_named_rule(&self, rule: SerializableRule) -> Result<()> {
+        let message = Message::CreateRateLimitRule(rule);
         match self.controller.handle_message(message).await? {
             Message::CreateRateLimitRuleResponse => Ok(()),
             _ => Err(ColibriError::Api(
@@ -204,7 +141,7 @@ impl Node for HashringNode {
         }
     }
 
-    async fn delete_named_rule(&self, rule_name: String) -> Result<()> {
+    async fn delete_named_rule(&self, rule_name: RuleName) -> Result<()> {
         let message = Message::DeleteRateLimitRule { rule_name };
         match self.controller.handle_message(message).await? {
             Message::DeleteRateLimitRuleResponse => Ok(()),
@@ -214,7 +151,7 @@ impl Node for HashringNode {
         }
     }
 
-    async fn list_named_rules(&self) -> Result<Vec<NamedRateLimitRule>> {
+    async fn list_named_rules(&self) -> Result<RuleList> {
         let message = Message::ListRateLimitRules;
         match self.controller.handle_message(message).await? {
             Message::ListRateLimitRulesResponse(rules) => Ok(rules),
@@ -224,7 +161,7 @@ impl Node for HashringNode {
         }
     }
 
-    async fn get_named_rule(&self, rule_name: String) -> Result<Option<NamedRateLimitRule>> {
+    async fn get_named_rule(&self, rule_name: RuleName) -> Result<Option<SerializableRule>> {
         let message = Message::GetRateLimitRule { rule_name };
         match self.controller.handle_message(message).await? {
             Message::GetRateLimitRuleResponse(rule) => Ok(rule),
@@ -236,13 +173,14 @@ impl Node for HashringNode {
 
     async fn rate_limit_custom(
         &self,
-        rule_name: String,
+        rule_name: RuleName,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
         let request = CheckCallsRequest {
             client_id: key,
             rule_name: Some(rule_name),
             consume_token: true,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -262,13 +200,14 @@ impl Node for HashringNode {
 
     async fn check_limit_custom(
         &self,
-        rule_name: String,
+        rule_name: RuleName,
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
         let request = CheckCallsRequest {
             client_id: key,
             rule_name: Some(rule_name),
             consume_token: false,
+            forwarding_depth: 0,
         };
         let message = Message::RateLimitRequest(request);
 
@@ -292,7 +231,7 @@ impl HashringNode {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                node_type: crate::settings::RunMode::Hashring,
+                node_type: settings::RunMode::Hashring,
                 bucket_count: 0,
             },
         };
@@ -341,109 +280,3 @@ impl HashringNode {
         }
     }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     //! Simple tests for HashringNode functionality - traffic direction and command forwarding
-
-//     use super::*;
-//     use std::collections::HashSet;
-
-//     fn test_settings() -> settings::Settings {
-//         let mut topology = HashSet::new();
-//         topology.insert("127.0.0.1:8422".to_string()); // Add this node's UDP address to topology
-//         let mut conf = settings::tests::sample();
-//         conf.topology = topology;
-//         conf
-//     }
-
-//     #[tokio::test]
-//     async fn test_hashring_node_creation() {
-//         let node_id = NodeId::new(1);
-//         let settings = test_settings();
-
-//         // Should create successfully
-//         let node = HashringNode::new(node_id, settings).await.unwrap();
-
-//         assert_eq!(node.node_id, node_id);
-//         assert!(node.cluster_inbox_tx.is_closed() == false);
-//         assert!(node.controller_handle.lock().unwrap().is_some());
-//     }
-
-//     #[tokio::test]
-//     async fn test_hashring_node_check_limit() {
-//         let node_id = NodeId::new(1);
-//         let settings = test_settings();
-//         let node = HashringNode::new(node_id, settings).await.unwrap();
-
-//         let client_id = "test_client".to_string();
-
-//         // Check limit should work (returns full limit for new client)
-//         let result = node.check_limit(client_id.clone()).await.unwrap();
-//         assert_eq!(result.client_id, client_id);
-//         assert_eq!(result.calls_remaining, 100); // From test_settings
-//     }
-
-//     #[tokio::test]
-//     async fn test_hashring_node_rate_limit() {
-//         let node_id = NodeId::new(1);
-//         let settings = test_settings();
-//         let node = HashringNode::new(node_id, settings).await.unwrap();
-
-//         let client_id = "test_client".to_string();
-
-//         // Rate limit should consume tokens and return remaining count
-//         let result = node.rate_limit(client_id.clone()).await.unwrap();
-//         assert!(result.is_some());
-
-//         let response = result.unwrap();
-//         assert_eq!(response.client_id, client_id);
-//         assert!(response.calls_remaining < 100); // Should have consumed tokens
-//     }
-
-//     #[tokio::test]
-//     async fn test_hashring_node_expire_keys() {
-//         let node_id = NodeId::new(1);
-//         let settings = test_settings();
-//         let node = HashringNode::new(node_id, settings).await.unwrap();
-
-//         // Should complete without error
-//         node.expire_keys().await.unwrap();
-//     }
-
-//     #[tokio::test]
-//     async fn test_hashring_node_command_forwarding() {
-//         let node_id = NodeId::new(1);
-//         let settings = test_settings();
-//         let node = HashringNode::new(node_id, settings).await.unwrap();
-
-//         let client_id = "test_client".to_string();
-
-//         // Make multiple operations to verify command forwarding works
-//         let check1 = node.check_limit(client_id.clone()).await.unwrap();
-//         let rate1 = node.rate_limit(client_id.clone()).await.unwrap().unwrap();
-//         let check2 = node.check_limit(client_id.clone()).await.unwrap();
-
-//         // Check that operations are properly forwarded and processed
-//         assert_eq!(check1.client_id, client_id);
-//         assert_eq!(rate1.client_id, client_id);
-//         assert_eq!(check2.client_id, client_id);
-
-//         // After rate limiting, remaining calls should be less than initial
-//         assert!(check2.calls_remaining < check1.calls_remaining);
-//     }
-
-//     #[tokio::test]
-//     async fn test_hashring_node_cleanup() {
-//         let node_id = NodeId::new(1);
-//         let settings = test_settings();
-//         let node = HashringNode::new(node_id, settings).await.unwrap();
-
-//         // Verify handle is initially present
-//         assert!(node.controller_handle.lock().unwrap().is_some());
-
-//         // Test cleanup method
-//         node.stop_controller();
-//         assert!(node.controller_handle.lock().unwrap().is_none());
-//     }
-// }

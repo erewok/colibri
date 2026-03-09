@@ -42,18 +42,16 @@ pub async fn expire_keys(State(state): State<node::NodeWrapper>) -> StatusCode {
 #[instrument(skip(state), level = "info")]
 pub async fn create_named_rate_limit_rule(
     State(state): State<node::NodeWrapper>,
-    axum::Json(new_rule): axum::Json<limiters::NamedRateLimitRule>,
+    axum::Json(new_rule): axum::Json<limiters::SerializableRule>,
 ) -> Result<StatusCode> {
-    state
-        .create_named_rule(new_rule.name, new_rule.settings)
-        .await?;
+    state.create_named_rule(new_rule).await?;
     Ok(StatusCode::CREATED)
 }
 
 #[instrument(skip(state), level = "info")]
 pub async fn list_named_rate_limit_rules(
     State(state): State<node::NodeWrapper>,
-) -> Result<axum::Json<Vec<limiters::NamedRateLimitRule>>> {
+) -> Result<axum::Json<limiters::RuleList>> {
     let rules = state.list_named_rules().await?;
     Ok(axum::Json(rules))
 }
@@ -63,8 +61,9 @@ pub async fn list_named_rate_limit_rules(
 pub async fn get_named_rate_limit_rule(
     Path(rule_name): Path<String>,
     State(state): State<node::NodeWrapper>,
-) -> Result<(StatusCode, axum::Json<Option<limiters::NamedRateLimitRule>>)> {
-    match state.get_named_rule(rule_name).await? {
+) -> Result<(StatusCode, axum::Json<Option<limiters::SerializableRule>>)> {
+    let rule = limiters::RuleName::from(rule_name);
+    match state.get_named_rule(rule).await? {
         None => return Ok((StatusCode::NOT_FOUND, axum::Json(None))),
         Some(rule) => Ok((StatusCode::OK, axum::Json(Some(rule)))),
     }
@@ -75,7 +74,8 @@ pub async fn delete_named_rate_limit_rule(
     Path(rule_name): Path<String>,
     State(state): State<node::NodeWrapper>,
 ) -> Result<StatusCode> {
-    state.delete_named_rule(rule_name).await?;
+    let rule = limiters::RuleName::from(rule_name);
+    state.delete_named_rule(rule).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -85,7 +85,8 @@ pub async fn rate_limit_custom(
     Path((rule_name, key)): Path<(String, String)>,
     State(state): State<node::NodeWrapper>,
 ) -> Result<axum::Json<messages::CheckCallsResponse>> {
-    let result = state.rate_limit_custom(rule_name, key).await?;
+    let rule = limiters::RuleName::from(rule_name);
+    let result = state.rate_limit_custom(rule, key).await?;
 
     match result {
         Some(resp) => Ok(axum::Json(resp)),
@@ -98,8 +99,6 @@ pub async fn check_limit_custom(
     Path((rule_name, key)): Path<(String, String)>,
     State(state): State<node::NodeWrapper>,
 ) -> Result<axum::Json<Option<messages::CheckCallsResponse>>> {
-    state
-        .check_limit_custom(rule_name, key)
-        .await
-        .map(axum::Json)
+    let rule = limiters::RuleName::from(rule_name);
+    state.check_limit_custom(rule, key).await.map(axum::Json)
 }

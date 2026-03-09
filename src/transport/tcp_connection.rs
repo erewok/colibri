@@ -8,9 +8,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tracing::trace;
 
 use super::socket_pool_tcp::TcpSocketPool;
 use super::stats::FrozenSocketPoolStats;
+use super::tcp_receiver::ProtocolType;
 use super::traits::{RequestSender, Sender};
 use crate::error::{ColibriError, Result};
 use crate::node::{messages::Message, NodeId};
@@ -72,7 +74,7 @@ impl TcpTransport {
     // FIRE-AND-FORGET OPERATIONS
     // ============================================================================
 
-    /// Send raw data without waiting for response (fire-and-forget)
+    /// Send raw data without waiting for response (fire-and-forget) using SocketAddr
     /// This spawns a task to send the message asynchronously
     pub async fn send_fire_and_forget(&self, peer: SocketAddr, data: &[u8]) -> Result<()> {
         let data = data.to_vec();
@@ -88,6 +90,16 @@ impl TcpTransport {
         Ok(())
     }
 
+    /// Send raw data without waiting for response (fire-and-forget) using NodeId
+    /// This looks up the peer address and sends with Gossip protocol type
+    pub async fn send_fire_and_forget_to_node(&self, target: NodeId, data: &[u8]) -> Result<()> {
+        self.socket_pool
+            .read()
+            .await
+            .send_fire_and_forget(target, data)
+            .await
+    }
+
     /// Internal helper to send data using the socket pool
     async fn send_with_socket_pool(
         _socket_pool: &Arc<RwLock<TcpSocketPool>>,
@@ -96,6 +108,9 @@ impl TcpTransport {
     ) -> Result<()> {
         let mut stream = tokio::net::TcpStream::connect(peer).await?;
 
+        // Write protocol type (fire-and-forget gossip)
+        stream.write_all(&[ProtocolType::Gossip.to_byte()]).await?;
+
         // Write length prefix
         let len = data.len() as u32;
         stream.write_all(&len.to_be_bytes()).await?;
@@ -103,6 +118,8 @@ impl TcpTransport {
         // Write payload
         stream.write_all(data).await?;
         stream.flush().await?;
+
+        trace!("Sent {} byte fire-and-forget message to {}", len, peer);
 
         Ok(())
     }
@@ -115,11 +132,18 @@ impl TcpTransport {
         tokio::time::timeout(timeout_duration, async {
             let mut stream = tokio::net::TcpStream::connect(peer).await?;
 
+            // Write protocol type (request-response)
+            stream
+                .write_all(&[ProtocolType::RequestResponse.to_byte()])
+                .await?;
+
             // Write request with length prefix
             let len = data.len() as u32;
             stream.write_all(&len.to_be_bytes()).await?;
             stream.write_all(data).await?;
             stream.flush().await?;
+
+            trace!("Sent {} byte request to {}", len, peer);
 
             // Read response length
             let mut len_bytes = [0u8; 4];
@@ -134,6 +158,8 @@ impl TcpTransport {
             // Read response data
             let mut response_data = vec![0u8; response_len];
             stream.read_exact(&mut response_data).await?;
+
+            trace!("Received {} byte response from {}", response_len, peer);
 
             Ok(response_data)
         })
@@ -210,26 +236,21 @@ impl TcpTransport {
 impl Sender for TcpTransport {
     /// Send data to a specific peer by NodeId (fire-and-forget)
     async fn send_to_peer(&self, target: NodeId, data: &[u8]) -> Result<()> {
-        // For TCP, this could be a simplified send without waiting for response
-        // or we could adapt it to send and ignore the response
-        let _response = self
-            .socket_pool
+        // Use proper fire-and-forget that sends Gossip protocol type
+        self.socket_pool
             .read()
             .await
-            .send_request_response(target, data)
-            .await?;
-        Ok(())
+            .send_fire_and_forget(target, data)
+            .await
     }
 
     /// Send data to a random peer (fire-and-forget)
     async fn send_to_random_peer(&self, data: &[u8]) -> Result<NodeId> {
-        let (node_id, _response) = self
-            .socket_pool
+        self.socket_pool
             .read()
             .await
-            .send_request_response_random(data)
-            .await?;
-        Ok(node_id)
+            .send_fire_and_forget_random(data)
+            .await
     }
 
     /// Send data to multiple random peers (fire-and-forget)
@@ -345,6 +366,7 @@ mod tests {
             client_id: "test-key".to_string(),
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         });
 
         let serialized = message.serialize();
@@ -372,6 +394,7 @@ mod tests {
             client_id: "test".to_string(),
             rule_name: None,
             consume_token: true,
+            forwarding_depth: 0,
         });
 
         // This should return immediately even if peer is not available

@@ -1,7 +1,7 @@
 //! TCP Socket Pool for Request-Response Communication
 //!
 //! Manages TCP connections for request-response patterns required by hashring nodes.
-use rand::Rng;
+use rand::RngExt;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

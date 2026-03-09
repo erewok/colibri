@@ -842,10 +842,7 @@ impl GossipController {
         let selected_peers: Vec<_> = {
             use rand::prelude::IndexedRandom;
             let mut rng = rand::rng();
-            peers
-                .choose_multiple(&mut rng, send_count)
-                .copied()
-                .collect()
+            peers.sample(&mut rng, send_count).copied().collect()
         }; // RNG is dropped here, before any await
 
         let mut sent_count = 0;

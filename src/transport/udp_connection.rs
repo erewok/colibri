@@ -132,7 +132,11 @@ impl UdpSocketPool {
 
     /// Add a new peer to the pool
     pub async fn add_peer(&mut self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
-        let bind_addr = if peer_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let bind_addr = if peer_addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
         let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| ColibriError::Transport(format!("Socket creation failed: {}", e)))?;

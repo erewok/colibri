@@ -1,7 +1,6 @@
 //! UDP Receiver
 //!
-//! Handles incoming UDP messages with support for both callback-based
-//! and channel-based message handling patterns.
+//! Handles incoming UDP messages by forwarding datagrams into an mpsc channel.
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

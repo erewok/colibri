@@ -20,7 +20,7 @@ pub struct GossipNode {
     /// Node name
     pub node_name: NodeName,
 
-    /// Controller - handles all operations via handle_message() and TCP communication
+    /// Controller - handles all operations via handle_message() and UDP network communication
     pub controller: Arc<GossipController>,
 }
 
@@ -77,7 +77,7 @@ impl Node for GossipNode {
             controller_clone.start().await;
         });
 
-        // Start the controller's TCP receiver
+        // Start the controller's UDP receiver
         controller.start_receiver().await?;
 
         Ok(Self {

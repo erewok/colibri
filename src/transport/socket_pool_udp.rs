@@ -99,7 +99,7 @@ mod tests {
 
         settings::TransportConfig {
             node_name: NodeName::from("Test".to_string()),
-            peer_listen_address: "127.0.0.1".parse().unwrap(),
+            peer_listen_address: "127.0.0.1".to_string(),
             peer_listen_port: 0,
             topology: cluster_urls,
         }

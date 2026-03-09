@@ -105,13 +105,13 @@ impl UdpSocketPool {
         // Now send to each peer without holding the main lock
         let mut successful_sends = Vec::new();
         // Do not allow the random rng to be used across await points: generate all random indexes now.
-        let rand_indexs: Vec<usize> = {
+        let rand_indices: Vec<usize> = {
             let mut rng = rand::rng();
             (0..count)
                 .map(|_| rng.random_range(0..self.peers.len()))
                 .collect()
         };
-        for random_usize in rand_indexs {
+        for random_usize in rand_indices {
             if let Some((target, _)) = self.peers.get_index(random_usize) {
                 match self.send_to(*target, data).await {
                     Ok(_) => successful_sends.push(*target),
@@ -132,7 +132,8 @@ impl UdpSocketPool {
 
     /// Add a new peer to the pool
     pub async fn add_peer(&mut self, peer_addr: SocketAddr, pool_size: usize) -> Result<()> {
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        let bind_addr = if peer_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| ColibriError::Transport(format!("Socket creation failed: {}", e)))?;
         self.peers.insert(peer_addr, Arc::new(Mutex::new(socket)));

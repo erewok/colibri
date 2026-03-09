@@ -398,12 +398,12 @@ impl GossipController {
                 );
                 self.create_rate_limit_rule(rule.name.as_str().to_string(), rule.settings)
                     .await?;
-                Ok(Message::Ack)
+                Ok(Message::CreateRateLimitRuleResponse)
             }
 
             Message::DeleteRateLimitRule { rule_name } => {
                 self.delete_rate_limit_rule(rule_name).await?;
-                Ok(Message::Ack)
+                Ok(Message::DeleteRateLimitRuleResponse)
             }
 
             Message::GetRateLimitRule { rule_name } => {

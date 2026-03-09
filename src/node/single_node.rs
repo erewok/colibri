@@ -95,6 +95,17 @@ impl Node for SingleNode {
     }
 
     async fn create_named_rule(&self, rule: rules::SerializableRule) -> Result<()> {
+        let name_str = rule.name.as_str();
+
+        if name_str.is_empty() {
+            return Err(ColibriError::Api("Rule name cannot be empty".to_string()));
+        }
+        if name_str == "default" || name_str == rules::DEFAULT_RULE_NAME {
+            return Err(ColibriError::Api(
+                "Cannot create or modify the default rule".to_string(),
+            ));
+        }
+
         let mut limiters = self.named_rate_limiters.write().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
         })?;

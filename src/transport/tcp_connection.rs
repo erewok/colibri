@@ -246,13 +246,11 @@ impl Sender for TcpTransport {
 
     /// Send data to a random peer (fire-and-forget)
     async fn send_to_random_peer(&self, data: &[u8]) -> Result<NodeId> {
-        let (node_id, _response) = self
-            .socket_pool
+        self.socket_pool
             .read()
             .await
-            .send_request_response_random(data)
-            .await?;
-        Ok(node_id)
+            .send_fire_and_forget_random(data)
+            .await
     }
 
     /// Send data to multiple random peers (fire-and-forget)

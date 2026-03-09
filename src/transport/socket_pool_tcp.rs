@@ -199,6 +199,20 @@ impl TcpSocketPool {
             Err(ColibriError::Transport("No peers available".to_string()))
         }
     }
+    /// Send data to a random peer without waiting for a response
+    pub async fn send_fire_and_forget_random(&self, data: &[u8]) -> Result<NodeId> {
+        if self.peer_connections.is_empty() {
+            return Err(ColibriError::Transport("No peers available".to_string()));
+        }
+        let random_idx = rand::rng().random_range(0..self.peer_connections.len());
+        if let Some((node_id, _)) = self.peer_connections.get_index(random_idx) {
+            self.send_fire_and_forget(*node_id, data).await?;
+            Ok(*node_id)
+        } else {
+            Err(ColibriError::Transport("No peers available".to_string()))
+        }
+    }
+
     /// Get a connection from the pool or create a new one
     async fn get_or_create_connection(
         &self,

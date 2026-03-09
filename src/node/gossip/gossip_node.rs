@@ -303,7 +303,7 @@ mod tests {
         // Should create successfully
         let node = GossipNode::new(settings).await.unwrap();
         // Controller is Arc so just verify it's set up
-        assert!(node.controller.receiver_handle.lock().unwrap().is_some());
+        assert!(node.controller.msg_eval_handle.lock().unwrap().is_some());
     }
 
     #[tokio::test]
@@ -372,10 +372,10 @@ mod tests {
 
         // Verify controller and receiver are initialized
         // Controller is Arc so just check it's not null by trying to use it
-        assert!(node.controller.receiver_handle.lock().unwrap().is_some());
+        assert!(node.controller.msg_eval_handle.lock().unwrap().is_some());
 
         // Test stop_all_tasks method
         node.stop_all_tasks();
-        assert!(node.controller.receiver_handle.lock().unwrap().is_none());
+        assert!(node.controller.msg_eval_handle.lock().unwrap().is_none());
     }
 }

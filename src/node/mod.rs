@@ -14,7 +14,7 @@ use crate::limiters::{self, rules};
 use crate::settings;
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;
-pub use messages::{AdminCommand, AdminResponse, BucketExport, ExportMetadata};
+pub use messages::{BucketExport, ExportMetadata};
 pub use node_id::{NodeAddress, NodeId, NodeName};
 pub use single_node::SingleNode;
 

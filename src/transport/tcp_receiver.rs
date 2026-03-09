@@ -76,8 +76,8 @@ impl TcpReceiver {
         })
     }
 
-    /// Start the receiving task
-    pub async fn start(&self) -> () {
+    /// Start the receiving task and return its join handle for cancellation
+    pub fn start(&self) -> tokio::task::JoinHandle<()> {
         let socket = self.socket.clone();
         let stats = self.stats.clone();
         let tx_clone = self.message_tx.clone();
@@ -220,7 +220,7 @@ impl TcpReceiver {
                     }
                 });
             }
-        });
+        })
     }
 
     /// Get receiver statistics
@@ -234,7 +234,25 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, timeout, Duration};
+
     use super::*;
+
+    async fn connect_and_send(addr: SocketAddr, frame: &[u8]) -> TcpStream {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(frame).await.unwrap();
+        stream.flush().await.unwrap();
+        stream
+    }
+
+    fn framed(protocol: ProtocolType, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![protocol.to_byte()];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
 
     #[tokio::test]
     async fn test_receiver_creation() {
@@ -243,5 +261,124 @@ mod tests {
         let receiver = TcpReceiver::new(bind_addr, Arc::new(tx)).await.unwrap();
 
         assert_eq!(receiver.get_stats().messages_received, 0);
+    }
+
+    #[tokio::test]
+    async fn test_gossip_protocol_no_response_channel() {
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let (tx, mut rx) = mpsc::channel(10);
+        let receiver = TcpReceiver::new(bind_addr, Arc::new(tx)).await.unwrap();
+        let addr = receiver.local_addr;
+        let _handle = receiver.start();
+        sleep(Duration::from_millis(10)).await;
+
+        let payload = b"gossip message";
+        connect_and_send(addr, &framed(ProtocolType::Gossip, payload)).await;
+
+        let request = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        assert_eq!(request.data.as_ref(), payload);
+        assert_eq!(request.protocol_type, ProtocolType::Gossip);
+        assert!(
+            request.response_tx.is_none(),
+            "Gossip must not have a response channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_response_protocol_roundtrip() {
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let (tx, mut rx) = mpsc::channel(10);
+        let receiver = TcpReceiver::new(bind_addr, Arc::new(tx)).await.unwrap();
+        let addr = receiver.local_addr;
+        let _handle = receiver.start();
+        sleep(Duration::from_millis(10)).await;
+
+        let payload = b"request payload";
+        let frame = framed(ProtocolType::RequestResponse, payload);
+
+        // Spawn the sender in a task so it can also wait to read the response
+        let response_payload = b"response data";
+        let response_clone: &'static [u8] = response_payload;
+
+        let sender_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&frame).await.unwrap();
+            stream.flush().await.unwrap();
+
+            // Read the length-prefixed response
+            let mut len_buf = [0u8; 4];
+            use tokio::io::AsyncReadExt;
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut resp = vec![0u8; len];
+            stream.read_exact(&mut resp).await.unwrap();
+            resp
+        });
+
+        // Receive the request and send back a response
+        let request = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        assert_eq!(request.data.as_ref(), payload);
+        assert_eq!(request.protocol_type, ProtocolType::RequestResponse);
+        let response_tx = request
+            .response_tx
+            .expect("RequestResponse must have a response channel");
+        response_tx.send(response_clone.to_vec()).unwrap();
+
+        let received_response = timeout(Duration::from_millis(200), sender_task)
+            .await
+            .expect("timeout")
+            .expect("task panicked");
+        assert_eq!(received_response, response_clone);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_protocol_byte_rejected() {
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let (tx, mut rx) = mpsc::channel(10);
+        let receiver = TcpReceiver::new(bind_addr, Arc::new(tx)).await.unwrap();
+        let addr = receiver.local_addr;
+        let _handle = receiver.start();
+        sleep(Duration::from_millis(10)).await;
+
+        // Send an invalid protocol byte followed by a valid-looking frame
+        let mut bad_frame = vec![0xFFu8]; // unknown protocol byte
+        bad_frame.extend_from_slice(&(4u32).to_be_bytes());
+        bad_frame.extend_from_slice(b"data");
+        connect_and_send(addr, &bad_frame).await;
+
+        // Nothing should arrive on the channel
+        let result = timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Unknown protocol byte must be rejected silently"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversized_message_rejected() {
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let (tx, mut rx) = mpsc::channel(10);
+        let receiver = TcpReceiver::new(bind_addr, Arc::new(tx)).await.unwrap();
+        let addr = receiver.local_addr;
+        let _handle = receiver.start();
+        sleep(Duration::from_millis(10)).await;
+
+        // Declare a message larger than the 10 MB limit (without actually sending that data)
+        let oversized_len: u32 = 11 * 1024 * 1024; // 11 MB
+        let mut frame = vec![ProtocolType::Gossip.to_byte()];
+        frame.extend_from_slice(&oversized_len.to_be_bytes());
+        // Don't need to send the actual data — receiver rejects before reading it
+        connect_and_send(addr, &frame).await;
+
+        let result = timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err(), "Oversized message must be rejected");
     }
 }

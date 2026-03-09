@@ -3,7 +3,7 @@
 //! Handles incoming UDP messages with support for both callback-based
 //! and channel-based message handling patterns.
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::error::{ColibriError, Result};
-use crate::transport::stats::ReceiverStats;
+use crate::transport::stats::{FrozenReceiverStats, ReceiverStats};
 
 /// UDP message receiver with flexible handling patterns
 pub struct UdpReceiver {
@@ -43,9 +43,8 @@ impl UdpReceiver {
         })
     }
 
-    /// Get a channel receiver for incoming messages
-    pub async fn start(&self) -> () {
-        // Start the receiving task if not already started
+    /// Start the receiving task and return its join handle for cancellation
+    pub fn start(&self) -> tokio::task::JoinHandle<()> {
         let socket = self.socket.clone();
         let stats = self.stats.clone();
         let tx_clone = self.message_tx.clone();
@@ -72,22 +71,18 @@ impl UdpReceiver {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Get receiver statistics
-    pub fn get_stats(&self) -> ReceiverStats {
-        ReceiverStats {
-            messages_received: AtomicU64::new(self.stats.messages_received.load(Ordering::Relaxed)),
-            receive_errors: AtomicU64::new(self.stats.receive_errors.load(Ordering::Relaxed)),
-        }
+    pub fn get_stats(&self) -> FrozenReceiverStats {
+        self.stats.freeze()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use tokio::time::{sleep, timeout, Duration};
@@ -100,13 +95,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1000);
         let receiver = UdpReceiver::new(bind_addr, Arc::new(tx)).await.unwrap();
 
-        assert_eq!(
-            receiver
-                .get_stats()
-                .messages_received
-                .load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(receiver.get_stats().messages_received, 0);
     }
 
     #[tokio::test]
@@ -117,7 +106,7 @@ mod tests {
             .await
             .unwrap();
 
-        receiver.start().await;
+        let _handle = receiver.start();
         // Give the receiver task a moment to start
         sleep(Duration::from_millis(10)).await;
 
@@ -140,6 +129,6 @@ mod tests {
         }
 
         let stats = receiver.get_stats();
-        assert_eq!(stats.messages_received.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.messages_received, 1);
     }
 }

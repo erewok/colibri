@@ -3,15 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use papaya::HashMap;
 use tokio::sync::mpsc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::rules::{self, RuleName, SerializableRule};
 use crate::limiters::TokenBucketLimiter;
 use crate::node::messages::{
-    CheckCallsRequest, CheckCallsResponse, Message, Queueable, Status, StatusResponse,
-    TopologyResponse,
+    CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
 };
 use crate::node::{NodeAddress, NodeName};
 use crate::settings::{self, ClusterTopology, RunMode};
@@ -36,11 +35,10 @@ pub struct HashringController {
     receiver: Arc<TcpReceiver>,
     /// Channel ownership transfer pattern
     receive_chan: Arc<Mutex<Option<mpsc::Receiver<TcpRequest>>>>,
-    /// Spawned task handle for message processing
-    pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Shutdown signaling (will be used for graceful shutdown)
-    #[allow(dead_code)]
-    shutdown_tx: broadcast::Sender<()>,
+    /// Handle for the TCP accept loop (loops on socket.accept, pushes TcpRequests into the channel)
+    msg_receive_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the message evaluation loop (reads from channel, calls handle_message)
+    msg_eval_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for HashringController {
@@ -81,7 +79,7 @@ impl HashringController {
         )));
         named_rate_limiters
             .pin()
-            .insert("<_default>".to_string(), default_limiter);
+            .insert(rules::DEFAULT_RULE_NAME.to_string(), default_limiter);
 
         let transport_config = settings.transport_config();
         let transport = TcpTransport::new(&transport_config).await?;
@@ -90,9 +88,6 @@ impl HashringController {
         let receiver_addr = settings.transport_config().peer_listen_url();
         let (message_tx, receive_chan) = tokio::sync::mpsc::channel(1000);
         let receiver = TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
-
-        // Create shutdown channel
-        let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             node_name,
@@ -104,24 +99,22 @@ impl HashringController {
             receiver_addr,
             receiver: Arc::new(receiver),
             receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
-            receiver_handle: Arc::new(Mutex::new(None)),
-            shutdown_tx,
+            msg_receive_handle: Arc::new(Mutex::new(None)),
+            msg_eval_handle: Arc::new(Mutex::new(None)),
         })
-    }
-
-    /// Start the main controller loop
-    pub async fn start(self, mut command_rx: mpsc::Receiver<Queueable>) {
-        info!("HashringController started for node {}", self.node_name);
-
-        while let Some(_command) = command_rx.recv().await {}
-
-        info!("HashringController stopped for node {}", self.node_name);
     }
 
     /// Start the TCP receiver and message processing loop
     pub async fn start_receiver(&self) -> Result<()> {
-        // Start the TCP receiver
-        self.receiver.start().await;
+        // Start the TCP accept loop and store its handle
+        let receive_handle = self.receiver.start();
+        {
+            let mut h = self
+                .msg_receive_handle
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            *h = Some(receive_handle);
+        }
 
         // Take ownership of the receive channel
         let mut receive_chan = {
@@ -189,27 +182,34 @@ impl HashringController {
             info!("Hashring TCP receiver stopped");
         });
 
-        // Store the handle
+        // Store the eval handle
         {
-            let mut receiver_handle = self
-                .receiver_handle
+            let mut h = self
+                .msg_eval_handle
                 .lock()
                 .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-            *receiver_handle = Some(handle);
+            *h = Some(handle);
         }
 
         Ok(())
     }
 
-    /// Stop the TCP receiver task
+    /// Stop both the TCP accept loop and the message evaluation loop
     pub fn stop_receiver(&self) {
-        if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
-            if let Some(handle) = receiver_handle.take() {
+        if let Ok(mut h) = self.msg_receive_handle.lock() {
+            if let Some(handle) = h.take() {
                 handle.abort();
-                info!("Hashring TCP receiver task stopped");
             }
         } else {
-            error!("Failed to acquire lock on receiver_handle during shutdown");
+            error!("Failed to acquire lock on msg_receive_handle during shutdown");
+        }
+        if let Ok(mut h) = self.msg_eval_handle.lock() {
+            if let Some(handle) = h.take() {
+                handle.abort();
+                info!("Hashring receiver stopped");
+            }
+        } else {
+            error!("Failed to acquire lock on msg_eval_handle during shutdown");
         }
     }
 

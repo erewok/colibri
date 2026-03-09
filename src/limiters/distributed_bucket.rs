@@ -170,6 +170,7 @@ impl DistributedBucketExternal {
             counter: self.counter.clone(),
             requests: Vec::new(),
             last_call: Utc::now().timestamp_millis(),
+            last_gossiped_vclock: VClock::new(),
         }
     }
 }
@@ -181,6 +182,8 @@ struct DistributedBucket {
     // internal state only: timestamps
     requests: Vec<InternalRequestEntry>,
     last_call: i64,
+    // vclock at the time this bucket was last included in a gossip batch
+    last_gossiped_vclock: VClock<NodeId>,
 }
 
 impl DistributedBucket {
@@ -196,13 +199,11 @@ impl DistributedBucket {
         true
     }
     pub fn has_updates_since_last_gossip(&self) -> bool {
-        let entry = self.requests.iter().last();
-        if let Some(entry) = entry {
-            if entry.vclock > self.counter.vclock {
-                return true;
-            }
-        }
-        false
+        self.counter.vclock > self.last_gossiped_vclock
+    }
+
+    pub fn mark_gossiped(&mut self) {
+        self.last_gossiped_vclock = self.counter.vclock.clone();
     }
 
     pub fn expire_entries(&mut self, expiration_threshold_ms: i64) {
@@ -249,6 +250,7 @@ impl Bucket for DistributedBucket {
             counter: DistributedRequestCounter::new(node_id),
             requests: Vec::new(),
             last_call: Utc::now().timestamp_millis(),
+            last_gossiped_vclock: VClock::new(),
         };
         instance.counter.inc_refills(node_id, max_calls as u64);
         instance
@@ -411,15 +413,15 @@ impl DistributedBucketLimiter {
         }
     }
 
-    /// Create state suitable for gossiping to other nodes
+    /// Create state suitable for gossiping to other nodes.
+    /// Only includes buckets with local changes since the last gossip batch,
+    /// then advances each included bucket's gossip watermark so they are
+    /// not re-sent until they have new operations.
     pub fn gossip_delta_state(&self) -> Vec<DistributedBucketExternal> {
-        // The problem here is selecting only the relevant entries to gossip.
-        // We also don't want to send a massive amount of packets.
-        // We break it into a vector in order to send smaller chunks.
-        // If we do not broadcast and we have a lot of delta states to send
-        // We may not end up gossiping everything we need to.
-        self.node_counters
-            .pin()
+        let guard = self.node_counters.pin();
+
+        // Phase 1: collect buckets that have changed since last gossip
+        let result: Vec<DistributedBucketExternal> = guard
             .iter()
             .filter_map(|(client_id, bucket)| {
                 if bucket.has_updates_since_last_gossip() {
@@ -428,7 +430,22 @@ impl DistributedBucketLimiter {
                     None
                 }
             })
-            .collect()
+            .collect();
+
+        // Phase 2: advance the gossip watermark for each included bucket
+        for ext in &result {
+            guard.update_or_insert_with(
+                ext.client_id.clone(),
+                |bucket| {
+                    let mut b = bucket.clone();
+                    b.mark_gossiped();
+                    b
+                },
+                || ext.bucket(),
+            );
+        }
+
+        result
     }
     pub fn client_delta_state_for_gossip(
         &self,
@@ -655,15 +672,25 @@ mod tests {
         limiter1.limit_calls_for_client(client_id.clone());
         limiter2.limit_calls_for_client(client_id.clone());
 
-        // Get gossip state and merge
+        // Get gossip state — node2 made a rate-limit call so it must have a delta
         let gossip_from_node2 = limiter2.gossip_delta_state();
-        assert!(gossip_from_node2.is_empty());
+        assert!(
+            !gossip_from_node2.is_empty(),
+            "node2 should have a delta after rate-limiting"
+        );
 
         limiter1.accept_delta_state(&gossip_from_node2);
 
-        // After merge, node1 should see combined state
+        // After merge, node1 sees node2's request: tokens consumed on both nodes
         let tokens = limiter1.check_calls_remaining_for_client(&client_id);
         assert!(tokens > 0);
+
+        // A second call to gossip_delta_state should return empty (watermark is current)
+        let gossip_from_node2_again = limiter2.gossip_delta_state();
+        assert!(
+            gossip_from_node2_again.is_empty(),
+            "no new operations since last gossip"
+        );
     }
 
     #[test]
@@ -697,13 +724,18 @@ mod tests {
         foreign_limiter.limit_calls_for_client("foreign_client".to_string());
 
         let gossip_state = foreign_limiter.gossip_delta_state();
+        assert!(
+            !gossip_state.is_empty(),
+            "foreign_limiter should have a delta after rate-limiting"
+        );
         limiter.accept_delta_state(&gossip_state);
 
-        assert_eq!(limiter.len(), 1);
+        // limiter now holds both "test_client" (local) and "foreign_client" (gossiped in)
+        assert_eq!(limiter.len(), 2);
 
-        // Should not expire foreign node buckets (only expires own node buckets)
+        // Should not expire either bucket (both are recent)
         limiter.expire_keys();
-        assert_eq!(limiter.len(), 1);
+        assert_eq!(limiter.len(), 2);
     } // === CRDT Properties Tests ===
 
     #[test]

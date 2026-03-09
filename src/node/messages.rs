@@ -7,19 +7,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{rules, DistributedBucketExternal, TokenBucketLimiter};
+use crate::limiters::{rules, DistributedBucketExternal};
 use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{RateLimitSettings, RunMode};
-
-// Controllers and Nodes use queuable messages to send/receive messages internally.
-/// To receive a response, provide a oneshot sender along with the message.
-///
-pub type ClusterMessageResult = Result<ClusterMessageResponse>;
-
-pub struct Queueable {
-    pub envelope: MessageEnvelope,
-    pub response_tx: oneshot::Sender<ClusterMessageResult>,
-}
 
 /// Unified command type for controller queues
 pub struct Command {
@@ -119,83 +109,6 @@ pub struct TopologyResponse {
 pub struct CreateRateLimitRule {
     pub rule_name: String,
     pub settings: RateLimitSettings,
-}
-
-/// Administrative commands
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AdminCommand {
-    /// Add a new node to cluster membership
-    AddNode { name: NodeName, address: SocketAddr },
-    /// Remove a node from cluster membership
-    RemoveNode { name: NodeName, address: SocketAddr },
-    /// Export all rate limiting data (for cluster migration)
-    ExportBuckets,
-    /// Import rate limiting data (for cluster migration)
-    ImportBuckets { filename: String, run_mode: RunMode },
-    /// Get current topology information
-    GetTopology,
-}
-
-/// Gossip message types for production delta-state protocol
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClusterMessage {
-    AdminCommand(AdminCommand),
-    StatusRequest,
-    GetTopology,
-    TopologyChangeRequest(TopologyChangeRequest),
-    // Rate limit configuration synchronization messages
-    RateLimitConfigCreate(CreateRateLimitRule),
-    RateLimitConfigDelete(String), // rule name
-    RateLimitConfigGet(String),    // rule name
-    RateLimitConfigList,           // rule name
-    RateLimitRequest(CheckCallsRequest),
-    // Request for specific state
-    StateRequest(Vec<String>), // keys requested
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClusterMessageResponse {
-    // Node + cluster info
-    AdminResponse(StatusResponse),
-    StatusResponse(StatusResponse),
-    TopologyResponse(TopologyResponse),
-    // Rate limit responses
-    RateLimitResponse(CheckCallsResponse),
-    RateLimitConfigCreateResponse,
-    RateLimitConfigDeleteResponse,
-    RateLimitConfigGetResponse(Option<rules::SerializableRule>),
-    RateLimitConfigListResponse(Vec<rules::SerializableRule>),
-    /// Response to state request with missing data
-    TokenBucketStateResponse(Vec<TokenBucketLimiter>),
-    DistributedBucketStateResponse(Vec<DistributedBucketExternal>),
-}
-
-/// Message routing and delivery information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageEnvelope {
-    /// Who sent this message
-    pub from: NodeName,
-    /// Who should receive this message
-    pub to: NodeName,
-    /// The actual message
-    pub message: ClusterMessage,
-    /// Simple lamport-clock timestamp for ordering
-    pub request_id: u64,
-}
-
-impl MessageEnvelope {
-    /// Create a new message envelope
-    pub fn new(from: NodeName, to: NodeName, message: ClusterMessage, request_id: u64) -> Self {
-        Self {
-            from,
-            to,
-            message,
-            request_id,
-        }
-    }
-    pub fn from_incoming_message(data: bytes::Bytes) -> Result<Self> {
-        deserialize(&data)
-    }
 }
 
 // ============================================================================
@@ -538,16 +451,6 @@ mod message_tests {
 // ============================================================================
 // ADDITIONAL TYPES
 // ============================================================================
-
-/// Admin command responses
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AdminResponse {
-    Ack,
-    Error { message: String },
-    Topology(TopologyResponse),
-    Export(BucketExport),
-    Status(StatusResponse),
-}
 
 /// Bucket export data structure
 #[derive(Debug, Clone, Serialize, Deserialize)]

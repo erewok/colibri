@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use papaya::HashMap;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -42,11 +42,10 @@ pub struct GossipController {
     receiver: Arc<UdpReceiver>,
     /// Channel ownership transfer pattern
     receive_chan: GossipReceiveChannel,
-    /// Spawned task handle for message processing
-    pub receiver_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Shutdown signaling
-    #[allow(dead_code)]
-    shutdown_tx: broadcast::Sender<()>,
+    /// Handle for the UDP recv loop (loops on socket.recv_from, pushes datagrams into the channel)
+    msg_receive_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the message evaluation loop (reads from channel, calls process_gossip_packet)
+    pub msg_eval_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for GossipController {
@@ -92,9 +91,6 @@ impl GossipController {
         let (message_tx, receive_chan) = tokio::sync::mpsc::channel(1000);
         let receiver = UdpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
 
-        // Create shutdown channel
-        let (shutdown_tx, _) = broadcast::channel(1);
-
         Ok(Self {
             node_name,
             node_id,
@@ -107,8 +103,8 @@ impl GossipController {
             receiver_addr,
             receiver: Arc::new(receiver),
             receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
-            receiver_handle: Arc::new(Mutex::new(None)),
-            shutdown_tx,
+            msg_receive_handle: Arc::new(Mutex::new(None)),
+            msg_eval_handle: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -127,7 +123,9 @@ impl GossipController {
         request: CheckCallsRequest,
     ) -> Result<CheckCallsResponse> {
         let limiter_arc = self.get_limiter(request.rule_name.as_ref().map(|r| r.as_str()))?;
-        let mut limiter = limiter_arc.lock().unwrap();
+        let mut limiter = limiter_arc
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
 
         let calls_remaining = if request.consume_token {
             limiter.limit_calls_for_client(request.client_id.clone())
@@ -266,7 +264,9 @@ impl GossipController {
     async fn get_rate_limit_rule(&self, rule_name: RuleName) -> Result<Option<SerializableRule>> {
         let key = rule_name.as_str();
         if let Some(limiter_arc) = self.named_rate_limiters.pin().get(key).cloned() {
-            let limiter = limiter_arc.lock().unwrap();
+            let limiter = limiter_arc
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
             let settings = limiter.get_settings().clone();
             return Ok(Some(SerializableRule {
                 name: rule_name,
@@ -286,7 +286,9 @@ impl GossipController {
             } else {
                 name.clone()
             };
-            let limiter = limiter_arc.lock().unwrap();
+            let limiter = limiter_arc
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
             rules.push(SerializableRule {
                 name: RuleName::from(user_facing_name),
                 settings: limiter.get_settings().clone(),
@@ -298,8 +300,15 @@ impl GossipController {
 
     /// Start the UDP receiver and gossip packet processing loop
     pub async fn start_receiver(&self) -> Result<()> {
-        // Start the UDP receiver
-        self.receiver.start().await;
+        // Start the UDP recv loop and store its handle
+        let receive_handle = self.receiver.start();
+        {
+            let mut h = self
+                .msg_receive_handle
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            *h = Some(receive_handle);
+        }
 
         // Take ownership of the receive channel
         let mut receive_chan = {
@@ -329,27 +338,34 @@ impl GossipController {
             info!("Gossip UDP receiver stopped");
         });
 
-        // Store the handle
+        // Store the eval handle
         {
-            let mut receiver_handle = self
-                .receiver_handle
+            let mut h = self
+                .msg_eval_handle
                 .lock()
                 .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-            *receiver_handle = Some(handle);
+            *h = Some(handle);
         }
 
         Ok(())
     }
 
-    /// Stop the UDP receiver task
+    /// Stop both the UDP recv loop and the message evaluation loop
     pub fn stop_receiver(&self) {
-        if let Ok(mut receiver_handle) = self.receiver_handle.lock() {
-            if let Some(handle) = receiver_handle.take() {
+        if let Ok(mut h) = self.msg_receive_handle.lock() {
+            if let Some(handle) = h.take() {
                 handle.abort();
-                info!("Gossip UDP receiver task stopped");
             }
         } else {
-            error!("Failed to acquire lock on receiver_handle during shutdown");
+            error!("Failed to acquire lock on msg_receive_handle during shutdown");
+        }
+        if let Ok(mut h) = self.msg_eval_handle.lock() {
+            if let Some(handle) = h.take() {
+                handle.abort();
+                info!("Gossip receiver stopped");
+            }
+        } else {
+            error!("Failed to acquire lock on msg_eval_handle during shutdown");
         }
     }
 
@@ -438,7 +454,9 @@ impl GossipController {
     ) -> Result<()> {
         {
             let limiter_arc = self.get_limiter(None)?;
-            let mut limiter = limiter_arc.lock().unwrap();
+            let mut limiter = limiter_arc
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
             limiter.accept_delta_state(&updates);
             debug!(
                 "[{}] Merged {} delta updates from gossip",
@@ -480,7 +498,9 @@ impl GossipController {
         missing_keys: Option<Vec<String>>,
     ) -> Result<Vec<DistributedBucketExternal>> {
         let limiter_arc = self.get_limiter(None)?;
-        let limiter = limiter_arc.lock().unwrap();
+        let limiter = limiter_arc
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
 
         if let Some(_keys) = missing_keys {
             debug!(
@@ -570,7 +590,9 @@ impl GossipController {
                         "Failed to get default limiter".to_string(),
                     )
                 })?;
-                let guard = limiter_arc.lock().unwrap();
+                let guard = limiter_arc
+                    .lock()
+                    .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
                 guard.get_latest_updated_vclock()
             };
 
@@ -594,7 +616,9 @@ impl GossipController {
     /// Collect buckets that have been updated and should be gossiped
     pub async fn collect_gossip_updates(&self) -> Result<Vec<DistributedBucketExternal>> {
         let limiter_arc = self.get_limiter(None)?;
-        let guard = limiter_arc.lock().unwrap();
+        let guard = limiter_arc
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
         Ok(guard.gossip_delta_state())
     }
 
@@ -862,10 +886,15 @@ impl GossipController {
             entries.len()
         );
         match self.get_limiter(None) {
-            Ok(arc) => {
-                arc.lock().unwrap().accept_delta_state(entries);
-                debug!("[{}] merge_gossip_state_static completed", node_id);
-            }
+            Ok(arc) => match arc.lock() {
+                Ok(mut limiter) => {
+                    limiter.accept_delta_state(entries);
+                    debug!("[{}] merge_gossip_state_static completed", node_id);
+                }
+                Err(e) => {
+                    error!("[{}] Failed to acquire limiter lock: {}", node_id, e);
+                }
+            },
             Err(e) => {
                 error!("[{}] Failed to get default limiter: {}", node_id, e);
             }
@@ -917,7 +946,9 @@ impl GossipController {
         };
 
         if let Some(limiter_arc) = self.named_rate_limiters.pin().get(internal_key).cloned() {
-            let limiter = limiter_arc.lock().unwrap();
+            let limiter = limiter_arc
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
             let settings = limiter.get_settings().clone();
             return Ok(Some(SerializableRule {
                 name: RuleName::from(rule_name),
@@ -959,7 +990,9 @@ impl GossipController {
             } else {
                 name.clone()
             };
-            let limiter = limiter_arc.lock().unwrap();
+            let limiter = limiter_arc
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
             rules.push(SerializableRule {
                 name: RuleName::from(user_facing_name),
                 settings: limiter.get_settings().clone(),
@@ -976,7 +1009,9 @@ impl GossipController {
         key: String,
     ) -> Result<Option<CheckCallsResponse>> {
         let limiter_arc = self.get_limiter(Some(rule_name.as_str()))?;
-        let mut limiter = limiter_arc.lock().unwrap();
+        let mut limiter = limiter_arc
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
 
         let calls_left = limiter.limit_calls_for_client(key.clone());
         calls_left
@@ -997,7 +1032,9 @@ impl GossipController {
         key: String,
     ) -> Result<CheckCallsResponse> {
         let limiter_arc = self.get_limiter(Some(rule_name.as_str()))?;
-        let limiter = limiter_arc.lock().unwrap();
+        let limiter = limiter_arc
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
         let calls_remaining = limiter.check_calls_remaining_for_client(&key);
         Ok(CheckCallsResponse {
             client_id: key,

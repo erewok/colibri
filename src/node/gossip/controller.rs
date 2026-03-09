@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::error::{ColibriError, Result};
 use crate::limiters::{
     distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter},
-    rules::{RuleList, RuleName, SerializableRule},
+    rules::{RuleList, RuleName, SerializableRule, DEFAULT_RULE_NAME},
 };
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
@@ -80,7 +80,7 @@ impl GossipController {
         )));
         named_rate_limiters
             .pin()
-            .insert("<_default>".to_string(), default_limiter);
+            .insert(DEFAULT_RULE_NAME.to_string(), default_limiter);
 
         let transport_config = settings.transport_config();
         let transport = UdpTransport::new(&transport_config).await?;
@@ -110,7 +110,7 @@ impl GossipController {
 
     /// Get rate limiter Arc for a given rule name (or default if None)
     fn get_limiter(&self, rule_name: Option<&str>) -> Result<Arc<Mutex<DistributedBucketLimiter>>> {
-        let key = rule_name.unwrap_or("<_default>");
+        let key = rule_name.unwrap_or(DEFAULT_RULE_NAME);
         self.named_rate_limiters
             .pin()
             .get(key)
@@ -221,7 +221,7 @@ impl GossipController {
         }
 
         // Don't allow creating/overwriting the default rule
-        if rule_name == "default" || rule_name == "<_default>" {
+        if rule_name == DEFAULT_RULE_NAME {
             debug!(
                 "[{}] Ignoring request to create/modify default rule",
                 self.node_id
@@ -242,7 +242,7 @@ impl GossipController {
 
     async fn delete_rate_limit_rule(&self, rule_name: RuleName) -> Result<()> {
         // Don't allow deleting the default rule
-        if rule_name.as_str() == "default" || rule_name.as_str() == "<_default>" {
+        if rule_name.as_str() == DEFAULT_RULE_NAME {
             return Err(ColibriError::Api(
                 "Cannot delete the default rule".to_string(),
             ));
@@ -281,16 +281,11 @@ impl GossipController {
         let mut rules = Vec::new();
 
         for (name, limiter_arc) in guard.iter() {
-            let user_facing_name = if name == "<_default>" {
-                "default".to_string()
-            } else {
-                name.clone()
-            };
             let limiter = limiter_arc
                 .lock()
                 .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
             rules.push(SerializableRule {
-                name: RuleName::from(user_facing_name),
+                name: RuleName::from(name.as_str()),
                 settings: limiter.get_settings().clone(),
             });
         }
@@ -915,12 +910,6 @@ impl GossipController {
             return Ok(());
         }
 
-        let internal_key = if rule_name == "default" {
-            "<_default>".to_string()
-        } else {
-            rule_name.clone()
-        };
-
         // Check if already exists
         if self.get_named_rule_local(&rule_name).await?.is_some() {
             return Ok(());
@@ -932,20 +921,14 @@ impl GossipController {
         )));
         self.named_rate_limiters
             .pin()
-            .insert(internal_key, rate_limiter);
+            .insert(rule_name.clone(), rate_limiter);
 
         Ok(())
     }
 
     /// Get a named rate limit rule locally (without gossiping)
     pub async fn get_named_rule_local(&self, rule_name: &str) -> Result<Option<SerializableRule>> {
-        let internal_key = if rule_name == "default" {
-            "<_default>"
-        } else {
-            rule_name
-        };
-
-        if let Some(limiter_arc) = self.named_rate_limiters.pin().get(internal_key).cloned() {
+        if let Some(limiter_arc) = self.named_rate_limiters.pin().get(rule_name).cloned() {
             let limiter = limiter_arc
                 .lock()
                 .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
@@ -961,7 +944,7 @@ impl GossipController {
 
     /// Delete a named rate limit rule locally (without gossiping)
     pub async fn delete_named_rule_local(&self, rule_name: RuleName) -> Result<()> {
-        if rule_name.as_str() == "default" || rule_name.as_str() == "<_default>" {
+        if rule_name.as_str() == DEFAULT_RULE_NAME {
             return Err(ColibriError::Api(
                 "Cannot delete the default rule".to_string(),
             ));
@@ -985,16 +968,11 @@ impl GossipController {
         let mut rules = Vec::new();
 
         for (name, limiter_arc) in guard.iter() {
-            let user_facing_name = if name == "<_default>" {
-                "default".to_string()
-            } else {
-                name.clone()
-            };
             let limiter = limiter_arc
                 .lock()
                 .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
             rules.push(SerializableRule {
-                name: RuleName::from(user_facing_name),
+                name: RuleName::from(name.as_str()),
                 settings: limiter.get_settings().clone(),
             });
         }

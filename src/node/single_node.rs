@@ -100,7 +100,7 @@ impl Node for SingleNode {
         if name_str.is_empty() {
             return Err(ColibriError::Api("Rule name cannot be empty".to_string()));
         }
-        if name_str == "default" || name_str == rules::DEFAULT_RULE_NAME {
+        if name_str == rules::DEFAULT_RULE_NAME {
             return Err(ColibriError::Api(
                 "Cannot create or modify the default rule".to_string(),
             ));

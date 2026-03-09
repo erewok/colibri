@@ -220,7 +220,7 @@ impl HashringController {
     {
         let key = rule_name
             .map(|r| r.as_str().to_string())
-            .unwrap_or_else(|| "<_default>".to_string());
+            .unwrap_or_else(|| rules::DEFAULT_RULE_NAME.to_string());
 
         let guard = self.named_rate_limiters.pin();
         let limiter_mutex = guard
@@ -399,7 +399,7 @@ impl HashringController {
         }
 
         // Don't allow creating/overwriting the default rule
-        if rule_name_str == "default" || rule_name_str == "<_default>" {
+        if rule_name_str == rules::DEFAULT_RULE_NAME {
             return Err(ColibriError::Api(
                 "Cannot create or modify the default rule".to_string(),
             ));
@@ -454,14 +454,8 @@ impl HashringController {
             let limiter = limiter_mutex.lock().map_err(|e| {
                 ColibriError::Concurrency(format!("Failed to acquire limiter lock: {}", e))
             })?;
-            // Normalize the internal sentinel key to the user-facing name
-            let display_name = if name.as_str() == "<_default>" {
-                "default"
-            } else {
-                name.as_str()
-            };
             rule_list.push(SerializableRule {
-                name: RuleName::from(display_name),
+                name: RuleName::from(name.as_str()),
                 settings: limiter.get_settings().clone(),
             });
         }

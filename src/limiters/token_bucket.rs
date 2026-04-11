@@ -58,11 +58,10 @@ impl Bucket for TokenBucket {
         let diff_ms: i64 = Utc::now().timestamp_millis() - self.last_call;
         // For this algorithm we arbitrarily do not trust intervals less than 5ms,
         // so we only *add* tokens if the diff is greater than that.
-        let diff_ms: i32 = diff_ms as i32;
-        if diff_ms < 5i32 {
+        if diff_ms < 5i64 {
             return self;
         }
-        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms);
+        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * (diff_ms as f64);
         self.tokens = (self.tokens + tokens_to_add).clamp(
             0.0,
             f64::from(rate_limit_settings.rate_limit_max_calls_allowed),

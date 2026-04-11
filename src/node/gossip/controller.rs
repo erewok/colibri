@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +21,10 @@ use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::{UdpReceiver, UdpTransport};
 
 use super::{GossipMessage, GossipPacket};
+
+/// Maximum number of recent packet IDs kept for receive-side deduplication.
+/// At ~50 gossip packets/sec in a small cluster, this is a ~20-second window.
+const DEDUP_CACHE_SIZE: usize = 1000;
 
 type GossipReceiveChannel = Arc<Mutex<Option<mpsc::Receiver<(Bytes, SocketAddr)>>>>;
 
@@ -46,6 +51,10 @@ pub struct GossipController {
     msg_receive_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Handle for the message evaluation loop (reads from channel, calls process_gossip_packet)
     pub msg_eval_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Receive-side deduplication cache. Stores recently seen packet_ids so that
+    /// re-propagated or retransmitted packets are dropped without reprocessing.
+    /// Bounded to DEDUP_CACHE_SIZE entries; oldest entries are evicted in FIFO order.
+    seen_packet_ids: Arc<Mutex<(HashSet<u64>, VecDeque<u64>)>>,
 }
 
 impl std::fmt::Debug for GossipController {
@@ -105,6 +114,7 @@ impl GossipController {
             receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
             msg_receive_handle: Arc::new(Mutex::new(None)),
             msg_eval_handle: Arc::new(Mutex::new(None)),
+            seen_packet_ids: Arc::new(Mutex::new((HashSet::new(), VecDeque::new()))),
         })
     }
 
@@ -628,8 +638,30 @@ impl GossipController {
 
     /// Process an incoming gossip packet
     pub async fn process_gossip_packet(&self, data: Bytes, peer_addr: SocketAddr) -> Result<()> {
-        match GossipPacket::deserialize(&data) {
+        match GossipPacket::from_wire(&data) {
             Ok(packet) => {
+                // Dedup: drop packets whose id we've already processed.
+                // This prevents re-propagated or retransmitted packets from
+                // being applied twice. The seen-set is bounded to DEDUP_CACHE_SIZE;
+                // oldest entries are evicted in FIFO order.
+                {
+                    let mut cache = self.seen_packet_ids.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!("seen_packet_ids poisoned: {}", e))
+                    })?;
+                    let (ref mut seen, ref mut order) = *cache;
+                    if seen.contains(&packet.packet_id) {
+                        debug!("[{}] Dropping duplicate packet {}", self.node_id, packet.packet_id);
+                        return Ok(());
+                    }
+                    seen.insert(packet.packet_id);
+                    order.push_back(packet.packet_id);
+                    if order.len() > DEDUP_CACHE_SIZE {
+                        if let Some(old_id) = order.pop_front() {
+                            seen.remove(&old_id);
+                        }
+                    }
+                }
+
                 match packet.message {
                     GossipMessage::StateRequest {
                         requesting_node_id,
@@ -901,14 +933,21 @@ impl GossipController {
                 Ok(())
             }
             Err(e) => {
-                debug!(
-                    "[{}] Failed to deserialize packet: {} from {}",
-                    self.node_id, e, peer_addr
-                );
-                Err(ColibriError::Transport(format!(
-                    "Deserialization failed: {}",
-                    e
-                )))
+                // Version mismatches are a deployment signal (mixed-version
+                // cluster); log at warn so they're visible without being noisy.
+                // Pure decode errors are debug-level (malformed/truncated UDP).
+                use super::messages::GossipDecodeError;
+                match &e {
+                    GossipDecodeError::VersionMismatch { expected, got } => warn!(
+                        "[{}] Gossip protocol version mismatch from {}: expected {}, got {}",
+                        self.node_id, peer_addr, expected, got
+                    ),
+                    GossipDecodeError::Decode(_) => debug!(
+                        "[{}] Failed to decode gossip packet from {}: {}",
+                        self.node_id, peer_addr, e
+                    ),
+                }
+                Err(ColibriError::Transport(format!("{}", e)))
             }
         }
     }

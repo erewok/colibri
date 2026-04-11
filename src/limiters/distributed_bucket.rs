@@ -1,5 +1,7 @@
 //! Distributed token bucket using CRDT for eventual consistency
-use chrono::Utc;
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use crdts::{CmRDT, CvRDT, PNCounter, ResetRemove, VClock};
 use num_bigint::BigInt;
 use num_traits::cast::ToPrimitive;
@@ -10,6 +12,28 @@ use tracing::debug;
 use crate::limiters::token_bucket::Bucket;
 use crate::node::NodeId;
 use crate::settings;
+
+/// Monotonic millisecond clock for all elapsed-time decisions in `DistributedBucket`.
+///
+/// Backed by `std::time::Instant`, which is guaranteed not to go backwards
+/// regardless of NTP corrections, leap seconds, or operator clock resets.
+/// The epoch is anchored at the first call (effectively process start) and is
+/// process-local — values are not meaningful across process restarts or node
+/// boundaries. That is fine: `DistributedBucket` state is in-memory only, and
+/// the fields that use this clock (`last_call`, `InternalRequestEntry::timestamp_ms`)
+/// are never included in the gossip wire format.
+///
+/// `TokenBucket` intentionally retains wall-clock time because its `last_call`
+/// field *is* serialized and imported by other nodes in cluster mode, where
+/// cross-node timestamp comparability matters.
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+fn monotonic_ms() -> i64 {
+    PROCESS_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as i64
+}
 
 /// Distributed request counter using CRDT PN-counters
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
@@ -192,7 +216,7 @@ impl DistributedBucketExternal {
             max_calls,
             counter: self.counter.clone(),
             requests: Vec::new(),
-            last_call: Utc::now().timestamp_millis(),
+            last_call: monotonic_ms(),
             // Initialise the watermark to the incoming state rather than VClock::new().
             // A freshly-adopted bucket has nothing local to re-broadcast: the
             // original sender already gossiped it. Only local writes that arrive
@@ -231,7 +255,7 @@ struct DistributedBucket {
 
 impl DistributedBucket {
     pub fn can_expire(&self, expiration_threshold_ms: i64) -> bool {
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = monotonic_ms();
         for entry in self.requests.iter() {
             if now_ms - (entry.timestamp_ms) <= expiration_threshold_ms {
                 // Found an entry that is still valid; cannot expire
@@ -250,7 +274,7 @@ impl DistributedBucket {
     }
 
     pub fn expire_entries(&mut self, expiration_threshold_ms: i64) {
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = monotonic_ms();
         let mut entries_to_remove = Vec::new();
         for (idx, entry) in self.requests.iter().enumerate() {
             if now_ms - (entry.timestamp_ms) > expiration_threshold_ms {
@@ -303,7 +327,7 @@ impl Bucket for DistributedBucket {
             max_calls,
             counter: DistributedRequestCounter::new(node_id),
             requests: Vec::new(),
-            last_call: Utc::now().timestamp_millis(),
+            last_call: monotonic_ms(),
             last_gossiped_vclock: VClock::new(),
         }
     }
@@ -319,12 +343,12 @@ impl Bucket for DistributedBucket {
         self.expire_entries(expiration_threshold_ms);
 
         // Same token replenishment logic as TokenBucket
-        let diff_ms: i64 = Utc::now().timestamp_millis() - self.last_call;
+        let now_ms = monotonic_ms();
+        let diff_ms: i64 = now_ms - self.last_call;
         // For this algorithm we arbitrarily do not trust intervals less than 5ms,
         // so we only *add* tokens if the diff is greater than that.
-        let diff_ms: i32 = diff_ms as i32;
         debug!("Token bucket diff_ms: {}", diff_ms);
-        if diff_ms < 5i32 {
+        if diff_ms < 5i64 {
             // no-op
             debug!("Not adding tokens to bucket: diff_ms < 5ms");
             return self;
@@ -332,15 +356,19 @@ impl Bucket for DistributedBucket {
         // Tokens are added at the token rate,
         // but for distributed bucket, we only add whole tokens
         // let participants: usize = self.vclock().dots.len();
-        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms);
+        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * (diff_ms as f64);
         let steps = tokens_to_add.trunc() as u64;
         debug!(
             "Adding tokens to bucket: diff_ms={}, tokens_to_add={} as steps={}",
             diff_ms, tokens_to_add, steps
         );
+        // Stamp the fill entry with the current time, not the previous last_call.
+        // Using self.last_call here would give the entry a stale timestamp, causing
+        // expire_entries to immediately remove fills that were just recorded when
+        // the elapsed gap exceeds the expiration threshold.
         self.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Fills(steps),
-            timestamp_ms: self.last_call,
+            timestamp_ms: now_ms,
             vclock: self.vclock(),
         });
         // Writes must go to the local writer slot. Using `counter.node_id` here
@@ -348,14 +376,14 @@ impl Bucket for DistributedBucket {
         // GCounter::merge would then silently drop via its per-actor max.
         self.counter.inc_refills(self.writer_node_id, steps);
         debug!("Updated bucket after adding tokens: {:?}", self.counter);
-        self.last_call = Utc::now().timestamp_millis();
+        self.last_call = now_ms;
         self
     }
 
     fn decrement(&mut self) -> &mut Self {
         self.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Requests(1),
-            timestamp_ms: Utc::now().timestamp_millis(),
+            timestamp_ms: monotonic_ms(),
             vclock: self.vclock(),
         });
         // See `add_tokens_to_bucket` — mutate the local writer slot, not the origin.
@@ -706,13 +734,13 @@ mod tests {
         // Add entries with different ages
         bucket.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Requests(1),
-            timestamp_ms: Utc::now().timestamp_millis() - 2000, // Old
+            timestamp_ms: monotonic_ms() - 2000, // Old
             vclock: bucket.vclock(),
         });
 
         bucket.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Fills(1),
-            timestamp_ms: Utc::now().timestamp_millis() - 200, // Recent
+            timestamp_ms: monotonic_ms() - 200, // Recent
             vclock: bucket.vclock(),
         });
 

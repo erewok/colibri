@@ -11,6 +11,43 @@ use crate::limiters::distributed_bucket::DistributedBucketExternal;
 use crate::limiters::{RuleList, RuleName, SerializableRule};
 use crate::node::NodeId;
 
+/// Wire protocol version. Bump this whenever the `GossipMessage` enum or
+/// `GossipPacket` layout changes in a backward-incompatible way.
+///
+/// Since postcard is position-dependent (enum variant discriminants are
+/// positional), removing or reordering variants silently corrupts traffic on a
+/// mixed-version cluster. Bumping this constant and rejecting mismatches on the
+/// receive side turns that silent corruption into a hard, logged error.
+pub const GOSSIP_PROTOCOL_VERSION: u16 = 1;
+
+/// Error returned by [`GossipPacket::from_wire`].
+#[derive(Debug)]
+pub enum GossipDecodeError {
+    /// Postcard deserialization failed (truncated, corrupt, or wrong format).
+    Decode(postcard::Error),
+    /// The packet's protocol version does not match [`GOSSIP_PROTOCOL_VERSION`].
+    VersionMismatch { expected: u16, got: u16 },
+}
+
+impl std::fmt::Display for GossipDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode(e) => write!(f, "gossip decode error: {}", e),
+            Self::VersionMismatch { expected, got } => write!(
+                f,
+                "gossip protocol version mismatch: expected {}, got {}",
+                expected, got
+            ),
+        }
+    }
+}
+
+impl From<postcard::Error> for GossipDecodeError {
+    fn from(e: postcard::Error) -> Self {
+        Self::Decode(e)
+    }
+}
+
 /// Gossip message types for production delta-state protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GossipMessage {
@@ -72,35 +109,59 @@ pub enum GossipMessage {
     },
 }
 
-/// GossipPacket wraps messages for network transmission
+/// GossipPacket wraps messages for network transmission.
+///
+/// Field order matters for postcard: `protocol_version` is first so that a
+/// receiver on a different version sees an immediately-wrong version number
+/// rather than silently misinterpreting the payload as a different message type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipPacket {
+    /// Wire protocol version. Always set to [`GOSSIP_PROTOCOL_VERSION`].
+    pub protocol_version: u16,
+    /// Random ID for receive-side deduplication.
+    pub packet_id: u64,
     pub message: GossipMessage,
-    pub packet_id: u64, // For deduplication
 }
 
 impl GossipPacket {
-    /// Create a new gossip packet
+    /// Create a new gossip packet with a random packet ID.
     pub fn new(message: GossipMessage) -> Self {
         Self {
+            protocol_version: GOSSIP_PROTOCOL_VERSION,
+            packet_id: rand::random(),
             message,
-            packet_id: rand::random(), // Generate random packet ID
         }
     }
 
-    /// Create a new gossip packet with specific ID
+    /// Create a new gossip packet with a specific ID (useful in tests).
     pub fn new_with_id(message: GossipMessage, packet_id: u64) -> Self {
-        Self { message, packet_id }
+        Self {
+            protocol_version: GOSSIP_PROTOCOL_VERSION,
+            packet_id,
+            message,
+        }
     }
 
-    /// Serialize for INTERNAL cluster communication (UDP gossip)
+    /// Serialize for INTERNAL cluster communication (UDP gossip).
     pub fn serialize(&self) -> Result<bytes::Bytes, postcard::Error> {
         to_allocvec(self).map(bytes::Bytes::from)
     }
 
-    /// Deserialize from INTERNAL cluster communication (UDP gossip)
-    pub fn deserialize(data: &[u8]) -> Result<Self, postcard::Error> {
-        from_bytes(data)
+    /// Deserialize and version-check a raw gossip packet from the wire.
+    ///
+    /// Returns `Err(GossipDecodeError::VersionMismatch)` when the packet's
+    /// `protocol_version` differs from [`GOSSIP_PROTOCOL_VERSION`]. This turns
+    /// what would otherwise be silent postcard corruption on a mixed-version
+    /// cluster into a hard, logged error.
+    pub fn from_wire(data: &[u8]) -> Result<Self, GossipDecodeError> {
+        let packet: Self = from_bytes(data)?;
+        if packet.protocol_version != GOSSIP_PROTOCOL_VERSION {
+            return Err(GossipDecodeError::VersionMismatch {
+                expected: GOSSIP_PROTOCOL_VERSION,
+                got: packet.protocol_version,
+            });
+        }
+        Ok(packet)
     }
 }
 
@@ -120,8 +181,8 @@ mod tests {
 
         // Test postcard serialization (for internal cluster communication)
         let serialized = packet.serialize().expect("Failed to serialize packet");
-        let deserialized =
-            GossipPacket::deserialize(&serialized).expect("Failed to deserialize packet");
+        let deserialized = GossipPacket::from_wire(&serialized).expect("Failed to decode packet");
+        assert_eq!(deserialized.protocol_version, GOSSIP_PROTOCOL_VERSION);
 
         match deserialized.message {
             GossipMessage::StateRequest {
@@ -135,5 +196,28 @@ mod tests {
             }
             _ => panic!("Wrong message type after deserialization"),
         }
+    }
+
+    #[test]
+    fn test_version_mismatch_is_rejected() {
+        let message = GossipMessage::StateRequest {
+            requesting_node_id: NodeName::from("node-1").node_id(),
+            missing_keys: None,
+            response_addr: "127.0.0.1:8410".parse().unwrap(),
+        };
+        // Construct a packet with a stale version number (simulates a node
+        // running an old binary sending to a node running this binary).
+        let old_packet = GossipPacket {
+            protocol_version: 0, // wrong version
+            packet_id: 42,
+            message,
+        };
+        let serialized = old_packet.serialize().expect("Failed to serialize");
+
+        let result = GossipPacket::from_wire(&serialized);
+        assert!(
+            matches!(result, Err(GossipDecodeError::VersionMismatch { expected: GOSSIP_PROTOCOL_VERSION, got: 0 })),
+            "expected VersionMismatch error, got {:?}", result.map(|_| ())
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! Colibri cluster administration tool
 //!
 //! Sends internal TCP messages to cluster nodes for administrative operations.
-//! Not exposed via public HTTP API - uses direct TCP transport.
+//! Not exposed via public HTTP API; uses direct TCP transport.
 //!
 //! # Examples
 //! ```

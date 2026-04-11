@@ -8,4 +8,3 @@
 - [ ] Add deployment infra: config-file and kubernetes resource definitions
 - [ ] Snapshot node state to persistent storage and reload on crash
 - [ ] Add docs
-

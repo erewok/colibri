@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +21,10 @@ use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::{UdpReceiver, UdpTransport};
 
 use super::{GossipMessage, GossipPacket};
+
+/// Maximum number of recent packet IDs kept for receive-side deduplication.
+/// At ~50 gossip packets/sec in a small cluster, this is a ~20-second window.
+const DEDUP_CACHE_SIZE: usize = 1000;
 
 type GossipReceiveChannel = Arc<Mutex<Option<mpsc::Receiver<(Bytes, SocketAddr)>>>>;
 
@@ -46,6 +51,10 @@ pub struct GossipController {
     msg_receive_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Handle for the message evaluation loop (reads from channel, calls process_gossip_packet)
     pub msg_eval_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Receive-side deduplication cache. Stores recently seen packet_ids so that
+    /// re-propagated or retransmitted packets are dropped without reprocessing.
+    /// Bounded to DEDUP_CACHE_SIZE entries; oldest entries are evicted in FIFO order.
+    seen_packet_ids: Arc<Mutex<(HashSet<u64>, VecDeque<u64>)>>,
 }
 
 impl std::fmt::Debug for GossipController {
@@ -105,6 +114,7 @@ impl GossipController {
             receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
             msg_receive_handle: Arc::new(Mutex::new(None)),
             msg_eval_handle: Arc::new(Mutex::new(None)),
+            seen_packet_ids: Arc::new(Mutex::new((HashSet::new(), VecDeque::new()))),
         })
     }
 
@@ -487,29 +497,38 @@ impl GossipController {
         Ok(())
     }
 
-    /// Gossip-specific: Handle state request
+    /// Gossip-specific: Handle state request (HTTP path).
+    ///
+    /// Returns the full state dump for anti-entropy. We always dump everything
+    /// regardless of which keys were requested — state-based CRDT merge is
+    /// idempotent so extra data is harmless, and simplicity beats precision here.
     async fn handle_state_request(
         &self,
-        missing_keys: Option<Vec<String>>,
+        _missing_keys: Option<Vec<String>>,
     ) -> Result<Vec<DistributedBucketExternal>> {
         let limiter_arc = self.get_limiter(None)?;
         let limiter = limiter_arc
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+        debug!(
+            "[{}] State request: returning full state dump",
+            self.node_id
+        );
+        Ok(limiter.full_state_dump())
+    }
 
-        if let Some(_keys) = missing_keys {
-            debug!(
-                "[{}] State request with specific keys - returning all state",
-                self.node_id
-            );
-            Ok(limiter.gossip_delta_state())
-        } else {
-            debug!(
-                "[{}] State request - returning all delta state",
-                self.node_id
-            );
-            Ok(limiter.gossip_delta_state())
-        }
+    /// Send a gossip packet to a specific peer address (unicast).
+    ///
+    /// Unlike `send_gossip_packet` which fans out to random peers, this targets
+    /// a single address — used for anti-entropy responses where we know exactly
+    /// who to reply to.
+    async fn send_gossip_packet_to(&self, addr: SocketAddr, packet: GossipPacket) -> Result<()> {
+        let data = packet
+            .serialize()
+            .map_err(|e| ColibriError::Transport(format!("Serialization failed: {}", e)))?;
+        self.transport.send_to_peer(addr, &data).await?;
+        debug!("[{}] Sent targeted gossip packet to {}", self.node_id, addr);
+        Ok(())
     }
 
     /// Check if this node has gossip enabled
@@ -547,7 +566,7 @@ impl GossipController {
         // We are taking a single reference to this mutex here
         loop {
             tokio::select! {
-                // Gossip timer - send delta updates
+                // Gossip timer -> send delta updates
                 _ = gossip_timer.tick() => {
                     if let Err(e) = self.handle_gossip_tick().await {
                         debug!("[{}] Error during gossip tick: {}", node_id, e);
@@ -564,6 +583,9 @@ impl GossipController {
     }
 
     pub async fn handle_gossip_tick(&self) -> Result<()> {
+        // Fix origin alive but idle: age out expired ops on idle buckets before collecting
+        // deltas, so any resulting decrements ride this same gossip round.
+        self.tick_all_expirations()?;
         // Send delta updates for buckets that have changed
         let updates = self.collect_gossip_updates().await?;
         if !updates.is_empty() {
@@ -608,6 +630,25 @@ impl GossipController {
         Ok(())
     }
 
+    /// Drive ageing on every known limiter's live buckets.
+    ///
+    /// Without this, an idle bucket's ops never age out: `expire_entries` is
+    /// otherwise only called transitively from `add_tokens_to_bucket`, which
+    /// only runs when the bucket receives a new request. Called on each gossip
+    /// tick so that un-aged ops are expired locally and the resulting CRDT
+    /// decrements are picked up by the very next `collect_gossip_updates`.
+    pub fn tick_all_expirations(&self) -> Result<()> {
+        let limiters: Vec<Arc<Mutex<DistributedBucketLimiter>>> =
+            self.named_rate_limiters.pin().values().cloned().collect();
+        for limiter_arc in limiters {
+            let limiter = limiter_arc
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            limiter.tick_expirations();
+        }
+        Ok(())
+    }
+
     /// Collect buckets that have been updated and should be gossiped
     pub async fn collect_gossip_updates(&self) -> Result<Vec<DistributedBucketExternal>> {
         let limiter_arc = self.get_limiter(None)?;
@@ -619,14 +660,81 @@ impl GossipController {
 
     /// Process an incoming gossip packet
     pub async fn process_gossip_packet(&self, data: Bytes, peer_addr: SocketAddr) -> Result<()> {
-        match GossipPacket::deserialize(&data) {
+        match GossipPacket::from_wire(&data) {
             Ok(packet) => {
-                match packet.message {
-                    GossipMessage::StateRequest { .. } => {
+                // Dedup: drop packets whose id we've already processed.
+                // This prevents re-propagated or retransmitted packets from
+                // being applied twice. The seen-set is bounded to DEDUP_CACHE_SIZE;
+                // oldest entries are evicted in FIFO order.
+                {
+                    let mut cache = self.seen_packet_ids.lock().map_err(|e| {
+                        ColibriError::Concurrency(format!("seen_packet_ids poisoned: {}", e))
+                    })?;
+                    let (ref mut seen, ref mut order) = *cache;
+                    if seen.contains(&packet.packet_id) {
                         debug!(
-                            "[{}] Received StateRequest - not yet implemented",
-                            self.node_id
+                            "[{}] Dropping duplicate packet {}",
+                            self.node_id, packet.packet_id
                         );
+                        return Ok(());
+                    }
+                    seen.insert(packet.packet_id);
+                    order.push_back(packet.packet_id);
+                    if order.len() > DEDUP_CACHE_SIZE {
+                        if let Some(old_id) = order.pop_front() {
+                            seen.remove(&old_id);
+                        }
+                    }
+                }
+
+                match packet.message {
+                    GossipMessage::StateRequest {
+                        requesting_node_id,
+                        response_addr: requester_addr,
+                        ..
+                    } => {
+                        // Don't respond to our own requests (shouldn't happen but guard anyway)
+                        if requesting_node_id == self.node_id {
+                            return Ok(());
+                        }
+
+                        info!(
+                            "[GOSSIP_ANTI_ENTROPY] node:{} received StateRequest from:{}",
+                            self.node_id, requesting_node_id
+                        );
+
+                        let state = {
+                            let limiter_arc = self.get_limiter(None)?;
+                            let limiter = limiter_arc.lock().map_err(|e| {
+                                ColibriError::Concurrency(format!("Lock poisoned: {}", e))
+                            })?;
+                            limiter.full_state_dump()
+                        };
+
+                        if !state.is_empty() {
+                            // Respond with a DeltaStateSync (propagation_factor 1 so the
+                            // anti-entropy response is not re-gossiped further). The receiver
+                            // already handles DeltaStateSync idempotently via CRDT merge.
+                            let response = GossipMessage::DeltaStateSync {
+                                updates: state,
+                                sender_node_id: self.node_id,
+                                response_addr: self.response_addr,
+                                propagation_factor: 1,
+                            };
+                            let packet = GossipPacket::new(response);
+                            if let Err(e) = self.send_gossip_packet_to(requester_addr, packet).await
+                            {
+                                warn!(
+                                    "[{}] Failed to send anti-entropy response to {}: {}",
+                                    self.node_id, requester_addr, e
+                                );
+                            }
+                        } else {
+                            debug!(
+                                "[{}] StateRequest from {} but limiter is empty — nothing to send",
+                                self.node_id, requesting_node_id
+                            );
+                        }
                     }
                     GossipMessage::DeltaStateSync {
                         updates,
@@ -679,12 +787,64 @@ impl GossipController {
                     GossipMessage::Heartbeat {
                         node_id: heartbeat_node_id,
                         timestamp: _,
-                        vclock: _,
-                        response_addr: _,
+                        vclock: peer_vclock,
+                        response_addr: peer_response_addr,
                     } => {
                         // Don't process our own heartbeat
                         if heartbeat_node_id == self.node_id {
                             return Ok(());
+                        }
+
+                        // Anti-entropy: if the peer's vclock has dots we don't have,
+                        // request their full state. The CRDT merge is idempotent so
+                        // requesting unnecessarily is safe; missing an update is not.
+                        //
+                        // `our_vclock >= peer_vclock` (causal dominance) means we have
+                        // seen every event the peer has. If that is not the case, the peer
+                        // is ahead on at least one actor slot — request a full sync.
+                        if !peer_vclock.is_empty() {
+                            let our_vclock = {
+                                let limiter_arc = self.get_limiter(None)?;
+                                let limiter = limiter_arc.lock().map_err(|e| {
+                                    ColibriError::Concurrency(format!("Lock poisoned: {}", e))
+                                })?;
+                                limiter.get_latest_updated_vclock()
+                            };
+
+                            // Request state when our clock is strictly behind the peer
+                            // (Some(Less)) OR concurrent with it (None — both nodes have
+                            // events the other hasn't seen). Both cases mean the peer has
+                            // at least one update we're missing.
+                            let peer_has_unseen_state = matches!(
+                                our_vclock.partial_cmp(&peer_vclock),
+                                Some(std::cmp::Ordering::Less) | None
+                            );
+
+                            if peer_has_unseen_state {
+                                info!(
+                                    "[GOSSIP_ANTI_ENTROPY] node:{} vclock behind peer:{}, sending StateRequest to {}",
+                                    self.node_id, heartbeat_node_id, peer_response_addr
+                                );
+                                let request = GossipMessage::StateRequest {
+                                    requesting_node_id: self.node_id,
+                                    missing_keys: None,
+                                    response_addr: self.response_addr,
+                                };
+                                let packet = GossipPacket::new(request);
+                                if let Err(e) =
+                                    self.send_gossip_packet_to(peer_response_addr, packet).await
+                                {
+                                    warn!(
+                                        "[{}] Failed to send StateRequest to {}: {}",
+                                        self.node_id, peer_response_addr, e
+                                    );
+                                }
+                            } else {
+                                debug!(
+                                    "[{}] Heartbeat from {}: vclock is current, no anti-entropy needed",
+                                    self.node_id, heartbeat_node_id
+                                );
+                            }
                         }
                     }
 
@@ -798,14 +958,21 @@ impl GossipController {
                 Ok(())
             }
             Err(e) => {
-                debug!(
-                    "[{}] Failed to deserialize packet: {} from {}",
-                    self.node_id, e, peer_addr
-                );
-                Err(ColibriError::Transport(format!(
-                    "Deserialization failed: {}",
-                    e
-                )))
+                // Version mismatches are a deployment signal (mixed-version
+                // cluster); log at warn so they're visible without being noisy.
+                // Pure decode errors are debug-level (malformed/truncated UDP).
+                use super::messages::GossipDecodeError;
+                match &e {
+                    GossipDecodeError::VersionMismatch { expected, got } => warn!(
+                        "[{}] Gossip protocol version mismatch from {}: expected {}, got {}",
+                        self.node_id, peer_addr, expected, got
+                    ),
+                    GossipDecodeError::Decode(_) => debug!(
+                        "[{}] Failed to decode gossip packet from {}: {}",
+                        self.node_id, peer_addr, e
+                    ),
+                }
+                Err(ColibriError::Transport(format!("{}", e)))
             }
         }
     }
@@ -838,7 +1005,7 @@ impl GossipController {
         // Send to multiple random peers up to gossip_fanout
         let send_count = self.gossip_fanout.min(peers.len());
 
-        // Select random peers - must complete before any await to avoid Send issues
+        // Select random peers. (This must complete before any await to avoid Send issues)
         let selected_peers: Vec<_> = {
             use rand::prelude::IndexedRandom;
             let mut rng = rand::rng();

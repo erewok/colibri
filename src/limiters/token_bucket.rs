@@ -58,11 +58,10 @@ impl Bucket for TokenBucket {
         let diff_ms: i64 = Utc::now().timestamp_millis() - self.last_call;
         // For this algorithm we arbitrarily do not trust intervals less than 5ms,
         // so we only *add* tokens if the diff is greater than that.
-        let diff_ms: i32 = diff_ms as i32;
-        if diff_ms < 5i32 {
+        if diff_ms < 5i64 {
             return self;
         }
-        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * f64::from(diff_ms);
+        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * (diff_ms as f64);
         self.tokens = (self.tokens + tokens_to_add).clamp(
             0.0,
             f64::from(rate_limit_settings.rate_limit_max_calls_allowed),
@@ -162,18 +161,18 @@ impl TokenBucketLimiter {
             updated_bucket.add_tokens_to_bucket(&self.settings);
 
             if updated_bucket.check_if_allowed() {
-                // Call is allowed - decrement and update
+                // Call is allowed! Decrement and update
                 updated_bucket.decrement();
                 let remaining = updated_bucket.tokens_to_u32();
                 self.cache.pin().insert(key, updated_bucket);
                 Some(remaining)
             } else {
-                // Call not allowed - update bucket state but don't decrement
+                // Call not allowed! Update bucket state but don't decrement
                 self.cache.pin().insert(key, updated_bucket);
                 None
             }
         } else {
-            // Create new bucket - first call is always allowed
+            // Create new bucket. First call is always allowed
             let mut new_bucket = self.new_bucket();
             new_bucket.decrement(); // Use one token
                                     // if negative here, we'll have an unreliable value.
@@ -606,7 +605,7 @@ mod tests {
             .is_some());
         assert_eq!(limiter.check_calls_remaining_for_client("clientB"), 4);
 
-        // Client C makes no requests - should have full quota
+        // Client C makes no requests and should have full quota
         assert_eq!(limiter.check_calls_remaining_for_client("clientC"), 5);
 
         // Client A should still have 2 remaining

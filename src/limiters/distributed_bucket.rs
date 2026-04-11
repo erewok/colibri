@@ -183,17 +183,20 @@ impl DistributedBucketExternal {
     /// The origin `node_id` is preserved from the gossip message so that
     /// `DistributedBucketLimiter::expire_keys` continues to refuse to GC buckets
     /// this node did not create.
-    fn bucket(&self, local_node_id: NodeId) -> DistributedBucket {
+    /// `max_calls` is the limiter's configured capacity. It is stored locally on
+    /// the bucket and never written into the CRDT (no immortal seed tokens).
+    fn bucket(&self, local_node_id: NodeId, max_calls: u32) -> DistributedBucket {
         DistributedBucket {
             node_id: self.node_id,
             writer_node_id: local_node_id,
+            max_calls,
             counter: self.counter.clone(),
             requests: Vec::new(),
             last_call: Utc::now().timestamp_millis(),
             // Initialise the watermark to the incoming state rather than VClock::new().
             // A freshly-adopted bucket has nothing local to re-broadcast: the
             // original sender already gossiped it. Only local writes that arrive
-            //  *after* adoption should trigger a push.
+            // *after* adoption should trigger a push.
             last_gossiped_vclock: self.counter.vclock.clone(),
         }
     }
@@ -211,6 +214,13 @@ struct DistributedBucket {
     /// into `DistributedRequestCounter` mutation methods must pass this value
     /// as the writer — never `counter.node_id`, which may be a remote origin.
     pub writer_node_id: NodeId,
+    /// The configured capacity for this bucket. Kept as a local constant and
+    /// never written into the CRDT (no immortal seed tokens).
+    ///
+    /// `tokens_to_u32()` returns `max_calls + counter.tokens()` so the full
+    /// capacity is visible at the API level without polluting gossip state.
+    /// All nodes must agree on this value via their rate-limit configuration.
+    pub max_calls: u32,
     pub counter: DistributedRequestCounter,
     // internal state only: timestamps
     requests: Vec<InternalRequestEntry>,
@@ -282,16 +292,20 @@ impl Bucket for DistributedBucket {
         // Local creation: this node is both the origin (for GC) and the writer
         // (for CRDT actor slot). The two become different only after adoption
         // via `DistributedBucketExternal::bucket`.
-        let mut instance = Self {
+        //
+        // Do NOT write max_calls into the CRDT as a seed refill. The
+        // capacity is stored as the local `max_calls` field and added as a
+        // constant offset in `tokens_to_u32`. This prevents the seed from
+        // living forever in gossip state as untracked, un-ageable CRDT tokens.
+        Self {
             node_id,
             writer_node_id: node_id,
+            max_calls,
             counter: DistributedRequestCounter::new(node_id),
             requests: Vec::new(),
             last_call: Utc::now().timestamp_millis(),
             last_gossiped_vclock: VClock::new(),
-        };
-        instance.counter.inc_refills(node_id, max_calls as u64);
-        instance
+        }
     }
 
     fn add_tokens_to_bucket(
@@ -356,8 +370,10 @@ impl Bucket for DistributedBucket {
     }
 
     fn tokens_to_u32(&self) -> u32 {
-        self.counter
-            .tokens()
+        // Add max_calls as a local constant offset. The CRDT only tracks
+        // *changes* (periodic refills and consumption); the initial capacity is
+        // not gossiped and never lives in PNCounter state.
+        (self.counter.tokens() + BigInt::from(self.max_calls))
             .clamp(BigInt::from(0), BigInt::from(u32::MAX))
             .to_u32()
             .unwrap_or(0)
@@ -487,7 +503,12 @@ impl DistributedBucketLimiter {
                     b.mark_gossiped();
                     b
                 },
-                || ext.bucket(local_node_id),
+                || {
+                    ext.bucket(
+                        local_node_id,
+                        self.rate_limit_settings.rate_limit_max_calls_allowed,
+                    )
+                },
             );
         }
 
@@ -536,7 +557,12 @@ impl DistributedBucketLimiter {
                     existing_counter.last_gossiped_vclock = existing_counter.counter.vclock.clone();
                     existing_counter
                 },
-                || incoming_bucket.bucket(local_node_id),
+                || {
+                    incoming_bucket.bucket(
+                        local_node_id,
+                        self.rate_limit_settings.rate_limit_max_calls_allowed,
+                    )
+                },
             );
         }
     }
@@ -635,16 +661,16 @@ mod tests {
         // Start with 1 token - should be allowed
         assert!(bucket.check_if_allowed());
 
-        // Consume the token
+        // Consume the token (seed no longer stored in CRDT; counter starts at 0)
         bucket.decrement();
-        assert_eq!(bucket.counter.tokens(), BigInt::from(0));
+        assert_eq!(bucket.counter.tokens(), BigInt::from(-1));
 
-        // Should not be allowed anymore
+        // Should not be allowed anymore (tokens_to_u32 = counter.tokens + max_calls = -1 + 1 = 0)
         assert!(!bucket.check_if_allowed());
 
         // Decrementing goes below 0 (consistent with TokenBucket behavior)
         bucket.decrement();
-        assert_eq!(bucket.counter.tokens(), BigInt::from(-1));
+        assert_eq!(bucket.counter.tokens(), BigInt::from(-2));
     }
 
     #[test]
@@ -885,7 +911,7 @@ mod tests {
         assert_eq!(external.node_id, node_id);
 
         // Convert back to internal format (as if adopted by the same node).
-        let restored_bucket = external.bucket(node_id);
+        let restored_bucket = external.bucket(node_id, 10);
         assert_eq!(restored_bucket.node_id, node_id);
         assert_eq!(restored_bucket.writer_node_id, node_id);
         assert_eq!(restored_bucket.counter.tokens(), bucket.counter.tokens());
@@ -912,7 +938,7 @@ mod tests {
         // step would copy A's `counter.node_id` into B's bucket and silently
         // route all of B's future writes into slot A of the PNCounter.
         let external = bucket_a.to_external("test_client");
-        let mut bucket_b = external.bucket(node_b);
+        let mut bucket_b = external.bucket(node_b, 100);
 
         // Post-adoption invariants: origin preserved for GC, writer is local.
         assert_eq!(bucket_b.node_id, node_a, "origin must be preserved");
@@ -1103,5 +1129,67 @@ mod tests {
         let bob_a = limiter_a.check_calls_remaining_for_client(&"bob".to_string());
         let bob_b = limiter_b.check_calls_remaining_for_client(&"bob".to_string());
         assert_eq!(bob_a, bob_b, "bob's quota must match after anti-entropy");
+    }
+
+    /// Regression test: seed tokens must NOT be stored in the CRDT.
+    ///
+    /// Before the fix, `DistributedBucket::new` called `inc_refills(node_id, max_calls)`
+    /// which wrote the initial capacity into the PNCounter. Those writes propagated
+    /// via gossip and were never tracked in the ageing vec, so they could never
+    /// be expired — immortal "ghost" tokens that accumulated with every new peer
+    /// that adopted the bucket and then re-wrote their own seed.
+    ///
+    /// After the fix, `max_calls` is stored as a local field and added as a
+    /// constant offset in `tokens_to_u32()`. The CRDT state for a freshly
+    /// created bucket must be zero.
+    #[test]
+    fn test_seed_tokens_not_in_crdt() {
+        let node_id = node_id();
+
+        // A new bucket must have an empty CRDT (tokens == 0 in the counter).
+        let bucket = DistributedBucket::new(100, node_id);
+        assert_eq!(
+            bucket.counter.tokens(),
+            BigInt::from(0),
+            "CRDT counter must start empty; seed tokens must not be written into the CRDT"
+        );
+
+        // The visible quota must still equal max_calls via the constant offset.
+        assert_eq!(
+            bucket.tokens_to_u32(),
+            100,
+            "tokens_to_u32 must return max_calls for a fresh bucket"
+        );
+
+        // When this bucket is serialised and adopted by a peer, the peer's copy
+        // must also show zero tokens in the CRDT — no seed doubles on adoption.
+        let node_b = NodeName::from("b").node_id();
+        let external = bucket.to_external("client_a");
+        let adopted = external.bucket(node_b, 100);
+        assert_eq!(
+            adopted.counter.tokens(),
+            BigInt::from(0),
+            "adopted bucket must not gain extra CRDT tokens; seed doubling regression"
+        );
+
+        // Verify two-node convergence: after one request each the quota seen by
+        // both replicas must be max_calls - 2, regardless of which node adopted
+        // whose bucket.
+        let mut bucket_a = DistributedBucket::new(100, node_id);
+        bucket_a.decrement(); // A: 1 request
+
+        let external_a = bucket_a.to_external("client_a");
+        let mut bucket_b = external_a.bucket(node_b, 100);
+        bucket_b.decrement(); // B: 1 additional request
+
+        // Merge B → A
+        let external_b = bucket_b.to_external("client_a");
+        bucket_a.counter.merge(external_b.counter);
+
+        assert_eq!(
+            bucket_a.tokens_to_u32(),
+            98,
+            "after 2 total requests quota must be 98 (100 - 2), not 198"
+        );
     }
 }

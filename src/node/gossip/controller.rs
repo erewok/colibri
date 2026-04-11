@@ -655,14 +655,14 @@ impl GossipController {
                         };
 
                         if !state.is_empty() {
-                            // Respond with a DeltaStateSync (propagation_factor 0 so the
+                            // Respond with a DeltaStateSync (propagation_factor 1 so the
                             // anti-entropy response is not re-gossiped further). The receiver
                             // already handles DeltaStateSync idempotently via CRDT merge.
                             let response = GossipMessage::DeltaStateSync {
                                 updates: state,
                                 sender_node_id: self.node_id,
                                 response_addr: self.response_addr,
-                                propagation_factor: 0,
+                                propagation_factor: 1,
                             };
                             let packet = GossipPacket::new(response);
                             if let Err(e) = self.send_gossip_packet_to(requester_addr, packet).await

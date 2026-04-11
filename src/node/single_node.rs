@@ -6,7 +6,7 @@ use tracing::info;
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::{rules, token_bucket};
-use crate::node::{messages::CheckCallsResponse, Node, NodeName};
+use crate::node::{Node, NodeName, messages::CheckCallsResponse};
 use crate::settings::Settings;
 
 /// Standalone rate limiter node

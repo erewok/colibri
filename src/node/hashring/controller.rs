@@ -2,20 +2,20 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use papaya::HashMap;
-use tokio::sync::mpsc;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::rules::{self, RuleName, SerializableRule};
 use crate::limiters::TokenBucketLimiter;
+use crate::limiters::rules::{self, RuleName, SerializableRule};
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
 };
 use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{self, ClusterTopology, RunMode};
 use crate::transport::traits::{RequestSender, Sender};
-use crate::transport::{tcp_receiver::TcpRequest, TcpReceiver, TcpTransport};
+use crate::transport::{TcpReceiver, TcpTransport, tcp_receiver::TcpRequest};
 
 use super::consistent_hashing;
 
@@ -307,7 +307,7 @@ impl HashringController {
                 _ => {
                     return Err(ColibriError::Transport(
                         "Unexpected response from forward".to_string(),
-                    ))
+                    ));
                 }
             }
         }

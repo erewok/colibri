@@ -175,16 +175,12 @@ impl TokenBucketLimiter {
             // Create new bucket. First call is always allowed
             let mut new_bucket = self.new_bucket();
             new_bucket.decrement(); // Use one token
-                                    // if negative here, we'll have an unreliable value.
-                                    // so we need to safe-check *first* before returning `remaining`
+            // if negative here, we'll have an unreliable value.
+            // so we need to safe-check *first* before returning `remaining`
             let is_allowed = new_bucket.check_if_allowed();
             let remaining = Some(new_bucket.tokens_to_u32());
             self.cache.pin().insert(key, new_bucket);
-            if is_allowed {
-                remaining
-            } else {
-                None
-            }
+            if is_allowed { remaining } else { None }
         }
     }
 
@@ -390,7 +386,7 @@ mod tests {
 
         let mut bucket = TokenBucket::default();
         bucket.tokens = 10.0; // Above maximum
-                              // Set timestamp to trigger token addition
+        // Set timestamp to trigger token addition
         bucket.last_call = Utc::now().timestamp_millis() - 1000; // 1 second ago
 
         bucket.add_tokens_to_bucket(&settings);
@@ -548,21 +544,27 @@ mod tests {
 
         // Exhaust tokens for client1
         for _ in 0..5 {
-            assert!(limiter
-                .limit_calls_for_client("client1".to_string())
-                .is_some());
+            assert!(
+                limiter
+                    .limit_calls_for_client("client1".to_string())
+                    .is_some()
+            );
         }
         // client1 should now be blocked
-        assert!(limiter
-            .limit_calls_for_client("client1".to_string())
-            .is_none());
+        assert!(
+            limiter
+                .limit_calls_for_client("client1".to_string())
+                .is_none()
+        );
         assert_eq!(limiter.check_calls_remaining_for_client("client1"), 0);
 
         // client2 should still have full quota
         assert_eq!(limiter.check_calls_remaining_for_client("client2"), 5);
-        assert!(limiter
-            .limit_calls_for_client("client2".to_string())
-            .is_some());
+        assert!(
+            limiter
+                .limit_calls_for_client("client2".to_string())
+                .is_some()
+        );
     }
 
     #[test]
@@ -593,16 +595,20 @@ mod tests {
 
         // Client A makes 3 requests
         for _ in 0..3 {
-            assert!(limiter
-                .limit_calls_for_client("clientA".to_string())
-                .is_some());
+            assert!(
+                limiter
+                    .limit_calls_for_client("clientA".to_string())
+                    .is_some()
+            );
         }
         assert_eq!(limiter.check_calls_remaining_for_client("clientA"), 2);
 
         // Client B makes 1 request
-        assert!(limiter
-            .limit_calls_for_client("clientB".to_string())
-            .is_some());
+        assert!(
+            limiter
+                .limit_calls_for_client("clientB".to_string())
+                .is_some()
+        );
         assert_eq!(limiter.check_calls_remaining_for_client("clientB"), 4);
 
         // Client C makes no requests and should have full quota
@@ -624,14 +630,18 @@ mod tests {
         // default is 0
         assert_eq!(limiter.check_calls_remaining_for_client("test_client"), 0);
         // Should immediately deny any requests
-        assert!(limiter
-            .limit_calls_for_client("test_client".to_string())
-            .is_none());
+        assert!(
+            limiter
+                .limit_calls_for_client("test_client".to_string())
+                .is_none()
+        );
         assert_eq!(limiter.check_calls_remaining_for_client("test_client"), 0);
         // calculating refills should also result in 0 remaining
-        assert!(limiter
-            .limit_calls_for_client("test_client".to_string())
-            .is_none());
+        assert!(
+            limiter
+                .limit_calls_for_client("test_client".to_string())
+                .is_none()
+        );
     }
 
     #[test]

@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use papaya::HashMap;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::{
     distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter},
-    rules::{RuleList, RuleName, SerializableRule, DEFAULT_RULE_NAME},
+    rules::{DEFAULT_RULE_NAME, RuleList, RuleName, SerializableRule},
 };
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
@@ -680,10 +680,10 @@ impl GossipController {
                     }
                     seen.insert(packet.packet_id);
                     order.push_back(packet.packet_id);
-                    if order.len() > DEDUP_CACHE_SIZE {
-                        if let Some(old_id) = order.pop_front() {
-                            seen.remove(&old_id);
-                        }
+                    if order.len() > DEDUP_CACHE_SIZE
+                        && let Some(old_id) = order.pop_front()
+                    {
+                        seen.remove(&old_id);
                     }
                 }
 

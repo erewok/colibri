@@ -4,7 +4,7 @@ mod rate_limits;
 use std::borrow::Cow;
 
 use axum::{
-    error_handling::HandleErrorLayer, http::StatusCode, response::IntoResponse, routing, Router,
+    Router, error_handling::HandleErrorLayer, http::StatusCode, response::IntoResponse, routing,
 };
 use tokio::time::Duration;
 use tower::{BoxError, ServiceBuilder};

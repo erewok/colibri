@@ -9,7 +9,7 @@
 
 use colibri::limiters::token_bucket::TokenBucketLimiter;
 use colibri::settings::RateLimitSettings;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
 /// Benchmark: Local token bucket operations

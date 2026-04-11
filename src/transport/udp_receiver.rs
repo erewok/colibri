@@ -2,8 +2,8 @@
 //!
 //! Handles incoming UDP messages by forwarding datagrams into an mpsc channel.
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -84,7 +84,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
-    use tokio::time::{sleep, timeout, Duration};
+    use tokio::time::{Duration, sleep, timeout};
 
     use super::*;
 

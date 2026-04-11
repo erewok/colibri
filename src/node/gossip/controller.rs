@@ -500,7 +500,10 @@ impl GossipController {
         let limiter = limiter_arc
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-        debug!("[{}] State request - returning full state dump", self.node_id);
+        debug!(
+            "[{}] State request - returning full state dump",
+            self.node_id
+        );
         Ok(limiter.full_state_dump())
     }
 
@@ -510,14 +513,11 @@ impl GossipController {
     /// a single address — used for anti-entropy responses where we know exactly
     /// who to reply to.
     async fn send_gossip_packet_to(&self, addr: SocketAddr, packet: GossipPacket) -> Result<()> {
-        let data = packet.serialize().map_err(|e| {
-            ColibriError::Transport(format!("Serialization failed: {}", e))
-        })?;
+        let data = packet
+            .serialize()
+            .map_err(|e| ColibriError::Transport(format!("Serialization failed: {}", e)))?;
         self.transport.send_to_peer(addr, &data).await?;
-        debug!(
-            "[{}] Sent targeted gossip packet to {}",
-            self.node_id, addr
-        );
+        debug!("[{}] Sent targeted gossip packet to {}", self.node_id, addr);
         Ok(())
     }
 
@@ -665,8 +665,7 @@ impl GossipController {
                                 propagation_factor: 0,
                             };
                             let packet = GossipPacket::new(response);
-                            if let Err(e) =
-                                self.send_gossip_packet_to(requester_addr, packet).await
+                            if let Err(e) = self.send_gossip_packet_to(requester_addr, packet).await
                             {
                                 warn!(
                                     "[{}] Failed to send anti-entropy response to {}: {}",

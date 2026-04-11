@@ -190,7 +190,11 @@ impl DistributedBucketExternal {
             counter: self.counter.clone(),
             requests: Vec::new(),
             last_call: Utc::now().timestamp_millis(),
-            last_gossiped_vclock: VClock::new(),
+            // Initialise the watermark to the incoming state rather than VClock::new().
+            // A freshly-adopted bucket has nothing local to re-broadcast: the
+            // original sender already gossiped it. Only local writes that arrive
+            //  *after* adoption should trigger a push.
+            last_gossiped_vclock: self.counter.vclock.clone(),
         }
     }
 }
@@ -524,6 +528,12 @@ impl DistributedBucketLimiter {
                     existing_counter
                         .counter
                         .merge(incoming_bucket.counter.clone());
+                    // Advance the watermark to the post-merge vclock so this node DOES NOT
+                    // re-broadcast state it just received from a peer.
+                    // Only local writes that happen *after* this merge will advance
+                    // counter.vclock past last_gossiped_vclock and trigger
+                    // the next delta push.
+                    existing_counter.last_gossiped_vclock = existing_counter.counter.vclock.clone();
                     existing_counter
                 },
                 || incoming_bucket.bucket(local_node_id),
@@ -947,6 +957,77 @@ mod tests {
         );
     }
 
+    /// Regression test for gossip merge cascades: accepting gossip from a peer must NOT cause
+    /// the receiver to re-broadcast that same state in the next gossip tick.
+    ///
+    /// Before the fix, `accept_delta_state` never advanced `last_gossiped_vclock`,
+    /// so every merge left `counter.vclock > last_gossiped_vclock`, which made
+    /// `has_updates_since_last_gossip` return true for every merged bucket,
+    /// triggering a re-broadcast cascade each tick.
+    #[test]
+    fn test_accepted_delta_does_not_cause_rebroadcast() {
+        let node_a = node_id();
+        let node_b = NodeName::from("b").node_id();
+        let settings = test_settings();
+
+        let mut limiter_a = DistributedBucketLimiter::new(node_a, settings.clone());
+        let mut limiter_b = DistributedBucketLimiter::new(node_b, settings);
+
+        // Node A processes a request so it has a delta to gossip.
+        limiter_a.limit_calls_for_client("client_1".to_string());
+
+        // Node B accepts A's delta.
+        let delta_from_a = limiter_a.gossip_delta_state();
+        assert!(!delta_from_a.is_empty(), "A should have a delta");
+        limiter_b.accept_delta_state(&delta_from_a);
+
+        // B has no local writes — it must produce an empty delta next tick.
+        // Before the fix, merging A's state advanced counter.vclock past B's
+        // (empty) last_gossiped_vclock, so B would re-broadcast A's data here.
+        let delta_from_b = limiter_b.gossip_delta_state();
+        assert!(
+            delta_from_b.is_empty(),
+            "receiver must not re-broadcast state it just accepted; \
+             got {} bucket(s) — gossip merge cascades regression",
+            delta_from_b.len()
+        );
+
+        // After a local write on B, B should produce a delta (its own write only).
+        limiter_b.limit_calls_for_client("client_1".to_string());
+        let delta_from_b_after_write = limiter_b.gossip_delta_state();
+        assert!(
+            !delta_from_b_after_write.is_empty(),
+            "B must gossip after a local write"
+        );
+
+        // --- Merge path (bucket already exists in the receiver) ---
+        //
+        // The insert-when-absent case above is handled by `bucket()` setting
+        // last_gossiped_vclock to the incoming vclock. The merge case (bucket
+        // already present) is a separate code path in update_or_insert_with and
+        // requires the accept_delta_state fix to advance the watermark after merge.
+
+        // Drain B's watermark so it's current again.
+        let _ = limiter_b.gossip_delta_state();
+
+        // A makes another request; B already has client_1 so the next accept will
+        // take the UPDATE (merge) path, not the INSERT path.
+        limiter_a.limit_calls_for_client("client_1".to_string());
+        let delta_from_a_2 = limiter_a.gossip_delta_state();
+        assert!(!delta_from_a_2.is_empty(), "A should have a second delta");
+        limiter_b.accept_delta_state(&delta_from_a_2);
+
+        // B again has no local writes — delta must be empty even though the merge
+        // updated an existing bucket (the merge path of update_or_insert_with).
+        let delta_from_b_after_merge = limiter_b.gossip_delta_state();
+        assert!(
+            delta_from_b_after_merge.is_empty(),
+            "receiver must not re-broadcast after merging into an existing bucket; \
+             got {} bucket(s) — S5/S6 merge-path regression",
+            delta_from_b_after_merge.len()
+        );
+    }
+
     /// `full_state_dump` must return all buckets regardless of whether they have
     /// been gossiped since their last update, unlike `gossip_delta_state` which
     /// skips watermark-current buckets.
@@ -1014,7 +1095,10 @@ mod tests {
         // After recovery B should see both clients with the same token counts as A.
         let alice_a = limiter_a.check_calls_remaining_for_client(&"alice".to_string());
         let alice_b = limiter_b.check_calls_remaining_for_client(&"alice".to_string());
-        assert_eq!(alice_a, alice_b, "alice's quota must match after anti-entropy");
+        assert_eq!(
+            alice_a, alice_b,
+            "alice's quota must match after anti-entropy"
+        );
 
         let bob_a = limiter_a.check_calls_remaining_for_client(&"bob".to_string());
         let bob_b = limiter_b.check_calls_remaining_for_client(&"bob".to_string());

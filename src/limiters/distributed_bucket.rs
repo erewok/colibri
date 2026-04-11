@@ -567,16 +567,21 @@ impl DistributedBucketLimiter {
         }
     }
 
+    /// Return the join (element-wise maximum) of every bucket's vclock.
+    ///
+    /// This is the correct summary of "all state this node has seen": a single
+    /// vclock whose value at each actor slot is the highest dot observed across
+    /// any bucket. Using `>` (strict dominance) instead of merge would silently
+    /// drop dots from concurrent vclocks whose iteration order is non-deterministic,
+    /// causing heartbeat comparisons to be spuriously `None` (concurrent) and
+    /// triggering permanent anti-entropy state requests.
     pub fn get_latest_updated_vclock(&self) -> VClock<NodeId> {
         self.node_counters
             .pin()
             .values()
-            .fold(VClock::new(), |acc, bucket| {
-                if acc > bucket.vclock() {
-                    acc
-                } else {
-                    bucket.vclock()
-                }
+            .fold(VClock::new(), |mut acc, bucket| {
+                acc.merge(bucket.vclock());
+                acc
             })
     }
 
@@ -1190,6 +1195,80 @@ mod tests {
             bucket_a.tokens_to_u32(),
             98,
             "after 2 total requests quota must be 98 (100 - 2), not 198"
+        );
+    }
+
+    /// Regression test for `get_latest_updated_vclock` returning the join of all
+    /// bucket vclocks rather than the max of any single bucket vclock.
+    ///
+    /// When multiple clients have buckets written by *different* nodes, their vclocks
+    /// are concurrent (each has dots the other lacks). The old implementation used
+    /// `acc > bucket.vclock()` to fold, which — because `>` is false for concurrent
+    /// vclocks — dropped earlier actors on every step, producing a result that varied
+    /// with HashMap iteration order. This made heartbeat comparisons spuriously
+    /// `None` (concurrent) and triggered permanent anti-entropy `StateRequest` loops.
+    ///
+    /// The fix uses `acc.merge(vclock)` to compute the element-wise maximum (join),
+    /// which always produces a stable vclock that covers every known actor slot.
+    #[test]
+    fn test_get_latest_updated_vclock_is_join_of_all_buckets() {
+        let node_a = node_id();
+        let node_b = NodeName::from("b").node_id();
+        let node_c = NodeName::from("c").node_id();
+        let settings = test_settings();
+
+        let mut limiter = DistributedBucketLimiter::new(node_a, settings.clone());
+
+        // Each client is processed by a different writer node, so their bucket
+        // vclocks are concurrent (disjoint actor sets).
+        let mut limiter_b = DistributedBucketLimiter::new(node_b, settings.clone());
+        let mut limiter_c = DistributedBucketLimiter::new(node_c, settings);
+
+        limiter.limit_calls_for_client("client_a".to_string()); // vclock {node_a: n}
+        limiter_b.limit_calls_for_client("client_b".to_string()); // vclock {node_b: n}
+        limiter_c.limit_calls_for_client("client_c".to_string()); // vclock {node_c: n}
+
+        // Converge all state into `limiter`.
+        limiter.accept_delta_state(&limiter_b.gossip_delta_state());
+        limiter.accept_delta_state(&limiter_c.gossip_delta_state());
+
+        // The summary vclock must cover all three actor slots.
+        let summary = limiter.get_latest_updated_vclock();
+
+        // The summary must dominate each individual bucket vclock.
+        for ext in limiter.full_state_dump() {
+            let bucket_vc = ext.counter.vclock;
+            assert!(
+                matches!(
+                    summary.partial_cmp(&bucket_vc),
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                ),
+                "summary vclock must dominate every bucket vclock; \
+                 summary={:?} did not dominate bucket={:?}",
+                summary,
+                bucket_vc
+            );
+        }
+
+        // Specifically: the summary must not be concurrent with any peer's
+        // individual bucket vclock. If it were, heartbeat comparisons would
+        // produce None and trigger spurious StateRequests.
+        let b_vc = limiter_b.get_latest_updated_vclock();
+        let c_vc = limiter_c.get_latest_updated_vclock();
+
+        assert!(
+            !matches!(
+                summary.partial_cmp(&b_vc),
+                None
+            ),
+            "summary must not be concurrent with node_b's vclock after convergence"
+        );
+        assert!(
+            !matches!(
+                summary.partial_cmp(&c_vc),
+                None
+            ),
+            "summary must not be concurrent with node_c's vclock after convergence"
         );
     }
 }

@@ -20,7 +20,7 @@ pub struct GossipNode {
     /// Node name
     pub node_name: NodeName,
 
-    /// Controller - handles all operations via handle_message() and UDP network communication
+    /// The Controller handles all operations via handle_message() and UDP network communication
     pub controller: Arc<GossipController>,
 }
 
@@ -242,14 +242,14 @@ impl GossipNode {
             },
         };
 
-        tracing::info!("Gossip node export skipped - using gossip synchronization");
+        tracing::info!("Gossip node export skipped. Using gossip synchronization");
         Ok(export)
     }
 
     pub async fn handle_import_buckets(&self, _import_data: BucketExport) -> Result<()> {
         // Gossip nodes don't use bucket-based data import
         // Data synchronization happens through gossip protocol
-        tracing::info!("Gossip node data import skipped - using gossip synchronization");
+        tracing::info!("Gossip node data import skipped. Using gossip synchronization");
         Ok(())
     }
 
@@ -292,7 +292,7 @@ impl GossipNode {
 
 #[cfg(test)]
 mod tests {
-    //! Simple tests for GossipNode functionality - traffic direction and command forwarding
+    //! Simple tests for GossipNode functionality, including traffic direction and command forwarding
 
     use super::*;
 

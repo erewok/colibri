@@ -511,7 +511,7 @@ impl GossipController {
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
         debug!(
-            "[{}] State request - returning full state dump",
+            "[{}] State request: returning full state dump",
             self.node_id
         );
         Ok(limiter.full_state_dump())
@@ -566,7 +566,7 @@ impl GossipController {
         // We are taking a single reference to this mutex here
         loop {
             tokio::select! {
-                // Gossip timer - send delta updates
+                // Gossip timer -> send delta updates
                 _ = gossip_timer.tick() => {
                     if let Err(e) = self.handle_gossip_tick().await {
                         debug!("[{}] Error during gossip tick: {}", node_id, e);
@@ -1005,7 +1005,7 @@ impl GossipController {
         // Send to multiple random peers up to gossip_fanout
         let send_count = self.gossip_fanout.min(peers.len());
 
-        // Select random peers - must complete before any await to avoid Send issues
+        // Select random peers. (This must complete before any await to avoid Send issues)
         let selected_peers: Vec<_> = {
             use rand::prelude::IndexedRandom;
             let mut rng = rand::rng();

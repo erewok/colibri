@@ -161,18 +161,18 @@ impl TokenBucketLimiter {
             updated_bucket.add_tokens_to_bucket(&self.settings);
 
             if updated_bucket.check_if_allowed() {
-                // Call is allowed - decrement and update
+                // Call is allowed! Decrement and update
                 updated_bucket.decrement();
                 let remaining = updated_bucket.tokens_to_u32();
                 self.cache.pin().insert(key, updated_bucket);
                 Some(remaining)
             } else {
-                // Call not allowed - update bucket state but don't decrement
+                // Call not allowed! Update bucket state but don't decrement
                 self.cache.pin().insert(key, updated_bucket);
                 None
             }
         } else {
-            // Create new bucket - first call is always allowed
+            // Create new bucket. First call is always allowed
             let mut new_bucket = self.new_bucket();
             new_bucket.decrement(); // Use one token
                                     // if negative here, we'll have an unreliable value.
@@ -605,7 +605,7 @@ mod tests {
             .is_some());
         assert_eq!(limiter.check_calls_remaining_for_client("clientB"), 4);
 
-        // Client C makes no requests - should have full quota
+        // Client C makes no requests and should have full quota
         assert_eq!(limiter.check_calls_remaining_for_client("clientC"), 5);
 
         // Client A should still have 2 remaining

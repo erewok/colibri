@@ -35,20 +35,20 @@ pub fn get_neighbor_bucket(bucket_selected: u32, number_of_buckets: u32) -> (u32
         // Special case: only one bucket
         (0, 0)
     } else if number_of_buckets == 2 {
-        // Special case: two buckets - neighbor is the other one
+        // Special case: two buckets where neighbor is the other one
         if bucket_selected == 0 {
             (1, 1)
         } else {
             (0, 0)
         }
     } else if bucket_selected == 0 {
-        // bucket is first
+        // Bucket is first
         (number_of_buckets - 1, 1)
     } else if bucket_selected == number_of_buckets - 1 {
-        // bucket is last
+        // Bucket is last
         (bucket_selected - 1, 0)
     } else {
-        // bucket is somewhere in between
+        // Bucket is somewhere in between
         (bucket_selected - 1, bucket_selected + 1)
     }
 }

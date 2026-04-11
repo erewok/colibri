@@ -717,7 +717,7 @@ mod tests {
         let node_id = node_id();
         let mut bucket = DistributedBucket::new(1, node_id);
 
-        // Start with 1 token - should be allowed
+        // Start with 1 token should be allowed
         assert!(bucket.check_if_allowed());
 
         // Consume the token (seed no longer stored in CRDT; counter starts at 0)
@@ -992,7 +992,7 @@ mod tests {
         limiter2.limit_calls_for_client(client_id.clone());
         limiter3.limit_calls_for_client(client_id.clone());
 
-        // Full mesh gossip - each node receives updates from all others
+        // Full mesh gossip where each node receives updates from all others
         let gossip1 = limiter1.gossip_delta_state();
         let gossip2 = limiter2.gossip_delta_state();
         let gossip3 = limiter3.gossip_delta_state();
@@ -1315,8 +1315,8 @@ mod tests {
     ///
     /// When multiple clients have buckets written by *different* nodes, their vclocks
     /// are concurrent (each has dots the other lacks). The old implementation used
-    /// `acc > bucket.vclock()` to fold, which — because `>` is false for concurrent
-    /// vclocks — dropped earlier actors on every step, producing a result that varied
+    /// `acc > bucket.vclock()` to fold, and because `>` is false for concurrent
+    /// vclocks it dropped earlier actors on every step, producing a result that varied
     /// with HashMap iteration order. This made heartbeat comparisons spuriously
     /// `None` (concurrent) and triggered permanent anti-entropy `StateRequest` loops.
     ///
@@ -1376,5 +1376,191 @@ mod tests {
             !matches!(summary.partial_cmp(&c_vc), None),
             "summary must not be concurrent with node_c's vclock after convergence"
         );
+    }
+
+    /// ===== Property tests for CRDT convergence under arbitrary interleaving =====
+    ///
+    /// The unit tests above each exercise one or two concrete op sequences, but
+    /// the `DistributedBucket` layer adds ageing, seed-token removal, and
+    /// writer-vs-origin identity that the upstream `crdts` crate tests do not
+    /// cover. Generating random op sequences and asserting the CRDT laws hold at
+    /// the `DistributedBucketLimiter` level gives us broad, adversarial coverage.
+    ///
+    /// Three properties are tested:
+    ///   1. Convergence — full-mesh gossip terminates in agreement.
+    ///   2. Idempotency — applying the same delta twice == applying it once.
+    ///   3. Commutativity — the merge order of two independent deltas does not
+    ///      matter.
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        const CLIENTS: &[&str] = &["alice", "bob", "carol"];
+        const NUM_NODES: usize = 3;
+
+        fn prop_node_ids() -> Vec<NodeId> {
+            (0..NUM_NODES)
+                .map(|i| NodeName::from(format!("node-{i}").as_str()).node_id())
+                .collect()
+        }
+
+        /// Long interval so no entries expire during a fast property-test run.
+        /// `expire_entries` threshold = interval_seconds * 1000 + 1 ms.
+        /// At 60 s that is 60 001 ms, well above the process-local monotonic
+        /// clock value for any test that runs in under a minute.
+        fn long_interval_settings() -> settings::RateLimitSettings {
+            settings::RateLimitSettings {
+                rate_limit_max_calls_allowed: 100,
+                rate_limit_interval_seconds: 60,
+            }
+        }
+
+        // After any sequence of rate-limit ops distributed across N nodes,
+        // a single full-mesh gossip round must bring every node to identical
+        // `check_calls_remaining_for_client` values for every client that
+        // received at least one op.
+        //
+        // This is the primary regression test for S1-style violations: if
+        // writes land in the wrong actor slot they get silently discarded on
+        // merge and the nodes diverge.
+        proptest! {
+            #[test]
+            fn prop_full_mesh_gossip_converges(
+                ops in proptest::collection::vec(
+                    (0usize..NUM_NODES, 0usize..CLIENTS.len()),
+                    1..30usize,
+                )
+            ) {
+                let settings = long_interval_settings();
+                let ids = prop_node_ids();
+
+                let mut limiters: Vec<DistributedBucketLimiter> = ids
+                    .iter()
+                    .map(|&id| DistributedBucketLimiter::new(id, settings.clone()))
+                    .collect();
+
+                for &(node_idx, client_idx) in &ops {
+                    limiters[node_idx].limit_calls_for_client(CLIENTS[client_idx].to_string());
+                }
+
+                // Full-mesh gossip: each node pushes its current delta to every
+                // other node. Collect all deltas before applying any so that the
+                // merge order within a round does not affect the outcome.
+                let deltas: Vec<Vec<DistributedBucketExternal>> = limiters
+                    .iter()
+                    .map(|l| l.gossip_delta_state())
+                    .collect();
+                for (i, delta) in deltas.iter().enumerate() {
+                    if !delta.is_empty() {
+                        for j in 0..NUM_NODES {
+                            if i != j {
+                                limiters[j].accept_delta_state(delta);
+                            }
+                        }
+                    }
+                }
+
+                // Assert convergence for every client that saw at least one op.
+                for &(_, ci) in &ops {
+                    let client_str = CLIENTS[ci].to_string();
+                    let counts: Vec<u32> = limiters
+                        .iter()
+                        .map(|l| l.check_calls_remaining_for_client(&client_str))
+                        .collect();
+                    let first = counts[0];
+                    for &c in &counts[1..] {
+                        prop_assert_eq!(
+                            c, first,
+                            "convergence violated for '{}': node counts = {:?}",
+                            CLIENTS[ci], counts
+                        );
+                    }
+                }
+            }
+        }
+
+        // `accept_delta_state` must be idempotent: applying the same delta a
+        // second time must not change the merged state.
+        proptest! {
+            #[test]
+            fn prop_accept_delta_is_idempotent(
+                ops in proptest::collection::vec(0usize..CLIENTS.len(), 1..15usize)
+            ) {
+                let settings = long_interval_settings();
+                let ids = prop_node_ids();
+
+                let mut sender = DistributedBucketLimiter::new(ids[0], settings.clone());
+                let mut recv_once = DistributedBucketLimiter::new(ids[1], settings.clone());
+                let mut recv_twice = DistributedBucketLimiter::new(ids[2], settings.clone());
+
+                for &ci in &ops {
+                    sender.limit_calls_for_client(CLIENTS[ci].to_string());
+                }
+                let delta = sender.gossip_delta_state();
+
+                recv_once.accept_delta_state(&delta);
+
+                recv_twice.accept_delta_state(&delta);
+                recv_twice.accept_delta_state(&delta); // second application must be a no-op
+
+                for client in CLIENTS {
+                    let client_str = client.to_string();
+                    let once = recv_once.check_calls_remaining_for_client(&client_str);
+                    let twice = recv_twice.check_calls_remaining_for_client(&client_str);
+                    prop_assert_eq!(
+                        once, twice,
+                        "idempotency violated for '{}': once={}, twice={}",
+                        client_str, once, twice
+                    );
+                }
+            }
+        }
+
+        // Merging deltas from two independent nodes must be commutative: the
+        // token count after (A then B) must equal the count after (B then A).
+        proptest! {
+            #[test]
+            fn prop_accept_delta_is_commutative(
+                ops_a in proptest::collection::vec(0usize..CLIENTS.len(), 1..15usize),
+                ops_b in proptest::collection::vec(0usize..CLIENTS.len(), 1..15usize),
+            ) {
+                let settings = long_interval_settings();
+                let ids = prop_node_ids();
+
+                let mut limiter_a = DistributedBucketLimiter::new(ids[0], settings.clone());
+                let mut limiter_b = DistributedBucketLimiter::new(ids[1], settings.clone());
+
+                for &ci in &ops_a {
+                    limiter_a.limit_calls_for_client(CLIENTS[ci].to_string());
+                }
+                for &ci in &ops_b {
+                    limiter_b.limit_calls_for_client(CLIENTS[ci].to_string());
+                }
+
+                let delta_a = limiter_a.gossip_delta_state();
+                let delta_b = limiter_b.gossip_delta_state();
+
+                // r_ab: merge A first, then B
+                let mut r_ab = DistributedBucketLimiter::new(ids[2], settings.clone());
+                r_ab.accept_delta_state(&delta_a);
+                r_ab.accept_delta_state(&delta_b);
+
+                // r_ba: merge B first, then A
+                let mut r_ba = DistributedBucketLimiter::new(ids[2], settings.clone());
+                r_ba.accept_delta_state(&delta_b);
+                r_ba.accept_delta_state(&delta_a);
+
+                for client in CLIENTS {
+                    let client_str = client.to_string();
+                    let ab = r_ab.check_calls_remaining_for_client(&client_str);
+                    let ba = r_ba.check_calls_remaining_for_client(&client_str);
+                    prop_assert_eq!(
+                        ab, ba,
+                        "commutativity violated for '{}': A∘B={}, B∘A={}",
+                        client_str, ab, ba
+                    );
+                }
+            }
+        }
     }
 }

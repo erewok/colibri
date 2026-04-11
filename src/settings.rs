@@ -135,7 +135,7 @@ impl ClusterTopology {
     }
 
     /// Get nodes sorted by name (for consistent bucket assignment)
-    /// This is critical for hashring mode - all nodes must agree on the same order
+    /// This is critical for hashring mode because all nodes must agree on the same order.
     pub fn sorted_nodes(&self) -> Vec<(NodeName, SocketAddr)> {
         let mut nodes = self.all_nodes();
         nodes.sort_by(|a, b| a.0.cmp(&b.0));

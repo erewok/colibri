@@ -186,7 +186,7 @@ impl TcpReceiver {
                                 // Write response length prefix
                                 let len = response_data.len() as u32;
                                 if let Err(e) = stream.write_all(&len.to_be_bytes()).await {
-                                    // Connection closed by peer - expected in some cases
+                                    // Connection closed by peer is expected in some cases
                                     debug!(
                                         "Failed to write response length to {}: {}",
                                         peer_addr, e

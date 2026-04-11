@@ -1257,17 +1257,11 @@ mod tests {
         let c_vc = limiter_c.get_latest_updated_vclock();
 
         assert!(
-            !matches!(
-                summary.partial_cmp(&b_vc),
-                None
-            ),
+            !matches!(summary.partial_cmp(&b_vc), None),
             "summary must not be concurrent with node_b's vclock after convergence"
         );
         assert!(
-            !matches!(
-                summary.partial_cmp(&c_vc),
-                None
-            ),
+            !matches!(summary.partial_cmp(&c_vc), None),
             "summary must not be concurrent with node_c's vclock after convergence"
         );
     }

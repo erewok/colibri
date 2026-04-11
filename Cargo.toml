@@ -5,7 +5,7 @@ description = "Distributed rate-limiting as a service"
 authors = ["Erik Aker <eraker@gmail.com>"]
 homepage = "https://github.com/erewok/colibri"
 repository = "https://github.com/erewok/colibri"
-edition = "2021"
+edition = "2024"
 license = "MPL-2.0"
 
 default-run = "colibri-server"
@@ -28,28 +28,28 @@ async-trait = "0.1.89"
 axum = { version = "0.8.8", features = ["macros"] }
 bytes = "1.11.1"
 chrono = { version = "0.4.44", features = ["clock"] }
-clap = { version = "4.5.60", features = ["derive", "env"] }
+clap = { version = "4.6.0", features = ["derive", "env"] }
 crdts = "7.3.2"
 figment = { version = "0.10.19", features = ["toml"] }
 gxhash = "3.4"
 hostname = "0.4.2"
-indexmap = {version = "2.13.0", features = ["serde"] }
+indexmap = {version = "2.14.0", features = ["serde"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
-papaya = { version = "0.2.3", features = ["serde"] }
+papaya = { version = "0.2.4", features = ["serde"] }
 postcard = { version = "1.1.3", features = ["alloc"] }
-rand = "0.10.0"
+rand = "0.10.1"
 reqwest = { version = "0.13.2", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.50.0", features = [
+tokio = { version = "1.51.1", features = [
     "macros",
     "rt-multi-thread",
     "time",
     "net",
     "sync",
 ] }
-toml = "0.9.8"
+toml = "1.1.2+spec-1.1.0"
 tower = { version = "0.5.3", features = [
     "util",
     "timeout",
@@ -69,14 +69,13 @@ thiserror = "2.0.18"
 url = "2.5.8"
 tracing = "0.1.44"
 tracing-futures = "0.2.5"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 # console-subscriber = "0.5.0"
 criterion = "0.8.2"
-env_logger = "0.11.9"
+env_logger = "0.11.10"
 mock_instant = "0.6.0"
-proptest = "1.10.0"
-rand = "0.10.0"
-tempfile = "3.26.0"
+proptest = "1.11.0"
+tempfile = "3.27.0"
 tokio-test = "0.4.5"

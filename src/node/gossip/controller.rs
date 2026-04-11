@@ -1186,4 +1186,133 @@ impl GossipController {
     }
 }
 
-// ===== Tests temporarily disabled =====
+// ===== Tx4: Controller-level tests for deduplication and packet processing =====
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::NodeName;
+    use crate::settings;
+
+    /// Helper: build a serialized `DeltaStateSync` packet whose updates come
+    /// from a sender limiter that is distinct from the controller's own node.
+    /// Uses `propagation_factor: 0` so the controller does not attempt to
+    /// re-propagate, which would fail with "no peers" in unit tests.
+    fn make_delta_packet(
+        sender_name: &str,
+        client_id: &str,
+        packet_id: u64,
+        controller_settings: &settings::Settings,
+    ) -> Bytes {
+        let sender_id = NodeName::from(sender_name).node_id();
+        let rl = controller_settings.rate_limit_settings();
+        let mut sender_limiter = DistributedBucketLimiter::new(sender_id, rl);
+        sender_limiter.limit_calls_for_client(client_id.to_string());
+        let updates = sender_limiter.gossip_delta_state();
+
+        let message = GossipMessage::DeltaStateSync {
+            updates,
+            sender_node_id: sender_id,
+            response_addr: "127.0.0.1:9999".parse().unwrap(),
+            propagation_factor: 0,
+        };
+        GossipPacket::new_with_id(message, packet_id)
+            .serialize()
+            .expect("serialization failed")
+    }
+
+    /// A duplicate packet — same `packet_id` sent twice — must be processed
+    /// exactly once. The dedup cache should drop the second copy so the
+    /// limiter state is identical to a single delivery.
+    #[tokio::test]
+    async fn test_duplicate_packet_is_deduplicated() {
+        let settings = settings::tests::sample();
+        let controller = GossipController::new(settings.clone()).await.unwrap();
+        let peer: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+
+        let packet = make_delta_packet("sender-node", "alice", 42, &settings);
+
+        // First delivery: state should be updated.
+        controller
+            .process_gossip_packet(packet.clone(), peer)
+            .await
+            .unwrap();
+
+        let tokens_after_first = {
+            let limiter = controller
+                .named_rate_limiters
+                .pin()
+                .get(DEFAULT_RULE_NAME)
+                .cloned()
+                .unwrap();
+            let guard = limiter.lock().unwrap();
+            guard.check_calls_remaining_for_client(&"alice".to_string())
+        };
+
+        // Second delivery with the same packet_id: dedup cache must drop it.
+        controller
+            .process_gossip_packet(packet.clone(), peer)
+            .await
+            .unwrap();
+
+        let tokens_after_second = {
+            let limiter = controller
+                .named_rate_limiters
+                .pin()
+                .get(DEFAULT_RULE_NAME)
+                .cloned()
+                .unwrap();
+            let guard = limiter.lock().unwrap();
+            guard.check_calls_remaining_for_client(&"alice".to_string())
+        };
+
+        assert_eq!(
+            tokens_after_first, tokens_after_second,
+            "duplicate packet must not change limiter state"
+        );
+    }
+
+    /// Two packets with distinct `packet_id`s must both be applied, even if
+    /// they carry updates for the same client from the same sender.
+    #[tokio::test]
+    async fn test_distinct_packet_ids_are_both_applied() {
+        let settings = settings::tests::sample();
+        let controller = GossipController::new(settings.clone()).await.unwrap();
+        let peer: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+        // Two separate packets, different IDs, different clients.
+        let packet_a = make_delta_packet("sender-node", "alice", 100, &settings);
+        let packet_b = make_delta_packet("sender-node", "bob", 101, &settings);
+
+        controller
+            .process_gossip_packet(packet_a, peer)
+            .await
+            .unwrap();
+        controller
+            .process_gossip_packet(packet_b, peer)
+            .await
+            .unwrap();
+
+        let limiter_arc = controller
+            .named_rate_limiters
+            .pin()
+            .get(DEFAULT_RULE_NAME)
+            .cloned()
+            .unwrap();
+        let guard = limiter_arc.lock().unwrap();
+
+        // Both clients should have been merged into the limiter.
+        let alice = guard.check_calls_remaining_for_client(&"alice".to_string());
+        let bob = guard.check_calls_remaining_for_client(&"bob".to_string());
+
+        // sender consumed one token each; both should be below the full limit.
+        assert!(
+            alice < settings.rate_limit_max_calls_allowed,
+            "alice's bucket not merged (tokens={alice})"
+        );
+        assert!(
+            bob < settings.rate_limit_max_calls_allowed,
+            "bob's bucket not merged (tokens={bob})"
+        );
+    }
+}

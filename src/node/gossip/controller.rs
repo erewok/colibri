@@ -487,29 +487,38 @@ impl GossipController {
         Ok(())
     }
 
-    /// Gossip-specific: Handle state request
+    /// Gossip-specific: Handle state request (HTTP path).
+    ///
+    /// Returns the full state dump for anti-entropy. We always dump everything
+    /// regardless of which keys were requested — state-based CRDT merge is
+    /// idempotent so extra data is harmless, and simplicity beats precision here.
     async fn handle_state_request(
         &self,
-        missing_keys: Option<Vec<String>>,
+        _missing_keys: Option<Vec<String>>,
     ) -> Result<Vec<DistributedBucketExternal>> {
         let limiter_arc = self.get_limiter(None)?;
         let limiter = limiter_arc
             .lock()
             .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+        debug!("[{}] State request - returning full state dump", self.node_id);
+        Ok(limiter.full_state_dump())
+    }
 
-        if let Some(_keys) = missing_keys {
-            debug!(
-                "[{}] State request with specific keys - returning all state",
-                self.node_id
-            );
-            Ok(limiter.gossip_delta_state())
-        } else {
-            debug!(
-                "[{}] State request - returning all delta state",
-                self.node_id
-            );
-            Ok(limiter.gossip_delta_state())
-        }
+    /// Send a gossip packet to a specific peer address (unicast).
+    ///
+    /// Unlike `send_gossip_packet` which fans out to random peers, this targets
+    /// a single address — used for anti-entropy responses where we know exactly
+    /// who to reply to.
+    async fn send_gossip_packet_to(&self, addr: SocketAddr, packet: GossipPacket) -> Result<()> {
+        let data = packet.serialize().map_err(|e| {
+            ColibriError::Transport(format!("Serialization failed: {}", e))
+        })?;
+        self.transport.send_to_peer(addr, &data).await?;
+        debug!(
+            "[{}] Sent targeted gossip packet to {}",
+            self.node_id, addr
+        );
+        Ok(())
     }
 
     /// Check if this node has gossip enabled
@@ -622,11 +631,54 @@ impl GossipController {
         match GossipPacket::deserialize(&data) {
             Ok(packet) => {
                 match packet.message {
-                    GossipMessage::StateRequest { .. } => {
-                        debug!(
-                            "[{}] Received StateRequest - not yet implemented",
-                            self.node_id
+                    GossipMessage::StateRequest {
+                        requesting_node_id,
+                        response_addr: requester_addr,
+                        ..
+                    } => {
+                        // Don't respond to our own requests (shouldn't happen but guard anyway)
+                        if requesting_node_id == self.node_id {
+                            return Ok(());
+                        }
+
+                        info!(
+                            "[GOSSIP_ANTI_ENTROPY] node:{} received StateRequest from:{}",
+                            self.node_id, requesting_node_id
                         );
+
+                        let state = {
+                            let limiter_arc = self.get_limiter(None)?;
+                            let limiter = limiter_arc.lock().map_err(|e| {
+                                ColibriError::Concurrency(format!("Lock poisoned: {}", e))
+                            })?;
+                            limiter.full_state_dump()
+                        };
+
+                        if !state.is_empty() {
+                            // Respond with a DeltaStateSync (propagation_factor 0 so the
+                            // anti-entropy response is not re-gossiped further). The receiver
+                            // already handles DeltaStateSync idempotently via CRDT merge.
+                            let response = GossipMessage::DeltaStateSync {
+                                updates: state,
+                                sender_node_id: self.node_id,
+                                response_addr: self.response_addr,
+                                propagation_factor: 0,
+                            };
+                            let packet = GossipPacket::new(response);
+                            if let Err(e) =
+                                self.send_gossip_packet_to(requester_addr, packet).await
+                            {
+                                warn!(
+                                    "[{}] Failed to send anti-entropy response to {}: {}",
+                                    self.node_id, requester_addr, e
+                                );
+                            }
+                        } else {
+                            debug!(
+                                "[{}] StateRequest from {} but limiter is empty — nothing to send",
+                                self.node_id, requesting_node_id
+                            );
+                        }
                     }
                     GossipMessage::DeltaStateSync {
                         updates,
@@ -679,12 +731,64 @@ impl GossipController {
                     GossipMessage::Heartbeat {
                         node_id: heartbeat_node_id,
                         timestamp: _,
-                        vclock: _,
-                        response_addr: _,
+                        vclock: peer_vclock,
+                        response_addr: peer_response_addr,
                     } => {
                         // Don't process our own heartbeat
                         if heartbeat_node_id == self.node_id {
                             return Ok(());
+                        }
+
+                        // Anti-entropy: if the peer's vclock has dots we don't have,
+                        // request their full state. The CRDT merge is idempotent so
+                        // requesting unnecessarily is safe; missing an update is not.
+                        //
+                        // `our_vclock >= peer_vclock` (causal dominance) means we have
+                        // seen every event the peer has. If that is not the case, the peer
+                        // is ahead on at least one actor slot — request a full sync.
+                        if !peer_vclock.is_empty() {
+                            let our_vclock = {
+                                let limiter_arc = self.get_limiter(None)?;
+                                let limiter = limiter_arc.lock().map_err(|e| {
+                                    ColibriError::Concurrency(format!("Lock poisoned: {}", e))
+                                })?;
+                                limiter.get_latest_updated_vclock()
+                            };
+
+                            // Request state when our clock is strictly behind the peer
+                            // (Some(Less)) OR concurrent with it (None — both nodes have
+                            // events the other hasn't seen). Both cases mean the peer has
+                            // at least one update we're missing.
+                            let peer_has_unseen_state = matches!(
+                                our_vclock.partial_cmp(&peer_vclock),
+                                Some(std::cmp::Ordering::Less) | None
+                            );
+
+                            if peer_has_unseen_state {
+                                info!(
+                                    "[GOSSIP_ANTI_ENTROPY] node:{} vclock behind peer:{}, sending StateRequest to {}",
+                                    self.node_id, heartbeat_node_id, peer_response_addr
+                                );
+                                let request = GossipMessage::StateRequest {
+                                    requesting_node_id: self.node_id,
+                                    missing_keys: None,
+                                    response_addr: self.response_addr,
+                                };
+                                let packet = GossipPacket::new(request);
+                                if let Err(e) =
+                                    self.send_gossip_packet_to(peer_response_addr, packet).await
+                                {
+                                    warn!(
+                                        "[{}] Failed to send StateRequest to {}: {}",
+                                        self.node_id, peer_response_addr, e
+                                    );
+                                }
+                            } else {
+                                debug!(
+                                    "[{}] Heartbeat from {}: vclock is current, no anti-entropy needed",
+                                    self.node_id, heartbeat_node_id
+                                );
+                            }
                         }
                     }
 

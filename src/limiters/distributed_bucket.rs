@@ -499,6 +499,21 @@ impl DistributedBucketLimiter {
             .map(|counter| counter.to_external(client_id))
     }
 
+    /// Return the full CRDT state for all known clients, regardless of whether
+    /// each bucket has been gossiped since its last update.
+    ///
+    /// Used for anti-entropy: when a peer requests a full sync, we send everything
+    /// we have so they can merge it idempotently. Unlike `gossip_delta_state`, this
+    /// does NOT advance the gossip watermark — the regular delta loop continues
+    /// normally after an anti-entropy exchange.
+    pub fn full_state_dump(&self) -> Vec<DistributedBucketExternal> {
+        self.node_counters
+            .pin()
+            .iter()
+            .map(|(client_id, bucket)| bucket.to_external(client_id))
+            .collect()
+    }
+
     pub fn accept_delta_state(&mut self, delta: &[DistributedBucketExternal]) {
         let local_node_id = self.node_id;
         for incoming_bucket in delta.iter() {
@@ -930,5 +945,79 @@ mod tests {
             96,
             "both replicas must converge to the same token count"
         );
+    }
+
+    /// `full_state_dump` must return all buckets regardless of whether they have
+    /// been gossiped since their last update, unlike `gossip_delta_state` which
+    /// skips watermark-current buckets.
+    #[test]
+    fn test_full_state_dump_returns_all_buckets() {
+        let node_a = node_id();
+        let settings = test_settings();
+        let mut limiter = DistributedBucketLimiter::new(node_a, settings);
+
+        limiter.limit_calls_for_client("client_1".to_string());
+        limiter.limit_calls_for_client("client_2".to_string());
+
+        // After gossip_delta_state advances the watermarks, those buckets are
+        // excluded from the next delta call.
+        let delta = limiter.gossip_delta_state();
+        assert_eq!(delta.len(), 2, "both buckets should appear in first delta");
+
+        let delta_again = limiter.gossip_delta_state();
+        assert_eq!(
+            delta_again.len(),
+            0,
+            "no new ops since last gossip — delta should be empty"
+        );
+
+        // But full_state_dump must still return everything for anti-entropy.
+        let dump = limiter.full_state_dump();
+        assert_eq!(
+            dump.len(),
+            2,
+            "full_state_dump must return all buckets regardless of watermark"
+        );
+        let client_ids: Vec<&str> = dump.iter().map(|b| b.client_id.as_str()).collect();
+        assert!(client_ids.contains(&"client_1"));
+        assert!(client_ids.contains(&"client_2"));
+    }
+
+    /// Anti-entropy: a node that received state via gossip and then went idle should
+    /// be able to recover that state after a `StateRequest`/`full_state_dump` exchange.
+    #[test]
+    fn test_full_state_dump_used_for_anti_entropy_recovery() {
+        let node_a = node_id();
+        let node_b = NodeName::from("b").node_id();
+        let settings = test_settings();
+
+        let mut limiter_a = DistributedBucketLimiter::new(node_a, settings.clone());
+        let mut limiter_b = DistributedBucketLimiter::new(node_b, settings);
+
+        // Node A processes requests for two clients.
+        limiter_a.limit_calls_for_client("alice".to_string());
+        limiter_a.limit_calls_for_client("alice".to_string());
+        limiter_a.limit_calls_for_client("bob".to_string());
+
+        // Simulate UDP packet loss: node B never receives A's delta gossip.
+        // Node B has no knowledge of alice or bob.
+        assert_eq!(limiter_b.full_state_dump().len(), 0);
+
+        // Anti-entropy: B sends a StateRequest; A responds with full_state_dump.
+        // (In production this round-trip happens over UDP; here we test the
+        // limiter-layer semantics directly.)
+        let full_state = limiter_a.full_state_dump();
+        assert_eq!(full_state.len(), 2, "A should have 2 clients");
+
+        limiter_b.accept_delta_state(&full_state);
+
+        // After recovery B should see both clients with the same token counts as A.
+        let alice_a = limiter_a.check_calls_remaining_for_client(&"alice".to_string());
+        let alice_b = limiter_b.check_calls_remaining_for_client(&"alice".to_string());
+        assert_eq!(alice_a, alice_b, "alice's quota must match after anti-entropy");
+
+        let bob_a = limiter_a.check_calls_remaining_for_client(&"bob".to_string());
+        let bob_b = limiter_b.check_calls_remaining_for_client(&"bob".to_string());
+        assert_eq!(bob_a, bob_b, "bob's quota must match after anti-entropy");
     }
 }

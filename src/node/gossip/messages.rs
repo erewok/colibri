@@ -216,8 +216,15 @@ mod tests {
 
         let result = GossipPacket::from_wire(&serialized);
         assert!(
-            matches!(result, Err(GossipDecodeError::VersionMismatch { expected: GOSSIP_PROTOCOL_VERSION, got: 0 })),
-            "expected VersionMismatch error, got {:?}", result.map(|_| ())
+            matches!(
+                result,
+                Err(GossipDecodeError::VersionMismatch {
+                    expected: GOSSIP_PROTOCOL_VERSION,
+                    got: 0
+                })
+            ),
+            "expected VersionMismatch error, got {:?}",
+            result.map(|_| ())
         );
     }
 }

@@ -595,6 +595,32 @@ impl DistributedBucketLimiter {
         }
     }
 
+    /// Age out expired operations on every live bucket.
+    ///
+    /// Addresses the Case where origin alive but idle: without traffic on a given
+    /// bucket, `add_tokens_to_bucket` is never called, so `expire_entries` is
+    /// never driven and the CRDT counter keeps the un-aged fill/request ops
+    /// forever. Calling this on every gossip tick ensures expirations happen
+    /// even for quiescent buckets.
+    ///
+    /// Preserves the single-writer-per-actor invariant: `expire_entries`
+    /// only writes to `self.writer_node_id`, which is always the local node's
+    /// slot, never a remote origin's. Case B (origin dead with un-aged ops at
+    /// remote replicas) is not addressed here; see the review doc.
+    pub fn tick_expirations(&self) {
+        let expiration_threshold_ms =
+            (self.rate_limit_settings.rate_limit_interval_seconds * 1000 + 1) as i64;
+        let guard = self.node_counters.pin();
+        let keys: Vec<String> = guard.iter().map(|(k, _)| k.clone()).collect();
+        for key in keys {
+            guard.update(key, |b| {
+                let mut b = b.clone();
+                b.expire_entries(expiration_threshold_ms);
+                b
+            });
+        }
+    }
+
     /// Return the join (element-wise maximum) of every bucket's vclock.
     ///
     /// This is the correct summary of "all state this node has seen": a single
@@ -863,7 +889,65 @@ mod tests {
         // Should not expire either bucket (both are recent)
         limiter.expire_keys();
         assert_eq!(limiter.len(), 2);
-    } // === CRDT Properties Tests ===
+    }
+
+    #[test]
+    fn test_tick_expirations_ages_idle_buckets() {
+        // Regression: an idle bucket's ops must age out via the
+        // periodic tick alone — `add_tokens_to_bucket` is never called on a
+        // bucket that has no new traffic, so without a background tick the
+        // un-aged entries sit in the CRDT forever.
+        let node_id = node_id();
+        let settings = settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 10,
+            rate_limit_interval_seconds: 1,
+        };
+        let limiter = DistributedBucketLimiter::new(node_id, settings);
+        let client_id = "idle_client".to_string();
+
+        // Stage a bucket that already has a stale op whose timestamp predates
+        // the expiration threshold. This avoids a 1+ second sleep in the test.
+        let threshold_ms: i64 = 1001;
+        {
+            let guard = limiter.node_counters.pin();
+            let mut bucket = DistributedBucket::new(10, node_id);
+            bucket.counter.inc_request(node_id);
+            bucket.requests.push(InternalRequestEntry {
+                op: InternalPnCounterOp::Requests(1),
+                timestamp_ms: monotonic_ms() - threshold_ms - 500,
+                vclock: bucket.vclock(),
+            });
+            guard.insert(client_id.clone(), bucket);
+        }
+
+        // Sanity: the staged decrement is visible before the tick.
+        {
+            let guard = limiter.node_counters.pin();
+            let bucket = guard.get(&client_id).unwrap();
+            assert_eq!(bucket.counter.tokens(), BigInt::from(-1));
+            assert_eq!(bucket.requests.len(), 1);
+        }
+
+        // No user traffic on this client — just a background tick.
+        limiter.tick_expirations();
+
+        // The stale op should be gone from the ageing log and the CRDT should
+        // have been compensated back to zero via the local writer slot.
+        let guard = limiter.node_counters.pin();
+        let bucket = guard.get(&client_id).unwrap();
+        assert_eq!(
+            bucket.requests.len(),
+            0,
+            "tick_expirations should have removed the expired entry"
+        );
+        assert_eq!(
+            bucket.counter.tokens(),
+            BigInt::from(0),
+            "tick_expirations should have compensated the CRDT counter"
+        );
+    }
+
+    // === CRDT Properties Tests ===
 
     #[test]
     fn test_crdt_properties() {

@@ -583,6 +583,9 @@ impl GossipController {
     }
 
     pub async fn handle_gossip_tick(&self) -> Result<()> {
+        // Fix origin alive but idle: age out expired ops on idle buckets before collecting
+        // deltas, so any resulting decrements ride this same gossip round.
+        self.tick_all_expirations()?;
         // Send delta updates for buckets that have changed
         let updates = self.collect_gossip_updates().await?;
         if !updates.is_empty() {
@@ -627,6 +630,25 @@ impl GossipController {
         Ok(())
     }
 
+    /// Drive ageing on every known limiter's live buckets.
+    ///
+    /// Without this, an idle bucket's ops never age out: `expire_entries` is
+    /// otherwise only called transitively from `add_tokens_to_bucket`, which
+    /// only runs when the bucket receives a new request. Called on each gossip
+    /// tick so that un-aged ops are expired locally and the resulting CRDT
+    /// decrements are picked up by the very next `collect_gossip_updates`.
+    pub fn tick_all_expirations(&self) -> Result<()> {
+        let limiters: Vec<Arc<Mutex<DistributedBucketLimiter>>> =
+            self.named_rate_limiters.pin().values().cloned().collect();
+        for limiter_arc in limiters {
+            let limiter = limiter_arc
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+            limiter.tick_expirations();
+        }
+        Ok(())
+    }
+
     /// Collect buckets that have been updated and should be gossiped
     pub async fn collect_gossip_updates(&self) -> Result<Vec<DistributedBucketExternal>> {
         let limiter_arc = self.get_limiter(None)?;
@@ -650,7 +672,10 @@ impl GossipController {
                     })?;
                     let (ref mut seen, ref mut order) = *cache;
                     if seen.contains(&packet.packet_id) {
-                        debug!("[{}] Dropping duplicate packet {}", self.node_id, packet.packet_id);
+                        debug!(
+                            "[{}] Dropping duplicate packet {}",
+                            self.node_id, packet.packet_id
+                        );
                         return Ok(());
                     }
                     seen.insert(packet.packet_id);

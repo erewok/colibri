@@ -1,4 +1,3 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 
@@ -18,14 +17,15 @@ impl NodeName {
         Self(id)
     }
 
-    pub fn value(&self) -> &str {
-        &self.0
-    }
-
     pub fn node_id(&self) -> NodeId {
-        let mut s = DefaultHasher::new();
-        self.hash(&mut s);
-        NodeId(s.finish() as u32)
+        // FNV-1a hash — deterministic and seed-independent across all processes and restarts.
+        // DefaultHasher is randomized per-process since Rust 1.36 and must not be used here.
+        let mut hash: u64 = 14695981039346656037;
+        for byte in self.0.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(1099511628211);
+        }
+        NodeId(hash as u32)
     }
 
     pub fn as_str(&self) -> &str {

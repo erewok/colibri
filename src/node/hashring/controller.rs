@@ -12,9 +12,9 @@ use crate::limiters::TokenBucketLimiter;
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
 };
-use crate::node::{NodeAddress, NodeName};
+use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{self, ClusterTopology, RunMode};
-use crate::transport::traits::Sender;
+use crate::transport::traits::{RequestSender, Sender};
 use crate::transport::{tcp_receiver::TcpRequest, TcpReceiver, TcpTransport};
 
 use super::consistent_hashing;
@@ -23,8 +23,8 @@ use super::consistent_hashing;
 #[derive(Clone)]
 pub struct HashringController {
     node_name: NodeName,
+    /// This node's positional index in topology.sorted_nodes() — its owned bucket.
     bucket: u32,
-    number_of_buckets: u32,
     topology: Arc<RwLock<ClusterTopology>>,
     transport: Arc<TcpTransport>,
     /// Concurrent HashMap for rate limiters (papaya provides lock-free reads)
@@ -46,7 +46,6 @@ impl std::fmt::Debug for HashringController {
         f.debug_struct("HashringController")
             .field("node_name", &self.node_name)
             .field("bucket", &self.bucket)
-            .field("number_of_buckets", &self.number_of_buckets)
             .finish()
     }
 }
@@ -56,20 +55,26 @@ impl HashringController {
         let node_name = settings.node_name();
 
         let cluster_topology = settings.cluster_topology();
-        let number_of_buckets = cluster_topology
-            .nodes
-            .len()
-            .try_into()
-            .map_err(|e| ColibriError::Config(format!("Invalid cluster size: {}", e)))?;
 
-        if number_of_buckets == 0 {
+        if cluster_topology.nodes.is_empty() {
             return Err(ColibriError::Config(
                 "Hashring mode requires cluster topology with other nodes".to_string(),
             ));
         }
 
-        let bucket =
-            consistent_hashing::jump_consistent_hash(node_name.as_str(), number_of_buckets);
+        // Bucket = positional index in sorted_nodes(). This is the only correct assignment:
+        // find_owner_if_not_self uses sorted_nodes()[bucket], so both sides must use position,
+        // not jump_consistent_hash(node_name) which is not a bijection over node names.
+        let sorted = cluster_topology.sorted_nodes();
+        let bucket = sorted
+            .iter()
+            .position(|(name, _)| name == &node_name)
+            .ok_or_else(|| {
+                ColibriError::Config(format!(
+                    "Node '{}' not found in its own topology — ensure the topology includes this node",
+                    node_name
+                ))
+            })? as u32;
 
         // Initialize HashMap with default limiter
         let named_rate_limiters = HashMap::new();
@@ -92,7 +97,6 @@ impl HashringController {
         Ok(Self {
             node_name,
             bucket,
-            number_of_buckets,
             topology: Arc::new(RwLock::new(cluster_topology)),
             transport: Arc::new(transport),
             named_rate_limiters,
@@ -232,43 +236,42 @@ impl HashringController {
         Ok(f(&mut limiter))
     }
 
-    fn owns_bucket_for_client(&self, client_id: &str) -> bool {
-        let client_bucket =
-            consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
-        client_bucket == self.bucket
-    }
-
-    async fn find_bucket_owner(&self, client_id: &str) -> Result<SocketAddr> {
-        let client_bucket =
-            consistent_hashing::jump_consistent_hash(client_id, self.number_of_buckets);
-
+    /// Returns `None` if this node owns the client's bucket, or `Some(NodeId)` of the owner.
+    /// Acquires the topology lock once so both the ownership check and the owner lookup
+    /// use the same N — eliminating the TOCTOU between separate lock acquisitions.
+    async fn find_owner_if_not_self(&self, client_id: &str) -> Result<Option<NodeId>> {
         let topology = self.topology.read().await;
-        let all_nodes: Vec<_> = topology.sorted_nodes().into_iter().collect();
+        let sorted = topology.sorted_nodes();
+        let n = sorted.len() as u32;
 
-        if client_bucket as usize >= all_nodes.len() {
+        if n == 0 {
+            return Err(ColibriError::Node("Topology is empty".to_string()));
+        }
+
+        let client_bucket = consistent_hashing::jump_consistent_hash(client_id, n);
+
+        if client_bucket == self.bucket {
+            return Ok(None);
+        }
+
+        if client_bucket as usize >= sorted.len() {
             return Err(ColibriError::Node(format!(
                 "Bucket {} out of range for {} nodes",
                 client_bucket,
-                all_nodes.len()
+                sorted.len()
             )));
         }
 
-        let (_name, address) = &all_nodes[client_bucket as usize];
-        Ok(*address)
+        let (name, _) = &sorted[client_bucket as usize];
+        Ok(Some(name.node_id()))
     }
 
-    async fn forward_request(&self, target: SocketAddr, message: &Message) -> Result<Message> {
-        debug!("Forwarding request to {} for routing", target);
+    async fn forward_request(&self, target: NodeId, message: &Message) -> Result<Message> {
+        debug!("Forwarding request to {:?} via socket pool", target);
 
-        let data = postcard::to_allocvec(message)
-            .map_err(|e| ColibriError::Transport(format!("Failed to serialize message: {}", e)))?;
-
+        let data = message.serialize()?;
         let response_data = self.transport.send_request_response(target, &data).await?;
-
-        let response: Message = postcard::from_bytes(&response_data).map_err(|e| {
-            ColibriError::Transport(format!("Failed to deserialize response: {}", e))
-        })?;
-        Ok(response)
+        Message::deserialize(&response_data)
     }
 
     async fn handle_rate_limit_request(
@@ -282,13 +285,12 @@ impl HashringController {
                 crate::node::messages::MAX_FORWARDING_DEPTH,
                 request.client_id
             );
-            return Err(ColibriError::Transport(
-                "Max forwarding depth exceeded - possible topology inconsistency".to_string(),
+            return Err(ColibriError::Node(
+                "Max forwarding depth exceeded — topology is converging, retry later".to_string(),
             ));
         }
 
-        if !self.owns_bucket_for_client(&request.client_id) {
-            let owner = self.find_bucket_owner(&request.client_id).await?;
+        if let Some(owner) = self.find_owner_if_not_self(&request.client_id).await? {
             request.forwarding_depth = request.forwarding_depth.saturating_add(1);
 
             debug!(

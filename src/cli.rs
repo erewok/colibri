@@ -129,13 +129,6 @@ pub struct Cli {
     )]
     pub gossip_fanout: usize,
 
-    #[clap(
-        long,
-        default_value = "1",
-        env("COLIBRI_HASH_REPLICATION_FACTOR"),
-        help = "Number of replicas for hashring mode (1, 2, or 3) (default 1)"
-    )]
-    pub hash_replication_factor: usize,
 }
 
 impl Cli {
@@ -168,7 +161,6 @@ impl Cli {
             topology: self.topology.into_iter().collect(),
             gossip_interval_ms: self.gossip_interval_ms,
             gossip_fanout: self.gossip_fanout,
-            hash_replication_factor: self.hash_replication_factor,
         }
     }
 

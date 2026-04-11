@@ -48,14 +48,15 @@ impl TcpTransport {
         self.send_fire_and_forget(peer, &data).await
     }
 
-    /// Send a Message to a peer by address and wait for response
+    /// Send a Message to a peer by address and wait for response.
+    /// Uses a direct connection (bypasses socket pool) — suitable for admin/one-off use.
     pub async fn send_message_request_response(
         &self,
         peer: SocketAddr,
         message: &Message,
     ) -> Result<Message> {
         let data = message.serialize()?;
-        let response_data = self.send_request_response(peer, &data).await?;
+        let response_data = self.send_request_response_direct(peer, &data).await?;
         Message::deserialize(&response_data)
     }
 
@@ -74,15 +75,24 @@ impl TcpTransport {
     // FIRE-AND-FORGET OPERATIONS
     // ============================================================================
 
-    /// Send raw data without waiting for response (fire-and-forget) using SocketAddr
-    /// This spawns a task to send the message asynchronously
+    /// Send raw data without waiting for response (fire-and-forget) using SocketAddr.
+    /// Spawns a task to send asynchronously without blocking the caller.
     pub async fn send_fire_and_forget(&self, peer: SocketAddr, data: &[u8]) -> Result<()> {
         let data = data.to_vec();
-        let socket_pool = self.socket_pool.clone();
 
-        // Spawn task to send without waiting
         tokio::spawn(async move {
-            if let Err(e) = Self::send_with_socket_pool(&socket_pool, peer, &data).await {
+            let result: Result<()> = async {
+                let mut stream = tokio::net::TcpStream::connect(peer).await?;
+                let len = data.len() as u32;
+                stream.write_all(&[ProtocolType::Gossip.to_byte()]).await?;
+                stream.write_all(&len.to_be_bytes()).await?;
+                stream.write_all(&data).await?;
+                stream.flush().await?;
+                trace!("Sent {} byte fire-and-forget message to {}", len, peer);
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
                 tracing::warn!("Fire-and-forget send failed to {}: {}", peer, e);
             }
         });
@@ -100,32 +110,14 @@ impl TcpTransport {
             .await
     }
 
-    /// Internal helper to send data using the socket pool
-    async fn send_with_socket_pool(
-        _socket_pool: &Arc<RwLock<TcpSocketPool>>,
+    /// Send raw data to a peer and wait for response, bypassing the socket pool.
+    /// Use this only for one-off connections (e.g. admin tooling). Hashring forwarding
+    /// should use the socket pool via `RequestSender::send_request_response`.
+    pub async fn send_request_response_direct(
+        &self,
         peer: SocketAddr,
         data: &[u8],
-    ) -> Result<()> {
-        let mut stream = tokio::net::TcpStream::connect(peer).await?;
-
-        // Write protocol type (fire-and-forget gossip)
-        stream.write_all(&[ProtocolType::Gossip.to_byte()]).await?;
-
-        // Write length prefix
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-
-        // Write payload
-        stream.write_all(data).await?;
-        stream.flush().await?;
-
-        trace!("Sent {} byte fire-and-forget message to {}", len, peer);
-
-        Ok(())
-    }
-
-    /// Send raw data to a peer and wait for response
-    pub async fn send_request_response(&self, peer: SocketAddr, data: &[u8]) -> Result<Vec<u8>> {
+    ) -> Result<Vec<u8>> {
         // Add timeout to prevent hanging on unresponsive peers
         let timeout_duration = tokio::time::Duration::from_secs(5);
 

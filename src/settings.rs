@@ -142,21 +142,6 @@ impl ClusterTopology {
         nodes
     }
 
-    /// Calculate bucket number for a given node name
-    /// Returns None if topology is empty
-    pub fn bucket_for_node(&self, node_name: &NodeName) -> Option<u32> {
-        if self.nodes.is_empty() {
-            return None;
-        }
-        let num_buckets = self.nodes.len() as u32;
-        Some(
-            crate::node::hashring::consistent_hashing::jump_consistent_hash(
-                node_name.as_str(),
-                num_buckets,
-            ),
-        )
-    }
-
     /// Get the node that owns a specific bucket
     /// Buckets are assigned to nodes in sorted order
     pub fn node_for_bucket(&self, bucket: u32) -> Option<NodeName> {
@@ -262,9 +247,6 @@ pub struct Settings {
     // Gossip Configuration
     pub gossip_interval_ms: u64, // Regular gossip interval (default: 25)
     pub gossip_fanout: usize,    // Number of peers per gossip round (default: 4)
-
-    // Hashring replication factor
-    pub hash_replication_factor: usize,
 }
 
 impl Settings {
@@ -273,19 +255,17 @@ impl Settings {
     }
 
     pub fn transport_config(&self) -> TransportConfig {
+        // Build topology from sorted ClusterTopology so NodeId→SocketAddr order is
+        // deterministic across restarts (HashMap iteration order is not guaranteed).
+        let cluster_topology = self.cluster_topology();
         TransportConfig {
             node_name: self.node_name(),
             peer_listen_address: self.peer_listen_address.clone(),
             peer_listen_port: self.peer_listen_port,
-            topology: self
-                .topology
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        NodeName::new(k.into()).node_id(),
-                        v.parse().expect("Invalid socket address in topology"),
-                    )
-                })
+            topology: cluster_topology
+                .sorted_nodes()
+                .into_iter()
+                .map(|(name, addr)| (name.node_id(), addr))
                 .collect(),
         }
     }
@@ -333,7 +313,6 @@ pub mod tests {
             gossip_interval_ms: 1000, // Longer for testing
             gossip_fanout: 3,
             topology: HashMap::new(), // Empty topology for simple tests
-            hash_replication_factor: 1,
         }
     }
 
@@ -422,26 +401,25 @@ pub mod tests {
 
     #[test]
     fn test_cluster_topology_bucket_assignment() {
+        // Buckets are assigned by positional index in sorted_nodes().
+        // Each node's bucket is unique and covers exactly [0, N).
         let mut nodes = IndexMap::new();
+        // Insert in non-alphabetical order to verify sorting
+        nodes.insert(NodeName::from("node-c"), "127.0.0.1:8003".parse().unwrap());
         nodes.insert(NodeName::from("node-a"), "127.0.0.1:8001".parse().unwrap());
         nodes.insert(NodeName::from("node-b"), "127.0.0.1:8002".parse().unwrap());
-        nodes.insert(NodeName::from("node-c"), "127.0.0.1:8003".parse().unwrap());
 
         let topology = ClusterTopology::new(NodeName::from("node-a"), nodes);
+        let sorted = topology.sorted_nodes();
 
-        // Test bucket assignment for nodes
-        let bucket_a = topology.bucket_for_node(&NodeName::from("node-a"));
-        let bucket_b = topology.bucket_for_node(&NodeName::from("node-b"));
-        let bucket_c = topology.bucket_for_node(&NodeName::from("node-c"));
+        // sorted order is: node-a (0), node-b (1), node-c (2)
+        assert_eq!(sorted[0].0, NodeName::from("node-a"));
+        assert_eq!(sorted[1].0, NodeName::from("node-b"));
+        assert_eq!(sorted[2].0, NodeName::from("node-c"));
 
-        assert!(bucket_a.is_some());
-        assert!(bucket_b.is_some());
-        assert!(bucket_c.is_some());
-
-        // Buckets should be in valid range [0, 2]
-        assert!(bucket_a.unwrap() < 3);
-        assert!(bucket_b.unwrap() < 3);
-        assert!(bucket_c.unwrap() < 3);
+        // Positional buckets are unique and cover [0, 3)
+        let buckets: Vec<u32> = sorted.iter().enumerate().map(|(i, _)| i as u32).collect();
+        assert_eq!(buckets, vec![0, 1, 2]);
     }
 
     #[test]
@@ -508,7 +486,6 @@ pub mod tests {
             gossip_interval_ms: 100,
             gossip_fanout: 3,
             topology,
-            hash_replication_factor: 1,
         };
 
         let cluster_topology = settings.cluster_topology();

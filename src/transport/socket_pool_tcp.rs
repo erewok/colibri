@@ -58,7 +58,7 @@ impl TcpSocketPool {
             .get(&target)
             .ok_or_else(|| ColibriError::Transport(format!("Peer not found: {:?}", target)))?;
 
-        let mut connection = self.get_or_create_connection(target, *peer_addr).await?;
+        let mut connection = self.open_connection(target, *peer_addr).await?;
 
         // Write protocol type byte first
         match timeout(self.connection_timeout, async {
@@ -89,7 +89,7 @@ impl TcpSocketPool {
             }
         }
 
-        // Send request with length prefix
+        // Send request with length prefix, then flush to ensure bytes reach the receiver
         let request_len = request_data.len() as u32;
         let len_bytes = request_len.to_be_bytes();
 
@@ -97,6 +97,7 @@ impl TcpSocketPool {
             use tokio::io::AsyncWriteExt;
             connection.write_all(&len_bytes).await?;
             connection.write_all(request_data).await?;
+            connection.flush().await?;
             Result::<()>::Ok(())
         })
         .await
@@ -213,14 +214,12 @@ impl TcpSocketPool {
         }
     }
 
-    /// Get a connection from the pool or create a new one
-    async fn get_or_create_connection(
+    /// Open a new TCP connection to the given peer. A new connection is opened per request.
+    async fn open_connection(
         &self,
         node_id: NodeId,
         socket_addr: SocketAddr,
     ) -> Result<TcpStream> {
-        // For now, create a new connection each time (simplified implementation)
-        // In a full implementation, you'd maintain a connection pool
         match timeout(self.connection_timeout, TcpStream::connect(socket_addr)).await {
             Ok(Ok(stream)) => {
                 debug!(
@@ -263,7 +262,7 @@ impl TcpSocketPool {
 
     /// Remove a peer from the socket pool
     pub async fn remove_peer(&mut self, node_id: NodeId) -> Result<()> {
-        self.peer_connections.swap_remove(&node_id);
+        self.peer_connections.shift_remove(&node_id);
         self.stats
             .peer_count
             .store(self.peer_connections.len(), Ordering::Relaxed);

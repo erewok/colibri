@@ -13,15 +13,6 @@ use crate::node::messages::{
 use crate::node::{Node, NodeName};
 use crate::settings;
 
-/// Replication factor for data distribution
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReplicationFactor {
-    Zero = 1,
-    #[default]
-    Two = 2,
-    Three = 3,
-}
-
 /// Consistent hash ring distributed rate limiter node
 #[derive(Clone)]
 pub struct HashringNode {

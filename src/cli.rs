@@ -128,7 +128,6 @@ pub struct Cli {
         help = "Number of peers to gossip to per round (default 1"
     )]
     pub gossip_fanout: usize,
-
 }
 
 impl Cli {

@@ -14,6 +14,13 @@ use crate::settings;
 /// Distributed request counter using CRDT PN-counters
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DistributedRequestCounter {
+    /// Origin metadata: the node that first created this counter.
+    ///
+    /// IMPORTANT: this field is **not** consulted when performing local writes.
+    /// The owning `DistributedBucket` holds `writer_node_id` separately, and all
+    /// mutation methods below take the writer identity as an explicit parameter.
+    /// Mixing these up would violate the GCounter single-writer-per-actor invariant
+    /// under concurrent cross-node updates.
     pub node_id: NodeId,
     refills: PNCounter<NodeId>,
     requests: PNCounter<NodeId>,
@@ -30,18 +37,22 @@ impl DistributedRequestCounter {
             vclock: VClock::new(),
         }
     }
-    fn expire_op_steps(&mut self, op: &InternalPnCounterOp) {
+
+    /// Apply expiration decrements as the given `writer`. The caller is responsible
+    /// for passing the local node's identity — never the counter's origin `node_id`,
+    /// which may belong to a remote node if this bucket was adopted via gossip.
+    fn expire_op_steps(&mut self, writer: NodeId, op: &InternalPnCounterOp) {
         match op {
             InternalPnCounterOp::Fills(steps) => {
-                let op = self.refills.dec_many(self.node_id, *steps);
+                let op = self.refills.dec_many(writer, *steps);
                 self.refills.apply(op);
             }
             InternalPnCounterOp::Requests(steps) => {
-                let op = self.requests.dec_many(self.node_id, *steps);
+                let op = self.requests.dec_many(writer, *steps);
                 self.requests.apply(op);
             }
         }
-        let op = self.vclock.inc(self.node_id);
+        let op = self.vclock.inc(writer);
         self.vclock.apply(op);
     }
 
@@ -164,9 +175,18 @@ pub struct DistributedBucketExternal {
 /// Used when receiving gossiped state from other nodes
 /// when we've never seen this client before.
 impl DistributedBucketExternal {
-    fn bucket(&self) -> DistributedBucket {
+    /// Adopt a gossiped bucket into local state.
+    ///
+    /// `local_node_id` must be the receiving limiter's node id. It becomes the
+    /// adopted bucket's `writer_node_id`, so any subsequent local mutations write
+    /// into this node's own PNCounter actor slot rather than the sender's.
+    /// The origin `node_id` is preserved from the gossip message so that
+    /// `DistributedBucketLimiter::expire_keys` continues to refuse to GC buckets
+    /// this node did not create.
+    fn bucket(&self, local_node_id: NodeId) -> DistributedBucket {
         DistributedBucket {
             node_id: self.node_id,
+            writer_node_id: local_node_id,
             counter: self.counter.clone(),
             requests: Vec::new(),
             last_call: Utc::now().timestamp_millis(),
@@ -177,7 +197,16 @@ impl DistributedBucketExternal {
 
 #[derive(Clone, Debug)]
 struct DistributedBucket {
+    /// Origin identity: the node that first created this bucket. Used by
+    /// `DistributedBucketLimiter::expire_keys` to refuse GC of buckets adopted
+    /// from peers (we cannot trust foreign timestamps for expiration decisions).
     pub node_id: NodeId,
+    /// Writer identity: the PNCounter actor slot this node writes into for this
+    /// bucket. Always the local limiter's node id, regardless of whether the
+    /// bucket was created locally or adopted from a gossip peer. Every call
+    /// into `DistributedRequestCounter` mutation methods must pass this value
+    /// as the writer — never `counter.node_id`, which may be a remote origin.
+    pub writer_node_id: NodeId,
     pub counter: DistributedRequestCounter,
     // internal state only: timestamps
     requests: Vec<InternalRequestEntry>,
@@ -211,12 +240,13 @@ impl DistributedBucket {
         let mut entries_to_remove = Vec::new();
         for (idx, entry) in self.requests.iter().enumerate() {
             if now_ms - (entry.timestamp_ms) > expiration_threshold_ms {
-                // Expire this entry
+                // Expire this entry. Decrements go to the local writer slot —
+                // never to `counter.node_id`, which may point at a remote origin.
                 debug!(
                     "Expiring entry {:?} from bucket for node {}: timestamp_ms={}, now_ms={}",
                     entry, self.node_id, entry.timestamp_ms, now_ms
                 );
-                self.counter.expire_op_steps(&entry.op);
+                self.counter.expire_op_steps(self.writer_node_id, &entry.op);
                 entries_to_remove.push(idx);
             }
         }
@@ -245,8 +275,12 @@ impl DistributedBucket {
 
 impl Bucket for DistributedBucket {
     fn new(max_calls: u32, node_id: NodeId) -> Self {
+        // Local creation: this node is both the origin (for GC) and the writer
+        // (for CRDT actor slot). The two become different only after adoption
+        // via `DistributedBucketExternal::bucket`.
         let mut instance = Self {
             node_id,
+            writer_node_id: node_id,
             counter: DistributedRequestCounter::new(node_id),
             requests: Vec::new(),
             last_call: Utc::now().timestamp_millis(),
@@ -291,7 +325,10 @@ impl Bucket for DistributedBucket {
             timestamp_ms: self.last_call,
             vclock: self.vclock(),
         });
-        self.counter.inc_refills(self.counter.node_id, steps);
+        // Writes must go to the local writer slot. Using `counter.node_id` here
+        // would attribute writes to a remote origin on adopted buckets, which
+        // GCounter::merge would then silently drop via its per-actor max.
+        self.counter.inc_refills(self.writer_node_id, steps);
         debug!("Updated bucket after adding tokens: {:?}", self.counter);
         self.last_call = Utc::now().timestamp_millis();
         self
@@ -303,7 +340,8 @@ impl Bucket for DistributedBucket {
             timestamp_ms: Utc::now().timestamp_millis(),
             vclock: self.vclock(),
         });
-        self.counter.inc_request(self.counter.node_id);
+        // See `add_tokens_to_bucket` — mutate the local writer slot, not the origin.
+        self.counter.inc_request(self.writer_node_id);
         self
     }
 
@@ -420,7 +458,7 @@ impl DistributedBucketLimiter {
     pub fn gossip_delta_state(&self) -> Vec<DistributedBucketExternal> {
         let guard = self.node_counters.pin();
 
-        // Phase 1: collect buckets that have changed since last gossip
+        // 1: collect buckets that have changed since last gossip
         let result: Vec<DistributedBucketExternal> = guard
             .iter()
             .filter_map(|(client_id, bucket)| {
@@ -432,7 +470,11 @@ impl DistributedBucketLimiter {
             })
             .collect();
 
-        // Phase 2: advance the gossip watermark for each included bucket
+        // 2: advance the gossip watermark for each included bucket.
+        // The || branch is the "insert if absent" path; in practice it should
+        // not fire here because we just iterated over the live entries. If it
+        // does, adopt the bucket with *this* limiter as the writer.
+        let local_node_id = self.node_id;
         for ext in &result {
             guard.update_or_insert_with(
                 ext.client_id.clone(),
@@ -441,7 +483,7 @@ impl DistributedBucketLimiter {
                     b.mark_gossiped();
                     b
                 },
-                || ext.bucket(),
+                || ext.bucket(local_node_id),
             );
         }
 
@@ -458,6 +500,7 @@ impl DistributedBucketLimiter {
     }
 
     pub fn accept_delta_state(&mut self, delta: &[DistributedBucketExternal]) {
+        let local_node_id = self.node_id;
         for incoming_bucket in delta.iter() {
             self.node_counters.pin().update_or_insert_with(
                 incoming_bucket.client_id.clone(),
@@ -468,7 +511,7 @@ impl DistributedBucketLimiter {
                         .merge(incoming_bucket.counter.clone());
                     existing_counter
                 },
-                || incoming_bucket.bucket(),
+                || incoming_bucket.bucket(local_node_id),
             );
         }
     }
@@ -816,9 +859,76 @@ mod tests {
         assert_eq!(external.client_id, "test_client");
         assert_eq!(external.node_id, node_id);
 
-        // Convert back to internal format
-        let restored_bucket = external.bucket();
+        // Convert back to internal format (as if adopted by the same node).
+        let restored_bucket = external.bucket(node_id);
         assert_eq!(restored_bucket.node_id, node_id);
+        assert_eq!(restored_bucket.writer_node_id, node_id);
         assert_eq!(restored_bucket.counter.tokens(), bucket.counter.tokens());
+    }
+
+    /// Regression test for safety issue: writer identity.
+    ///
+    /// When a bucket is adopted from a gossip peer, subsequent local mutations
+    /// must attribute their CRDT writes to the LOCAL node's actor slot, not the
+    /// sender's. Under concurrent writes at both nodes, the GCounter max-merge
+    /// would otherwise silently drop one side's updates.
+    #[test]
+    fn test_adopted_bucket_writes_do_not_clobber_origin_slot() {
+        let node_a = node_id();
+        let node_b = NodeName::from("b").node_id();
+
+        // Node A creates a bucket for a client and consumes one token.
+        // Use the bucket API directly (not the limiter) so wall-clock refills
+        // don't contaminate the exact-count assertion below.
+        let mut bucket_a = DistributedBucket::new(100, node_a);
+        bucket_a.decrement(); // A local: 1 request
+
+        // Simulate B adopting A's bucket via gossip. Before the safety bug fix this
+        // step would copy A's `counter.node_id` into B's bucket and silently
+        // route all of B's future writes into slot A of the PNCounter.
+        let external = bucket_a.to_external("test_client");
+        let mut bucket_b = external.bucket(node_b);
+
+        // Post-adoption invariants: origin preserved for GC, writer is local.
+        assert_eq!(bucket_b.node_id, node_a, "origin must be preserved");
+        assert_eq!(
+            bucket_b.writer_node_id, node_b,
+            "writer must be the local (adopting) node"
+        );
+
+        // Concurrent writes: both A and B process additional requests against
+        // their own replicas before any further gossip.
+        bucket_a.decrement(); // A local: 2 total
+        bucket_a.decrement(); // A local: 3 total
+        bucket_b.decrement(); // B local: 1 new request (on top of the adopted state)
+
+        // Gossip B's state back to A and merge.
+        let external_from_b = bucket_b.to_external("test_client");
+        bucket_a.counter.merge(external_from_b.counter);
+
+        // Total requests counted across the cluster:
+        //   1 (A's original, already in both replicas) + 2 (A's new) + 1 (B's new) = 4
+        // With seed refills = 100, net tokens after merge must be 100 - 4 = 96.
+        //
+        // With safety bug present, B's decrement landed in slot A. Node A's own slot A
+        // reached 3 requests locally, while B's slot A reached 2 (1 inherited + 1 new).
+        // merge = max(3, 2) = 3 → buggy net tokens = 97.
+        let tokens_after_merge = bucket_a.tokens_to_u32();
+        assert_eq!(
+            tokens_after_merge, 96,
+            "expected 96 tokens after 3 writes from A and 1 from B; \
+             got {}. An off-by-one here is the regression signature.",
+            tokens_after_merge
+        );
+
+        // Symmetric check: merging A's post-mutation state into B should yield
+        // the same total (idempotent, commutative).
+        let external_from_a = bucket_a.to_external("test_client");
+        bucket_b.counter.merge(external_from_a.counter);
+        assert_eq!(
+            bucket_b.tokens_to_u32(),
+            96,
+            "both replicas must converge to the same token count"
+        );
     }
 }

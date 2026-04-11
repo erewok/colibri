@@ -215,11 +215,7 @@ impl TcpSocketPool {
     }
 
     /// Open a new TCP connection to the given peer. A new connection is opened per request.
-    async fn open_connection(
-        &self,
-        node_id: NodeId,
-        socket_addr: SocketAddr,
-    ) -> Result<TcpStream> {
+    async fn open_connection(&self, node_id: NodeId, socket_addr: SocketAddr) -> Result<TcpStream> {
         match timeout(self.connection_timeout, TcpStream::connect(socket_addr)).await {
             Ok(Ok(stream)) => {
                 debug!(

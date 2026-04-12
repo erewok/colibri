@@ -29,7 +29,11 @@
 \*   ForeignSlotsMonotone pC/nC at node n are non-decreasing for actor slots a != n;
 \*                        only GossipMerge (element-wise max) touches them, so they
 \*                        can only grow -- this is the GCounter monotonicity property
-\*                        at the replica level
+\*                        at the replica level.
+\*                        Checked via history variables pC_prev/nC_prev that record
+\*                        the pre-step values; the invariant asserts that foreign
+\*                        slots in the current state are >= their value in the
+\*                        previous state.
 \*   ConvergenceQuiescent when gossip is quiescent (no GossipMerge would change any
 \*                        node's view), all nodes must already agree on every slot.
 \*                        This is the bounded-convergence safety check: it replaces
@@ -77,9 +81,11 @@ VARIABLES
     opLog,      \* opLog[n] : sequence of timestamped local entries for ageing
     tick,       \* global logical clock
     totalOps,   \* total ConsumeAt ops so far
-    totalRefills \* total RefillAt ops so far
+    totalRefills, \* total RefillAt ops so far
+    pC_prev,    \* history variable: pC values at the start of the previous step
+    nC_prev     \* history variable: nC values at the start of the previous step
 
-vars == <<pC, nC, opLog, tick, totalOps, totalRefills>>
+vars == <<pC, nC, opLog, tick, totalOps, totalRefills, pC_prev, nC_prev>>
 
 \* ---------------------------------------------------------------------------
 \* Helpers
@@ -135,6 +141,8 @@ TypeOK ==
     /\ tick        \in Nat
     /\ totalOps    \in Nat
     /\ totalRefills \in Nat
+    /\ pC_prev     \in [Nodes -> [Nodes -> Nat]]
+    /\ nC_prev     \in [Nodes -> [Nodes -> Nat]]
 
 \* ---------------------------------------------------------------------------
 \* Init
@@ -146,6 +154,10 @@ Init ==
     /\ tick        = 0
     /\ totalOps    = 0
     /\ totalRefills = 0
+    \* History variables: initialised equal to pC/nC so the invariant holds trivially
+    \* in the initial state (current value >= previous value, and they are equal).
+    /\ pC_prev     = [n \in Nodes |-> [a \in Nodes |-> IF a = n THEN MaxTokens ELSE 0]]
+    /\ nC_prev     = [n \in Nodes |-> [a \in Nodes |-> 0]]
 
 \* ---------------------------------------------------------------------------
 \* ConsumeAt(n): accept a client request at node n.
@@ -157,6 +169,8 @@ ConsumeAt(n) ==
     /\ nC'          = [nC EXCEPT ![n][n] = @ + 1]
     /\ opLog'       = [opLog EXCEPT ![n] = Append(@, [kind |-> "N", amt |-> 1, t |-> tick])]
     /\ totalOps'    = totalOps + 1
+    /\ pC_prev'     = pC
+    /\ nC_prev'     = nC
     /\ UNCHANGED <<pC, tick, totalRefills>>
 
 \* ---------------------------------------------------------------------------
@@ -168,6 +182,8 @@ RefillAt(n) ==
     /\ pC'          = [pC EXCEPT ![n][n] = @ + RefillPerTick]
     /\ opLog'       = [opLog EXCEPT ![n] = Append(@, [kind |-> "P", amt |-> RefillPerTick, t |-> tick])]
     /\ totalRefills' = totalRefills + 1
+    /\ pC_prev'     = pC
+    /\ nC_prev'     = nC
     /\ UNCHANGED <<nC, tick, totalOps>>
 
 \* ---------------------------------------------------------------------------
@@ -184,6 +200,8 @@ ExpireAt(n) ==
     /\ pC'    = [pC    EXCEPT ![n][n] = IF @ >= expP THEN @ - expP ELSE 0]
     /\ nC'    = [nC    EXCEPT ![n][n] = IF @ >= expN THEN @ - expN ELSE 0]
     /\ opLog' = [opLog EXCEPT ![n] = FilterActive(log)]
+    /\ pC_prev' = pC
+    /\ nC_prev' = nC
     /\ UNCHANGED <<tick, totalOps, totalRefills>>
 
 \* ---------------------------------------------------------------------------
@@ -196,6 +214,8 @@ GossipMerge(m, n) ==
     /\ m # n
     /\ pC' = [pC EXCEPT ![n] = EWMax(@, pC[m])]
     /\ nC' = [nC EXCEPT ![n] = EWMax(@, nC[m])]
+    /\ pC_prev' = pC
+    /\ nC_prev' = nC
     /\ UNCHANGED <<opLog, tick, totalOps, totalRefills>>
 
 \* ---------------------------------------------------------------------------
@@ -204,6 +224,8 @@ GossipMerge(m, n) ==
 Tick ==
     /\ tick < MaxTicks
     /\ tick' = tick + 1
+    /\ pC_prev' = pC
+    /\ nC_prev' = nC
     /\ UNCHANGED <<pC, nC, opLog, totalOps, totalRefills>>
 
 \* ---------------------------------------------------------------------------
@@ -220,6 +242,11 @@ Next ==
 \* Checking safety invariants (TypeOK, TokensNonNegative, ForeignSlotsMonotone,
 \* ConvergenceQuiescent) does not require fairness; all reachable states are
 \* explored without the obligation-set multiplication that causes OOM under WF.
+\*
+\* pC_prev and nC_prev are history variables whose sole purpose is to give
+\* ForeignSlotsMonotone something concrete to compare against.  They increase
+\* the state space modestly (each carries one extra [Nodes->[Nodes->Nat]] value)
+\* but do not alter the set of reachable pC/nC/opLog/tick states.
 Spec == Init /\ [][Next]_vars
 
 \* ---------------------------------------------------------------------------
@@ -237,24 +264,24 @@ TokensNonNegative ==
 
 \* ForeignSlotsMonotone (the core CRDT replica-level monotonicity property):
 \*   For every node n and every actor a != n:
-\*     pC[n][a] and nC[n][a] are non-decreasing across the entire execution.
+\*     pC[n][a] and nC[n][a] are non-decreasing across every step of the execution.
 \*
 \*   This holds because:
 \*   1. Only GossipMerge changes foreign slots at n (actions ConsumeAt, RefillAt,
 \*      ExpireAt touch only slot n).
 \*   2. GossipMerge applies EWMax, which is monotonically non-decreasing.
 \*
-\*   The checkable state invariant we assert:
-\*   For all n and a != n, pC[n][a] <= pC[a][a] is NOT necessarily maintained
-\*   (a can expire its own slot back, while replicas hold the historical max).
-\*   The true monotonicity guarantee is at the replica level.  We capture the
-\*   structurally-sound consequence: foreign slots are always in Nat (>= 0), and
-\*   the net token count is always non-negative.
+\*   Implementation: history variables pC_prev and nC_prev record the values of
+\*   pC and nC at the start of the previous step (set in every action via
+\*   pC_prev' = pC / nC_prev' = nC).  The invariant then asserts that, for every
+\*   foreign slot, the current value is at least as large as it was one step ago.
+\*   Because TLC checks this on every reachable state, it validates the property
+\*   across all transitions, not just a single step.
 ForeignSlotsMonotone ==
     \A n \in Nodes : \A a \in Nodes :
         a # n =>
-            /\ pC[n][a] \in Nat   \* non-negative by type; shown here explicitly
-            /\ nC[n][a] \in Nat   \* same
+            /\ pC[n][a] >= pC_prev[n][a]
+            /\ nC[n][a] >= nC_prev[n][a]
 
 \* ---------------------------------------------------------------------------
 \* Bounded-convergence safety invariant

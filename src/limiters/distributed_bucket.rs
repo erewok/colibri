@@ -1516,6 +1516,145 @@ mod tests {
             }
         }
 
+        // When some gossip deltas are dropped (packet loss), anti-entropy —
+        // simulated here as a full-state-dump round — must bring all nodes to
+        // the same state regardless of which deltas were lost.
+        //
+        // delivery_matrix[i * N + j] is true when node i's delta reaches
+        // node j in the lossy round; false means the packet was dropped.
+        // A subsequent full-state-dump round (what the Heartbeat →
+        // StateRequest → StateResponse loop does) must repair every gap.
+        proptest! {
+            #[test]
+            fn prop_anti_entropy_recovers_after_packet_loss(
+                ops in proptest::collection::vec(
+                    (0usize..NUM_NODES, 0usize..CLIENTS.len()),
+                    1..20usize,
+                ),
+                delivery_matrix in proptest::collection::vec(
+                    proptest::bool::ANY,
+                    NUM_NODES * NUM_NODES,
+                ),
+            ) {
+                let settings = long_interval_settings();
+                let ids = prop_node_ids();
+
+                let mut limiters: Vec<DistributedBucketLimiter> = ids
+                    .iter()
+                    .map(|&id| DistributedBucketLimiter::new(id, settings.clone()))
+                    .collect();
+
+                for &(node_idx, client_idx) in &ops {
+                    limiters[node_idx].limit_calls_for_client(CLIENTS[client_idx].to_string());
+                }
+
+                // Lossy first round: collect all deltas before any delivery so
+                // that drop decisions are independent of merge order.
+                let deltas: Vec<Vec<DistributedBucketExternal>> = limiters
+                    .iter()
+                    .map(|l| l.gossip_delta_state())
+                    .collect();
+                for i in 0..NUM_NODES {
+                    if !deltas[i].is_empty() {
+                        for j in 0..NUM_NODES {
+                            if i != j && delivery_matrix[i * NUM_NODES + j] {
+                                limiters[j].accept_delta_state(&deltas[i]);
+                            }
+                        }
+                    }
+                }
+
+                // Anti-entropy recovery round: full state dump from every node.
+                let full_states: Vec<Vec<DistributedBucketExternal>> = limiters
+                    .iter()
+                    .map(|l| l.full_state_dump())
+                    .collect();
+                for i in 0..NUM_NODES {
+                    if !full_states[i].is_empty() {
+                        for j in 0..NUM_NODES {
+                            if i != j {
+                                limiters[j].accept_delta_state(&full_states[i]);
+                            }
+                        }
+                    }
+                }
+
+                // After anti-entropy all nodes must agree.
+                for &(_, ci) in &ops {
+                    let client_str = CLIENTS[ci].to_string();
+                    let counts: Vec<u32> = limiters
+                        .iter()
+                        .map(|l| l.check_calls_remaining_for_client(&client_str))
+                        .collect();
+                    let first = counts[0];
+                    for &c in &counts[1..] {
+                        prop_assert_eq!(
+                            c, first,
+                            "anti-entropy failed to recover '{}': node counts = {:?}",
+                            CLIENTS[ci], counts
+                        );
+                    }
+                }
+            }
+        }
+
+        // After a bidirectional gossip exchange (A→B and B→A in one round),
+        // both nodes must agree on all token counts AND neither node should
+        // produce further deltas. A spurious re-broadcast here is the S5/S6
+        // watermark loop; this test is the Tx3 regression guard.
+        proptest! {
+            #[test]
+            fn prop_bidirectional_gossip_converges_without_rebroadcast(
+                ops_a in proptest::collection::vec(0usize..CLIENTS.len(), 1..15usize),
+                ops_b in proptest::collection::vec(0usize..CLIENTS.len(), 1..15usize),
+            ) {
+                let settings = long_interval_settings();
+                let ids = prop_node_ids();
+
+                let mut limiter_a = DistributedBucketLimiter::new(ids[0], settings.clone());
+                let mut limiter_b = DistributedBucketLimiter::new(ids[1], settings.clone());
+
+                for &ci in &ops_a {
+                    limiter_a.limit_calls_for_client(CLIENTS[ci].to_string());
+                }
+                for &ci in &ops_b {
+                    limiter_b.limit_calls_for_client(CLIENTS[ci].to_string());
+                }
+
+                // Collect both deltas before applying either — simultaneous exchange.
+                let delta_a = limiter_a.gossip_delta_state();
+                let delta_b = limiter_b.gossip_delta_state();
+
+                limiter_a.accept_delta_state(&delta_b);
+                limiter_b.accept_delta_state(&delta_a);
+
+                // Convergence: both sides must agree on every client's count.
+                for client in CLIENTS {
+                    let client_str = client.to_string();
+                    let a_count = limiter_a.check_calls_remaining_for_client(&client_str);
+                    let b_count = limiter_b.check_calls_remaining_for_client(&client_str);
+                    prop_assert_eq!(
+                        a_count, b_count,
+                        "bidirectional convergence violated for '{}': a={}, b={}",
+                        client, a_count, b_count
+                    );
+                }
+
+                // No re-broadcast loop: accept_delta_state must advance
+                // last_gossiped_vclock so gossip_delta_state finds nothing new.
+                let rebroadcast_a = limiter_a.gossip_delta_state();
+                let rebroadcast_b = limiter_b.gossip_delta_state();
+                prop_assert!(
+                    rebroadcast_a.is_empty(),
+                    "node A has unexpected re-broadcast delta: {:?}", rebroadcast_a
+                );
+                prop_assert!(
+                    rebroadcast_b.is_empty(),
+                    "node B has unexpected re-broadcast delta: {:?}", rebroadcast_b
+                );
+            }
+        }
+
         // Merging deltas from two independent nodes must be commutative: the
         // token count after (A then B) must equal the count after (B then A).
         proptest! {

@@ -3,3 +3,5 @@ cluster_exports/
 .planning/
 work-in-progress/
 .bmo/
+tla/*out
+tla/states/

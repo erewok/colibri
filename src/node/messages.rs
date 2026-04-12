@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{rules, DistributedBucketExternal};
+use crate::limiters::{DistributedBucketExternal, rules};
 use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{RateLimitSettings, RunMode};
 

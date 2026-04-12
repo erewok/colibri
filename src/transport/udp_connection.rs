@@ -4,8 +4,8 @@
 //! Provides load balancing and fault tolerance through socket rotation.
 use rand::RngExt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
 use tokio::net::UdpSocket;

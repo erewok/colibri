@@ -3,8 +3,8 @@
 //! Manages TCP connections for request-response patterns required by hashring nodes.
 use rand::RngExt;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use indexmap::IndexMap;

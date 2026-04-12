@@ -15,7 +15,7 @@ use super::stats::FrozenSocketPoolStats;
 use super::tcp_receiver::ProtocolType;
 use super::traits::{RequestSender, Sender};
 use crate::error::{ColibriError, Result};
-use crate::node::{messages::Message, NodeId};
+use crate::node::{NodeId, messages::Message};
 use crate::settings::TransportConfig;
 
 #[derive(Clone, Debug)]
@@ -317,8 +317,8 @@ impl RequestSender for TcpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::messages::{CheckCallsRequest, CheckCallsResponse};
     use crate::node::NodeName;
+    use crate::node::messages::{CheckCallsRequest, CheckCallsResponse};
     use crate::settings::TransportConfig;
     use indexmap::IndexMap;
 

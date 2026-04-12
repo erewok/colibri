@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use figment::{
-    providers::{Format, Serialized, Toml},
     Figment,
+    providers::{Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
 

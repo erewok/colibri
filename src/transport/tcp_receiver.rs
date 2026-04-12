@@ -3,8 +3,8 @@
 //! Handles incoming TCP messages with protocol-aware routing.
 //! Supports both fire-and-forget (gossip) and request-response patterns.
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -152,9 +152,7 @@ impl TcpReceiver {
 
                     trace!(
                         "Received {} byte {:?} message from {}",
-                        msg_len,
-                        protocol_type,
-                        peer_addr
+                        msg_len, protocol_type, peer_addr
                     );
 
                     // Create response channel only for request-response protocol
@@ -236,7 +234,7 @@ mod tests {
 
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
-    use tokio::time::{sleep, timeout, Duration};
+    use tokio::time::{Duration, sleep, timeout};
 
     use super::*;
 

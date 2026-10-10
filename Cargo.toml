@@ -3,7 +3,6 @@ name = "colibri"
 version = "0.7.0"
 description = "Distributed rate-limiting as a service"
 authors = ["Erik Aker <eraker@gmail.com>"]
-homepage = "https://github.com/erewok/colibri"
 repository = "https://github.com/erewok/colibri"
 edition = "2024"
 rust-version = "1.86"
@@ -38,7 +37,6 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 crdts = "7.3.2"
 figment = { version = "0.10.19", features = ["toml"] }
 gxhash = "3.5.0"
-hostname = "0.4.2"
 indexmap = { version = "2.14.2", features = ["serde"] }
 num-bigint = "0.4.8"
 num-traits = "0.2.19"
@@ -74,7 +72,6 @@ tower-service = "0.3.3"
 thiserror = "2.0.21"
 url = "2.5.8"
 tracing = "0.1.44"
-tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [dev-dependencies]

@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
@@ -31,7 +31,7 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-nextest,cargo-udeps
+          tool: just,cargo-nextest
 
       - name: Code quality checks
         run: |

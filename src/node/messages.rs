@@ -282,6 +282,26 @@ impl Message {
 }
 
 // ============================================================================
+// ADDITIONAL TYPES
+// ============================================================================
+
+/// Bucket export data structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketExport {
+    pub client_data: Vec<u8>,
+    pub metadata: ExportMetadata,
+}
+
+/// Metadata for bucket exports
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportMetadata {
+    pub node_name: String,
+    pub export_timestamp: u64,
+    pub node_type: RunMode,
+    pub bucket_count: usize,
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
@@ -459,24 +479,4 @@ mod message_tests {
             "unexpected error: {err}"
         );
     }
-}
-
-// ============================================================================
-// ADDITIONAL TYPES
-// ============================================================================
-
-/// Bucket export data structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BucketExport {
-    pub client_data: Vec<u8>,
-    pub metadata: ExportMetadata,
-}
-
-/// Metadata for bucket exports
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportMetadata {
-    pub node_name: String,
-    pub export_timestamp: u64,
-    pub node_type: RunMode,
-    pub bucket_count: usize,
 }

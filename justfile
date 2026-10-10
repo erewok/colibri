@@ -6,7 +6,6 @@ _default:
 # Install cargo plugins used by this project
 bootstrap:
     cargo install cargo-nextest
-    cargo install cargo-udeps
 
 # Install cargo plugins for building docs
 bootstrap-docs:

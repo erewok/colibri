@@ -6,6 +6,8 @@ HTTP service for distributed rate limiting with in-memory state.
 
 **Note**: Rate limit counts reset when nodes restart.
 
+**Another Note**: I have generally asked Claude to implement the TLA+ specs **and** the hegel property-based tests. I wrote myself the primary code for this codebase and it was all an idea I had (which did not come from talking to an LLM...). Make of that what you will ¯\_(ツ)_/¯.
+
 ## Why I Made This
 
 Most of the rate-limiting implementations I have worked on in the past have used Redis with a token-bucket or leaky-bucket implementation either in Lua or application code. Redis is completely fine, but something always bothered me about this setup: why couldn't I have a pure in-memory rate-limiting appliance?
@@ -20,7 +22,7 @@ One primary design goal for this project is as mentioned above: **Colibri remain
 
 This project's status is considered **experimental**. I do not run it in production yet. It has the following major issues to solve:
 
-- Gossip size limits: each gossip update must fit in a single UDP datagram, which caps gossip mode at roughly 350-750 active clients per rule (see [deploy.md](deploy.md)).
+- Gossip anti-entropy resends every active client when a node falls behind, in one burst of datagrams (see [deploy.md](deploy.md)).
 - Crash-and-reload is not implemented
 - No upgrade paths (we have planned an admin command).
 - No authentication or TLS, no metrics, no graceful shutdown

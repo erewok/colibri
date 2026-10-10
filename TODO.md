@@ -10,7 +10,8 @@
 - [ ] Add docs
 - [ ] Fix config-file loading: `colibri.toml` values are overridden by CLI defaults (merged after the file), and `--name` is required before the file is read.
 - [x] Gossip: restarting a node under the same name over-admits; calls admitted before the first sync are credited back twice when they expire.
-- [ ] Gossip: split delta and anti-entropy state across UDP datagrams; one datagram holds all of it today (~90-190 bytes per client with 3 nodes, so ~350-750 clients max).
+- [x] Gossip: split delta and anti-entropy state across UDP datagrams (`--gossip-max-packet-bytes`, default 1400).
+- [ ] Gossip: partition anti-entropy (per-partition digests in heartbeats; pull only the partitions that differ) so a behind node doesn't pull every client in one burst.
 - [x] Gossip: free idle client state (`GossipNode::expire_keys` is a no-op), without breaking the single-writer CRDT discipline.
 - [x] Gossip: expire requests from a node that is removed for good (peers retire a slot that has sat unchanged for a window).
 - [x] Hashring: free idle client buckets (`HashringNode::expire_keys` is a no-op).
@@ -28,7 +29,8 @@
 - [x] Hashring: ownership follows topology changes; cluster messages carry a protocol version.
 - [x] Gossip: a dead process's requests are retired everywhere; gossiped buckets carry each slot's quiet age, so re-adopting a bucket doesn't restart the countdown.
 - [x] Gossip: incarnations are ordered by start time (seconds since 2020, plus 18 random bits).
-- [ ] Gossip: compact retired slots of a node's older incarnations; a client that never goes idle keeps a slot for every process that served it.
+- [x] Gossip: compact retired slots of a node's older incarnations, so a busy client's state doesn't grow with restarts.
+- [ ] Gossip: compact the slots of a node removed for good (no newer incarnation ever appears); today they stay until the client goes idle.
 - [ ] Gossip: the heartbeat digest sums per-actor counts across buckets, so different states can produce equal sums; hash each bucket's vclock instead.
 - [ ] Gossip: a create on a node that never saw an earlier delete can lose to that delete (last-write-wins), so the rule silently disappears.
 - [ ] Gossip: deleted-rule tombstones are never garbage-collected, and `RuleConfigSync` is a single datagram.

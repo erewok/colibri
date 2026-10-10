@@ -128,6 +128,14 @@ pub struct Cli {
         help = "Number of peers to gossip to per round (default 1"
     )]
     pub gossip_fanout: usize,
+
+    #[clap(
+        long,
+        default_value = "1400",
+        env("COLIBRI_GOSSIP_MAX_PACKET_BYTES"),
+        help = "Largest gossip datagram to send, in bytes; state is split to fit (default 1400)"
+    )]
+    pub gossip_max_packet_bytes: usize,
 }
 
 impl Cli {
@@ -160,6 +168,7 @@ impl Cli {
             topology: self.topology.into_iter().collect(),
             gossip_interval_ms: self.gossip_interval_ms,
             gossip_fanout: self.gossip_fanout,
+            gossip_max_packet_bytes: self.gossip_max_packet_bytes,
         }
     }
 

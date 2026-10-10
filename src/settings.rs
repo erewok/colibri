@@ -247,6 +247,7 @@ pub struct Settings {
     // Gossip Configuration
     pub gossip_interval_ms: u64, // Regular gossip interval (default: 25)
     pub gossip_fanout: usize,    // Number of peers per gossip round (default: 4)
+    pub gossip_max_packet_bytes: usize, // Largest gossip datagram to send (default: 1400)
 }
 
 impl Settings {
@@ -312,6 +313,7 @@ pub mod tests {
             run_mode: RunMode::Gossip,
             gossip_interval_ms: 1000, // Longer for testing
             gossip_fanout: 3,
+            gossip_max_packet_bytes: 1400,
             topology: HashMap::new(), // Empty topology for simple tests
         }
     }
@@ -485,6 +487,7 @@ pub mod tests {
             run_mode: RunMode::Hashring,
             gossip_interval_ms: 100,
             gossip_fanout: 3,
+            gossip_max_packet_bytes: 1400,
             topology,
         };
 

@@ -9,7 +9,9 @@ use crdts::VClock;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter};
+use crate::limiters::distributed_bucket::{
+    DistributedBucketExternal, DistributedBucketLimiter, Incarnations,
+};
 use crate::limiters::rule_config::{RuleConfig, RuleVersion};
 use crate::limiters::rules::{RuleName, SerializableRule};
 use crate::node::{ActorId, NodeId};
@@ -37,6 +39,8 @@ pub struct RulesReply {
 /// What a heartbeat tells peers about the sender's state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeartbeatDigest {
+    /// The sender, so peers learn of its incarnation.
+    pub actor: ActorId,
     /// Per-node write counts summed over every bucket of every rule.
     pub buckets: VClock<ActorId>,
     /// `RuleConfig::digest` of the sender's rule configuration.
@@ -70,6 +74,7 @@ pub struct GossipState {
     limiters: BTreeMap<RuleName, DistributedBucketLimiter>,
     /// The version of each named rule's limiter.
     versions: BTreeMap<RuleName, RuleVersion>,
+    incarnations: Incarnations,
 }
 
 impl GossipState {
@@ -80,16 +85,22 @@ impl GossipState {
 
     /// Like `new`, with a given incarnation; for deterministic tests.
     pub fn with_actor(actor: ActorId, default_settings: RateLimitSettings) -> Self {
+        let incarnations = Incarnations::default();
         let mut limiters = BTreeMap::new();
         limiters.insert(
             RuleName::default(),
-            DistributedBucketLimiter::new(actor, default_settings.clone()),
+            DistributedBucketLimiter::with_incarnations(
+                actor,
+                default_settings.clone(),
+                incarnations.clone(),
+            ),
         );
         Self {
             actor,
             rules: RuleConfig::default(),
             limiters,
             versions: BTreeMap::new(),
+            incarnations,
         }
     }
 
@@ -208,7 +219,11 @@ impl GossipState {
             if self.versions.get(&name) != Some(&version) {
                 self.limiters.insert(
                     name.clone(),
-                    DistributedBucketLimiter::new(self.actor, settings),
+                    DistributedBucketLimiter::with_incarnations(
+                        self.actor,
+                        settings,
+                        self.incarnations.clone(),
+                    ),
                 );
                 self.versions.insert(name, version);
                 started = true;
@@ -273,17 +288,29 @@ impl GossipState {
             }
         }
         HeartbeatDigest {
+            actor: self.actor,
             buckets,
             rules: self.rules.digest(),
         }
     }
 
     /// Decide what to do about a peer's heartbeat.
-    pub fn on_heartbeat(&self, peer: &HeartbeatDigest) -> HeartbeatReply {
+    /// Dead processes' slots are ignored: we may have compacted them away.
+    pub fn on_heartbeat(&mut self, peer: &HeartbeatDigest) -> HeartbeatReply {
+        self.incarnations.note(peer.actor);
         let ours = self.digest();
-        let pull_state = !peer.buckets.is_empty()
+        let live = |clock: &VClock<ActorId>| VClock {
+            dots: clock
+                .dots
+                .iter()
+                .filter(|(a, _)| !self.incarnations.is_dead(**a))
+                .map(|(a, n)| (*a, *n))
+                .collect(),
+        };
+        let peer_buckets = live(&peer.buckets);
+        let pull_state = !peer_buckets.is_empty()
             && matches!(
-                ours.buckets.partial_cmp(&peer.buckets),
+                live(&ours.buckets).partial_cmp(&peer_buckets),
                 Some(Ordering::Less) | None
             );
         HeartbeatReply {

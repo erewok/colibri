@@ -21,6 +21,7 @@
 \*   ConsumeAt(n)     admit a request (rebasing an unused own slot first)
 \*   ExpireAt(n)      age out n's own requests: exps := reqs - still tracked
 \*   RetireAt(n, a)   expire another actor's slot unchanged for a window
+\*   CompactAt(n, a)  forget an idle slot of a dead incarnation
 \*   GossipMerge(m,n) merge m's state (with its change ticks) into n, or adopt it
 \*   DropAt(n)        forget an idle bucket
 \*   RestartAt(n)     lose all state and start a new incarnation
@@ -65,10 +66,11 @@ VARIABLES
     restarts,
     hw,          \* ghost: hw[a] = highest value actor a ever wrote
     admits,      \* ghost: admits[a] = {<<value, tick>>} for each of a's requests
-    lastWrite    \* ghost: lastWrite[a] = tick of actor a's last write
+    lastWrite,   \* ghost: lastWrite[a] = tick of actor a's last write
+    seen         \* ghost: seen[n][a] = highest reqs[n][a] since n's process started
 
 vars == <<reqs, exps, changed, opLog, present, inc, dropHigh, tick, totalOps,
-          restarts, hw, admits, lastWrite>>
+          restarts, hw, admits, lastWrite, seen>>
 
 \* ---------------------------------------------------------------------------
 \* Helpers
@@ -121,6 +123,7 @@ Init ==
     /\ hw       = [a \in Actors |-> 0]
     /\ admits   = [a \in Actors |-> {}]
     /\ lastWrite = [a \in Actors |-> 0]
+    /\ seen      = [n \in Nodes |-> ZeroRow]
 
 \* ---------------------------------------------------------------------------
 \* ConsumeAt(n): admit a request. With nothing live of its own, n first moves
@@ -171,6 +174,20 @@ RetireAt(n, a) ==
     /\ changed[n][a] + AgeingWindow < tick
     /\ exps' = [exps EXCEPT ![n][a] = reqs[n][a]]
     /\ UNCHANGED <<reqs, changed, opLog, present, inc, dropHigh, tick, totalOps,
+                   restarts, hw, admits, lastWrite>>
+
+\* ---------------------------------------------------------------------------
+\* CompactAt(n, a): forget the idle slot of an incarnation older than its
+\* node's current one. A merge may bring it back.
+\* ---------------------------------------------------------------------------
+CompactAt(n, a) ==
+    /\ present[n]
+    /\ a[2] < inc[a[1]]
+    /\ reqs[n][a] > 0
+    /\ reqs[n][a] = exps[n][a]
+    /\ reqs' = [reqs EXCEPT ![n][a] = 0]
+    /\ exps' = [exps EXCEPT ![n][a] = 0]
+    /\ UNCHANGED <<changed, opLog, present, inc, dropHigh, tick, totalOps,
                    restarts, hw, admits, lastWrite>>
 
 \* ---------------------------------------------------------------------------
@@ -235,11 +252,15 @@ Tick ==
     /\ UNCHANGED <<reqs, exps, changed, opLog, present, inc, dropHigh, totalOps,
                    restarts, hw, admits, lastWrite>>
 
-Next ==
+Actions ==
     \/ \E n \in Nodes : ConsumeAt(n) \/ ExpireAt(n) \/ DropAt(n) \/ RestartAt(n)
-    \/ \E n \in Nodes, a \in Actors : RetireAt(n, a)
+    \/ \E n \in Nodes, a \in Actors : RetireAt(n, a) \/ CompactAt(n, a)
     \/ \E m, n \in Nodes : GossipMerge(m, n)
     \/ Tick
+
+Next ==
+    /\ Actions
+    /\ seen' = [n \in Nodes |-> IF inc'[n] # inc[n] THEN ZeroRow ELSE EWMax(seen[n], reqs'[n])]
 
 \* Safety only: no fairness, so TLC explores every reachable state.
 Spec == Init /\ [][Next]_vars
@@ -262,6 +283,12 @@ TypeOK ==
 NoPrematureRelease ==
     \A n \in Nodes, a \in Actors :
         \A va \in admits[a] : va[1] <= exps[n][a] => IsExpired(va[2])
+
+\* No forgetting: a node counts every request it has seen until it ages out.
+SeenRequestsCounted ==
+    \A n \in Nodes, a \in Actors :
+        \A va \in admits[a] :
+            (va[1] <= seen[n][a] /\ ~IsExpired(va[2])) => va[1] <= reqs[n][a]
 
 \* No node has seen more of an actor's slot than the actor ever wrote.
 WriterHighWater ==

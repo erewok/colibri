@@ -2,8 +2,8 @@
 
 use colibri::clock::virtual_clock;
 use colibri::limiters::RuleName;
-use colibri::node::NodeName;
 use colibri::node::gossip::state::{GossipState, RuleBuckets, TickOutput};
+use colibri::node::{ActorId, NodeName};
 use colibri::settings::RateLimitSettings;
 
 fn settings(max_calls: u32, interval_seconds: u32) -> RateLimitSettings {
@@ -226,14 +226,145 @@ fn a_dead_process_is_retired_everywhere_despite_skewed_arrival() {
     assert_eq!((p.bucket_count(), r.bucket_count()), (0, 0));
 }
 
-/// Incarnations started later compare greater, so a node can tell its own
+/// Incarnations started a second or more later compare greater, so a node can tell its own
 /// older processes apart.
 #[test]
 fn later_incarnations_are_ordered_after_earlier_ones() {
     let clock = virtual_clock::install();
     let node = NodeName::from("n").node_id();
-    let first = colibri::node::ActorId::fresh(node);
-    clock.advance(1);
-    let second = colibri::node::ActorId::fresh(node);
+    let first = ActorId::fresh(node);
+    clock.advance(1_000);
+    let second = ActorId::fresh(node);
     assert!(second > first);
+}
+
+/// A client that never goes idle sheds the slot of a node's dead process once
+/// it is retired, so its gossiped state doesn't grow with every restart.
+#[test]
+fn a_hot_client_sheds_a_restarted_process_slot() {
+    let clock = virtual_clock::install();
+    let rule = RuleName::default();
+    let node = NodeName::from("a").node_id();
+    let old = ActorId {
+        node,
+        incarnation: 1,
+    };
+    let mut a = GossipState::with_actor(old, settings(100, 1));
+    let mut b = GossipState::new(NodeName::from("b").node_id(), settings(100, 1));
+    a.limit(&rule, "c").unwrap().unwrap();
+    b.accept(&delta(&mut a));
+
+    // The process restarts; both nodes keep serving the client.
+    let mut a = GossipState::with_actor(
+        ActorId {
+            node,
+            incarnation: 2,
+        },
+        settings(100, 1),
+    );
+    for _ in 0..50 {
+        clock.advance(100);
+        a.limit(&rule, "c").unwrap().unwrap();
+        b.limit(&rule, "c").unwrap().unwrap();
+        let (from_a, from_b) = (a.tick(), b.tick());
+        let (full_a, full_b) = (a.full_state(), b.full_state());
+        exchange(from_b, &mut a, &full_b);
+        exchange(from_a, &mut b, &full_a);
+    }
+    for (name, state) in [("a", &a), ("b", &b)] {
+        let actors = state.limiter(&rule).unwrap().bucket_actors("c").unwrap();
+        assert!(
+            !actors.contains(&old),
+            "{name} still holds {old}: {actors:?}"
+        );
+    }
+}
+
+/// After a restart, the new process compacts its predecessor's slot. A peer
+/// that still holds it in a live bucket must not make it pull state forever.
+#[test]
+fn compaction_after_a_restart_settles() {
+    let clock = virtual_clock::install();
+    let rule = RuleName::default();
+    let node = NodeName::from("a").node_id();
+    let mut a = GossipState::with_actor(
+        ActorId {
+            node,
+            incarnation: 1,
+        },
+        settings(5, 10),
+    );
+    let mut b = GossipState::new(NodeName::from("b").node_id(), settings(5, 10));
+    a.limit(&rule, "c").unwrap().unwrap();
+    b.accept(&delta(&mut a));
+
+    // The process restarts and stays quiet. The peer admits a request that
+    // keeps its bucket, and the dead slot in it, live past retirement.
+    let mut a = GossipState::with_actor(
+        ActorId {
+            node,
+            incarnation: 2,
+        },
+        settings(5, 10),
+    );
+    let mut late_pulls = 0;
+    for round in 0..150 {
+        clock.advance(100);
+        if round == 50 {
+            b.limit(&rule, "c").unwrap().unwrap();
+        }
+        let (from_a, from_b) = (a.tick(), b.tick());
+        a.expire_keys();
+        b.expire_keys();
+        let (full_a, full_b) = (a.full_state(), b.full_state());
+        for (output, to, full) in [(from_b, &mut a, &full_b), (from_a, &mut b, &full_a)] {
+            if let TickOutput::Heartbeat(h) = &output
+                && to.on_heartbeat(h).pull_state
+            {
+                late_pulls += usize::from(round >= 110);
+            }
+            exchange(output, to, full);
+        }
+    }
+    assert_eq!(
+        late_pulls, 0,
+        "still pulling state after the cluster settled"
+    );
+}
+
+/// A dead process's requests keep counting until they age out, even once its
+/// slot is known to be dead and compactable.
+#[test]
+fn a_dead_process_requests_count_until_they_age_out() {
+    let clock = virtual_clock::install();
+    let rule = RuleName::default();
+    let node = NodeName::from("a").node_id();
+    let mut a = GossipState::with_actor(
+        ActorId {
+            node,
+            incarnation: 1,
+        },
+        settings(5, 10),
+    );
+    let mut b = GossipState::new(NodeName::from("b").node_id(), settings(5, 10));
+    for _ in 0..3 {
+        a.limit(&rule, "c").unwrap().unwrap();
+    }
+    b.accept(&delta(&mut a));
+
+    let mut a = GossipState::with_actor(
+        ActorId {
+            node,
+            incarnation: 2,
+        },
+        settings(5, 10),
+    );
+    a.limit(&rule, "c").unwrap().unwrap();
+    b.accept(&delta(&mut a));
+    a.accept(&b.full_state());
+    clock.advance(1_000);
+    a.tick();
+    b.tick();
+    assert_eq!(b.check(&rule, "c").unwrap(), 1);
+    assert_eq!(a.check(&rule, "c").unwrap(), 1);
 }

@@ -380,4 +380,76 @@ mod tests {
         assert_eq!(first.map(|r| r.calls_remaining), Some(0));
         assert!(node.rate_limit(client_id).await.unwrap().is_none());
     }
+
+    /// Two gossip nodes on free local ports, `a` started first; `b` starts
+    /// after `delay`, so it misses whatever `a` sent before then.
+    async fn pair_with_clients(
+        clients: &[String],
+        delay: std::time::Duration,
+    ) -> (GossipNode, GossipNode) {
+        let ports: Vec<u16> = (0..2)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|s| s.local_addr().unwrap().port())
+            .collect();
+        let topology: std::collections::HashMap<String, String> =
+            [("a", ports[0]), ("b", ports[1])]
+                .into_iter()
+                .map(|(name, port)| (name.to_string(), format!("127.0.0.1:{port}")))
+                .collect();
+        let node = |name: &str, port: u16| {
+            let mut settings = settings::tests::sample();
+            settings.server_name = name.to_string();
+            settings.peer_listen_port = port;
+            settings.gossip_interval_ms = 50;
+            settings.topology = topology.clone();
+            GossipNode::new(settings)
+        };
+        let a = node("a", ports[0]).await.unwrap();
+        for client in clients {
+            a.rate_limit(client.clone()).await.unwrap();
+        }
+        tokio::time::sleep(delay).await;
+        let b = node("b", ports[1]).await.unwrap();
+        (a, b)
+    }
+
+    /// Wait up to 10s for `b` to see one call by each client.
+    async fn missing_at(b: &GossipNode, clients: &[String]) -> usize {
+        let max = settings::tests::sample().rate_limit_max_calls_allowed;
+        let mut missing = clients.len();
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            missing = 0;
+            for client in clients {
+                let remaining = b.check_limit(client.clone()).await.unwrap();
+                missing += usize::from(remaining.map(|r| r.calls_remaining) != Some(max - 1));
+            }
+            if missing == 0 {
+                break;
+            }
+        }
+        missing
+    }
+
+    /// State larger than one UDP datagram (~90 KB here) reaches a peer in
+    /// deltas.
+    #[tokio::test]
+    async fn test_state_larger_than_a_datagram_reaches_peers() {
+        let clients: Vec<String> = (0..1500).map(|c| format!("client-{c:06}")).collect();
+        let (_a, b) = pair_with_clients(&clients, std::time::Duration::ZERO).await;
+        let missing = missing_at(&b, &clients).await;
+        assert_eq!(missing, 0, "{missing} clients never reached the peer");
+    }
+
+    /// A peer that missed the deltas catches up through anti-entropy, whose
+    /// full state is larger than one datagram.
+    #[tokio::test]
+    async fn test_a_late_peer_catches_up_on_state_larger_than_a_datagram() {
+        let clients: Vec<String> = (0..1500).map(|c| format!("client-{c:06}")).collect();
+        let (_a, b) = pair_with_clients(&clients, std::time::Duration::from_millis(300)).await;
+        let missing = missing_at(&b, &clients).await;
+        assert_eq!(missing, 0, "{missing} clients never reached the late peer");
+    }
 }

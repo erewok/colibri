@@ -1,7 +1,7 @@
 //! Distributed token bucket using CRDT for eventual consistency
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crdts::pncounter::{Dir, Op};
 use crdts::{CmRDT, CvRDT, Dot, PNCounter, ResetRemove, VClock};
@@ -92,6 +92,14 @@ impl DistributedRequestCounter {
             let op = self.vclock.inc(writer);
             self.vclock.apply(op);
         }
+    }
+
+    /// Remove `actor`'s slot entirely.
+    fn forget(&mut self, actor: ActorId) {
+        let mut clock = VClock::new();
+        clock.dots.insert(actor, u64::MAX);
+        self.requests.reset_remove(&clock);
+        self.vclock.reset_remove(&clock);
     }
 
     /// Expire everything `actor`'s slot counts as live (see `DistributedBucket::retire_stale`).
@@ -299,6 +307,26 @@ impl DistributedBucket {
         }
     }
 
+    /// Forget the idle slots of processes known to be dead: a node's
+    /// incarnations older than the newest seen. Merges may re-add them.
+    fn compact(&mut self, newest: &BTreeMap<NodeId, u64>) {
+        let dead: Vec<ActorId> = self
+            .counter
+            .actors()
+            .filter(|a| {
+                newest.get(&a.node).is_some_and(|&n| n > a.incarnation)
+                    && self.counter.outstanding(*a) == 0
+            })
+            .collect();
+        for actor in dead {
+            self.counter.forget(actor);
+            let mut clock = VClock::new();
+            clock.dots.insert(actor, u64::MAX);
+            self.last_gossiped_vclock.reset_remove(&clock);
+            self.last_changed.remove(&actor);
+        }
+    }
+
     pub fn expire_entries(&mut self, expiration_threshold_ms: i64) {
         let now_ms = monotonic_ms();
         self.requests
@@ -377,6 +405,29 @@ impl Bucket for DistributedBucket {
     }
 }
 
+/// The newest incarnation seen of each node, shared by a process's limiters.
+/// Older incarnations are dead processes.
+#[derive(Clone, Debug, Default)]
+pub struct Incarnations(Arc<Mutex<BTreeMap<NodeId, u64>>>);
+
+impl Incarnations {
+    pub fn note(&self, actor: ActorId) {
+        let mut newest = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = newest.entry(actor.node).or_insert(actor.incarnation);
+        *entry = (*entry).max(actor.incarnation);
+    }
+
+    pub fn is_dead(&self, actor: ActorId) -> bool {
+        self.snapshot()
+            .get(&actor.node)
+            .is_some_and(|&n| n > actor.incarnation)
+    }
+
+    fn snapshot(&self) -> BTreeMap<NodeId, u64> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// Distributed rate limiter using CRDT buckets
 #[derive(Clone, Debug)]
 pub struct DistributedBucketLimiter {
@@ -387,6 +438,7 @@ pub struct DistributedBucketLimiter {
     rate_limit_settings: settings::RateLimitSettings,
     /// Highest own-slot value in any bucket this node dropped; new slots start above it.
     dropped_high: Arc<AtomicU64>,
+    incarnations: Incarnations,
 }
 
 impl DistributedBucketLimiter {
@@ -394,13 +446,24 @@ impl DistributedBucketLimiter {
         actor: impl Into<ActorId>,
         rate_limit_settings: settings::RateLimitSettings,
     ) -> Self {
+        Self::with_incarnations(actor, rate_limit_settings, Incarnations::default())
+    }
+
+    /// Like `new`, sharing what is known about incarnations with other limiters.
+    pub fn with_incarnations(
+        actor: impl Into<ActorId>,
+        rate_limit_settings: settings::RateLimitSettings,
+        incarnations: Incarnations,
+    ) -> Self {
         let actor = actor.into();
+        incarnations.note(actor);
         Self {
             node_id: actor.node,
             actor,
             node_counters: HashMap::new(),
             rate_limit_settings,
             dropped_high: Arc::new(AtomicU64::new(0)),
+            incarnations,
         }
     }
 
@@ -518,6 +581,9 @@ impl DistributedBucketLimiter {
 
     pub fn accept_delta_state(&mut self, delta: &[DistributedBucketExternal]) {
         let local = self.actor;
+        for actor in delta.iter().flat_map(|b| b.counter.actors()) {
+            self.incarnations.note(actor);
+        }
         for incoming_bucket in delta.iter() {
             // Don't resurrect idle buckets.
             let known = self
@@ -551,6 +617,7 @@ impl DistributedBucketLimiter {
     /// ones, in every bucket. Runs on each gossip tick.
     pub fn tick_expirations(&self) {
         let threshold = self.expiration_threshold_ms();
+        let newest = self.incarnations.snapshot();
         let guard = self.node_counters.pin();
         let keys: Vec<String> = guard.iter().map(|(k, _)| k.clone()).collect();
         for key in keys {
@@ -558,6 +625,7 @@ impl DistributedBucketLimiter {
                 let mut b = b.clone();
                 b.expire_entries(threshold);
                 b.retire_stale(threshold);
+                b.compact(&newest);
                 b
             });
         }
@@ -588,6 +656,15 @@ impl DistributedBucketLimiter {
                 bucket.tracked_requests(),
             )
         })
+    }
+
+    /// For tests: the actors with a slot in `client`'s bucket.
+    #[doc(hidden)]
+    pub fn bucket_actors(&self, client: &str) -> Option<Vec<ActorId>> {
+        self.node_counters
+            .pin()
+            .get(client)
+            .map(|bucket| bucket.counter.actors().collect())
     }
 
     pub fn is_empty(&self) -> bool {

@@ -18,7 +18,7 @@ use crate::node::{ActorId, NodeId};
 /// positional), removing or reordering variants silently corrupts traffic on a
 /// mixed-version cluster. Bumping this constant and rejecting mismatches on the
 /// receive side turns that silent corruption into a hard, logged error.
-pub const GOSSIP_PROTOCOL_VERSION: u16 = 2;
+pub const GOSSIP_PROTOCOL_VERSION: u16 = 3;
 
 /// Error returned by [`GossipPacket::from_wire`].
 #[derive(Debug)]
@@ -71,6 +71,7 @@ pub enum GossipMessage {
         response_addr: SocketAddr,
         timestamp: u64,
         node_id: NodeId,
+        actor: ActorId,
         vclock: VClock<ActorId>,
         rules_digest: u64,
     },
@@ -81,6 +82,69 @@ pub enum GossipMessage {
         sender_node_id: NodeId,
         rules: RuleConfig,
     },
+}
+
+fn encoded_len<T: Serialize>(value: &T) -> usize {
+    to_allocvec(value).map_or(0, |bytes| bytes.len())
+}
+
+/// Pack `updates` into `DeltaStateSync` packets of at most `max_bytes` each.
+/// Buckets merge independently, so any split is valid; a bucket larger than
+/// `max_bytes` travels alone.
+pub fn delta_packets(
+    updates: Vec<RuleBuckets>,
+    sender_node_id: NodeId,
+    response_addr: SocketAddr,
+    propagation_factor: u8,
+    max_bytes: usize,
+) -> Vec<GossipPacket> {
+    // Headroom for a length prefix that grows as items are added.
+    const LENGTH_SLACK: usize = 4;
+    let packet = |updates| {
+        GossipPacket::new(GossipMessage::DeltaStateSync {
+            response_addr,
+            updates,
+            sender_node_id,
+            propagation_factor,
+        })
+    };
+    let empty = encoded_len(&packet(Vec::new())) + LENGTH_SLACK;
+
+    let mut packets = Vec::new();
+    let mut current: Vec<RuleBuckets> = Vec::new();
+    let mut used = empty;
+    for update in updates {
+        let header = encoded_len(&RuleBuckets {
+            buckets: Vec::new(),
+            ..update.clone()
+        }) + LENGTH_SLACK;
+        for bucket in update.buckets {
+            let same_rule = current
+                .last()
+                .is_some_and(|last| last.rule == update.rule && last.version == update.version);
+            let mut need = encoded_len(&bucket) + if same_rule { 0 } else { header };
+            if used + need > max_bytes && !current.is_empty() {
+                packets.push(packet(std::mem::take(&mut current)));
+                used = empty;
+                need = encoded_len(&bucket) + header;
+            }
+            match current.last_mut() {
+                Some(last) if last.rule == update.rule && last.version == update.version => {
+                    last.buckets.push(bucket)
+                }
+                _ => current.push(RuleBuckets {
+                    rule: update.rule.clone(),
+                    version: update.version,
+                    buckets: vec![bucket],
+                }),
+            }
+            used += need;
+        }
+    }
+    if !current.is_empty() {
+        packets.push(packet(current));
+    }
+    packets
 }
 
 /// GossipPacket wraps messages for network transmission.

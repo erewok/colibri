@@ -16,7 +16,8 @@ use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::{UdpReceiver, UdpTransport};
 
-use super::state::{GossipState, HeartbeatDigest, TickOutput};
+use super::messages::delta_packets;
+use super::state::{GossipState, HeartbeatDigest, RuleBuckets, TickOutput};
 use super::{GossipMessage, GossipPacket};
 
 /// Maximum number of recent packet IDs kept for receive-side deduplication.
@@ -38,6 +39,8 @@ pub struct GossipController {
     pub response_addr: SocketAddr,
     pub gossip_interval_ms: u64,
     pub gossip_fanout: usize,
+    /// Largest datagram to send; updates are split across packets to fit.
+    pub max_packet_bytes: usize,
     /// Receiver address for logging
     receiver_addr: SocketAddr,
     /// Receiver for incoming UDP datagrams
@@ -101,6 +104,7 @@ impl GossipController {
             response_addr,
             gossip_interval_ms: settings.gossip_interval_ms,
             gossip_fanout: settings.gossip_fanout,
+            max_packet_bytes: settings.gossip_max_packet_bytes,
             receiver_addr,
             receiver: Arc::new(receiver),
             receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
@@ -458,18 +462,17 @@ impl GossipController {
     pub async fn handle_gossip_tick(&self) -> Result<()> {
         // Ages every bucket first, so expiries ride this same gossip round.
         let message = match self.with_state(|state| state.tick())? {
-            TickOutput::Delta(updates) => GossipMessage::DeltaStateSync {
-                updates,
-                sender_node_id: self.node_id,
-                response_addr: self.response_addr,
-                propagation_factor: 1,
-            },
+            TickOutput::Delta(updates) => {
+                let packets = self.delta_packets(updates, self.node_id, 1);
+                return self.send_gossip_packets(packets).await;
+            }
             TickOutput::Heartbeat(digest) => GossipMessage::Heartbeat {
                 node_id: self.node_id,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                actor: digest.actor,
                 vclock: digest.buckets,
                 rules_digest: digest.rules,
                 response_addr: self.response_addr,
@@ -531,21 +534,17 @@ impl GossipController {
                         let state = self.with_state(|state| state.full_state())?;
 
                         if !state.is_empty() {
-                            // Respond with a DeltaStateSync; the receiver relays it
+                            // Respond with DeltaStateSyncs; the receiver relays them
                             // once more (propagation_factor 1).
-                            let response = GossipMessage::DeltaStateSync {
-                                updates: state,
-                                sender_node_id: self.node_id,
-                                response_addr: self.response_addr,
-                                propagation_factor: 1,
-                            };
-                            let packet = GossipPacket::new(response);
-                            if let Err(e) = self.send_gossip_packet_to(requester_addr, packet).await
-                            {
-                                warn!(
-                                    "[{}] Failed to send anti-entropy response to {}: {}",
-                                    self.node_id, requester_addr, e
-                                );
+                            for packet in self.delta_packets(state, self.node_id, 1) {
+                                if let Err(e) =
+                                    self.send_gossip_packet_to(requester_addr, packet).await
+                                {
+                                    warn!(
+                                        "[{}] Failed to send anti-entropy response to {}: {}",
+                                        self.node_id, requester_addr, e
+                                    );
+                                }
                             }
                         } else {
                             debug!(
@@ -574,19 +573,15 @@ impl GossipController {
                         self.with_state(|state| state.accept(&updates))?;
                         // Propagate further if propagation_factor > 0
                         if propagation_factor > 0 {
-                            let message = GossipMessage::DeltaStateSync {
-                                updates, // propagate the same updates to other nodes
-                                sender_node_id,
-                                response_addr: self.response_addr,
-                                propagation_factor: propagation_factor - 1,
-                            };
-                            let packet = GossipPacket::new(message);
-                            self.send_gossip_packet(packet).await?;
+                            let packets =
+                                self.delta_packets(updates, sender_node_id, propagation_factor - 1);
+                            self.send_gossip_packets(packets).await?;
                         }
                     }
                     GossipMessage::Heartbeat {
                         node_id: heartbeat_node_id,
                         timestamp: _,
+                        actor,
                         vclock,
                         rules_digest,
                         response_addr: peer_response_addr,
@@ -596,6 +591,7 @@ impl GossipController {
                             return Ok(());
                         }
                         let peer = HeartbeatDigest {
+                            actor,
                             buckets: vclock,
                             rules: rules_digest,
                         };
@@ -710,8 +706,29 @@ impl GossipController {
         }
     }
 
+    /// `updates` as datagrams of at most `max_packet_bytes`.
+    fn delta_packets(
+        &self,
+        updates: Vec<RuleBuckets>,
+        sender_node_id: NodeId,
+        propagation_factor: u8,
+    ) -> Vec<GossipPacket> {
+        delta_packets(
+            updates,
+            sender_node_id,
+            self.response_addr,
+            propagation_factor,
+            self.max_packet_bytes,
+        )
+    }
+
     /// Send a gossip packet to random peers using transport layer
     pub async fn send_gossip_packet(&self, packet: GossipPacket) -> Result<()> {
+        self.send_gossip_packets(vec![packet]).await
+    }
+
+    /// Send packets to the same `gossip_fanout` random peers.
+    pub async fn send_gossip_packets(&self, packets: Vec<GossipPacket>) -> Result<()> {
         let topology = self.topology.read().await;
         let all_nodes = topology.all_nodes();
 
@@ -729,11 +746,14 @@ impl GossipController {
             return Ok(());
         }
 
-        // Serialize the packet
-        let data = packet.serialize().map_err(|e| {
-            debug!("[{}] Failed to serialize packet: {}", self.node_id, e);
-            ColibriError::Transport(format!("Serialization failed: {}", e))
-        })?;
+        let datagrams = packets
+            .iter()
+            .map(GossipPacket::serialize)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                debug!("[{}] Failed to serialize packet: {}", self.node_id, e);
+                ColibriError::Transport(format!("Serialization failed: {}", e))
+            })?;
 
         // Send to multiple random peers up to gossip_fanout
         let send_count = self.gossip_fanout.min(peers.len());
@@ -747,19 +767,25 @@ impl GossipController {
 
         let mut sent_count = 0;
         for peer in selected_peers {
-            match self.transport.send_to_peer(peer, &data).await {
-                Ok(_) => sent_count += 1,
-                Err(e) => debug!(
-                    "[{}] Failed to send gossip to {}: {}",
-                    self.node_id, peer, e
-                ),
+            let mut delivered = true;
+            for data in &datagrams {
+                if let Err(e) = self.transport.send_to_peer(peer, data).await {
+                    delivered = false;
+                    debug!(
+                        "[{}] Failed to send gossip to {}: {}",
+                        self.node_id, peer, e
+                    );
+                }
             }
+            sent_count += usize::from(delivered);
         }
 
         if sent_count > 0 {
             debug!(
-                "[{}] Sent gossip packet to {} peers",
-                self.node_id, sent_count
+                "[{}] Sent {} gossip packets to {} peers",
+                self.node_id,
+                datagrams.len(),
+                sent_count
             );
             Ok(())
         } else {

@@ -2,7 +2,8 @@
 
 use colibri::clock::virtual_clock;
 use colibri::limiters::RuleName;
-use colibri::node::gossip::state::{GossipState, RuleBuckets, TickOutput};
+use colibri::node::gossip::messages::{GossipMessage, GossipPacket};
+use colibri::node::gossip::state::{GossipState, RuleBuckets, TickOutput, partition_of};
 use colibri::node::{ActorId, NodeName};
 use colibri::settings::RateLimitSettings;
 
@@ -179,15 +180,22 @@ fn a_recreated_rule_does_not_inherit_old_counts() {
     );
 }
 
-/// Deliver a peer's tick output, pulling `peer_state` if its heartbeat shows
-/// state `to` lacks.
-fn exchange(output: TickOutput, to: &mut GossipState, peer_state: &[RuleBuckets]) {
+/// Deliver `from`'s tick output to `to`. On a heartbeat whose partitions
+/// differ, `to` pulls those partitions and pushes its own; returns whether
+/// they differed.
+fn exchange(output: TickOutput, from: &mut GossipState, to: &mut GossipState) -> bool {
     match output {
-        TickOutput::Delta(updates) => to.accept(&updates),
+        TickOutput::Delta(updates) => {
+            to.accept(&updates);
+            false
+        }
         TickOutput::Heartbeat(h) => {
-            if to.on_heartbeat(&h).pull_state {
-                to.accept(peer_state);
+            let differ = to.on_heartbeat(&h).partitions;
+            if !differ.is_empty() {
+                to.accept(&from.partition_state(&differ));
+                from.accept(&to.partition_state(&differ));
             }
+            !differ.is_empty()
         }
     }
 }
@@ -217,9 +225,8 @@ fn a_dead_process_is_retired_everywhere_despite_skewed_arrival() {
         let (from_p, from_r) = (p.tick(), r.tick());
         p.expire_keys();
         r.expire_keys();
-        let (full_p, full_r) = (p.full_state(), r.full_state());
-        exchange(from_r, &mut p, &full_r);
-        exchange(from_p, &mut r, &full_p);
+        exchange(from_r, &mut r, &mut p);
+        exchange(from_p, &mut p, &mut r);
     }
     assert_eq!(p.check(&rule, "c").unwrap(), 5);
     assert_eq!(r.check(&rule, "c").unwrap(), 5);
@@ -267,9 +274,8 @@ fn a_hot_client_sheds_a_restarted_process_slot() {
         a.limit(&rule, "c").unwrap().unwrap();
         b.limit(&rule, "c").unwrap().unwrap();
         let (from_a, from_b) = (a.tick(), b.tick());
-        let (full_a, full_b) = (a.full_state(), b.full_state());
-        exchange(from_b, &mut a, &full_b);
-        exchange(from_a, &mut b, &full_a);
+        exchange(from_b, &mut b, &mut a);
+        exchange(from_a, &mut a, &mut b);
     }
     for (name, state) in [("a", &a), ("b", &b)] {
         let actors = state.limiter(&rule).unwrap().bucket_actors("c").unwrap();
@@ -316,15 +322,8 @@ fn compaction_after_a_restart_settles() {
         let (from_a, from_b) = (a.tick(), b.tick());
         a.expire_keys();
         b.expire_keys();
-        let (full_a, full_b) = (a.full_state(), b.full_state());
-        for (output, to, full) in [(from_b, &mut a, &full_b), (from_a, &mut b, &full_a)] {
-            if let TickOutput::Heartbeat(h) = &output
-                && to.on_heartbeat(h).pull_state
-            {
-                late_pulls += usize::from(round >= 110);
-            }
-            exchange(output, to, full);
-        }
+        let differed = exchange(from_b, &mut b, &mut a) | exchange(from_a, &mut a, &mut b);
+        late_pulls += usize::from(round >= 110 && differed);
     }
     assert_eq!(
         late_pulls, 0,
@@ -367,4 +366,150 @@ fn a_dead_process_requests_count_until_they_age_out() {
     b.tick();
     assert_eq!(b.check(&rule, "c").unwrap(), 1);
     assert_eq!(a.check(&rule, "c").unwrap(), 1);
+}
+
+/// Two in-sync nodes; then `a` updates `client` and the delta is lost.
+fn one_missed_update(client: &str) -> (GossipState, GossipState) {
+    let rule = RuleName::default();
+    let mut a = GossipState::new(NodeName::from("a").node_id(), settings(5, 60));
+    let mut b = GossipState::new(NodeName::from("b").node_id(), settings(5, 60));
+    for c in 0..300 {
+        a.limit(&rule, &format!("client-{c}")).unwrap().unwrap();
+    }
+    b.accept(&delta(&mut a));
+    a.limit(&rule, client).unwrap().unwrap();
+    let _lost = delta(&mut a);
+    (a, b)
+}
+
+/// A node that missed one update pulls only that client's partition.
+#[test]
+fn a_peer_that_missed_one_update_pulls_only_its_partition() {
+    let _clock = virtual_clock::install();
+    let (mut a, mut b) = one_missed_update("client-7");
+    let differ = b.on_heartbeat(&heartbeat(&mut a)).partitions;
+    assert_eq!(differ, vec![partition_of("client-7")]);
+
+    let pulled = a.partition_state(&differ);
+    let clients: usize = pulled.iter().map(|r| r.buckets.len()).sum();
+    assert!(clients < 300 / 8, "pulled {clients} of 300 clients");
+    b.accept(&pulled);
+    assert_eq!(b.check(&RuleName::default(), "client-7").unwrap(), 3);
+    assert!(b.on_heartbeat(&heartbeat(&mut a)).partitions.is_empty());
+}
+
+/// The node that is ahead also sees the difference in a behind peer's
+/// heartbeat, so a busy node (which only sends deltas) can push the repair.
+#[test]
+fn a_node_ahead_sees_a_behind_peers_partition() {
+    let _clock = virtual_clock::install();
+    let (mut a, mut b) = one_missed_update("client-7");
+    let differ = a.on_heartbeat(&heartbeat(&mut b)).partitions;
+    assert_eq!(differ, vec![partition_of("client-7")]);
+    b.accept(&a.partition_state(&differ));
+    assert_eq!(b.check(&RuleName::default(), "client-7").unwrap(), 3);
+}
+
+/// A heartbeat fits one datagram however many clients a node holds.
+#[test]
+fn a_heartbeat_fits_one_datagram() {
+    let _clock = virtual_clock::install();
+    let rule = RuleName::default();
+    let mut a = GossipState::new(NodeName::from("a").node_id(), settings(5, 60));
+    for c in 0..10_000 {
+        a.limit(&rule, &format!("client-{c}")).unwrap().unwrap();
+    }
+    let _ = delta(&mut a);
+    let h = heartbeat(&mut a);
+    let packet = GossipPacket::new(GossipMessage::Heartbeat {
+        response_addr: "127.0.0.1:7946".parse().unwrap(),
+        timestamp: 0,
+        node_id: NodeName::from("a").node_id(),
+        incarnations: h.incarnations,
+        partitions: h.partitions,
+        rules_digest: h.rules,
+    });
+    let size = packet.serialize().unwrap().len();
+    assert!(size <= 1400, "{size}-byte heartbeat");
+}
+
+/// One reliable gossip round: every node ticks and delivers to every other.
+/// Returns whether any partitions differed.
+fn gossip_round(nodes: &mut [GossipState]) -> bool {
+    let mut differed = false;
+    for sender in 0..nodes.len() {
+        let output = nodes[sender].tick();
+        for receiver in (0..nodes.len()).filter(|&r| r != sender) {
+            let (from, to) = if sender < receiver {
+                let (left, right) = nodes.split_at_mut(receiver);
+                (&mut left[sender], &mut right[0])
+            } else {
+                let (left, right) = nodes.split_at_mut(sender);
+                (&mut right[0], &mut left[receiver])
+            };
+            differed |= exchange(output.clone(), from, to);
+        }
+    }
+    differed
+}
+
+/// Nodes retire and compact a dead process's slot at different ticks. One
+/// that has compacted must not take the slot back from one that hasn't yet.
+#[test]
+fn a_compacted_slot_is_not_taken_back_from_a_peer() {
+    let clock = virtual_clock::install();
+    let rule = RuleName::default();
+    let dead = NodeName::from("d").node_id();
+    let mut d = GossipState::with_actor(
+        ActorId {
+            node: dead,
+            incarnation: 1,
+        },
+        settings(5, 1),
+    );
+    let mut nodes: Vec<GossipState> = ["p", "q", "r"]
+        .iter()
+        .map(|n| GossipState::new(NodeName::from(*n).node_id(), settings(5, 1)))
+        .collect();
+    d.limit(&rule, "c").unwrap().unwrap();
+    let sent = delta(&mut d);
+    let mut d = GossipState::with_actor(
+        ActorId {
+            node: dead,
+            incarnation: 2,
+        },
+        settings(5, 1),
+    );
+    let restarted = heartbeat(&mut d);
+    for node in &mut nodes {
+        node.accept(&sent);
+        node.on_heartbeat(&restarted);
+    }
+
+    clock.advance(1_002);
+    let still_moving = (0..10).filter(|_| gossip_round(&mut nodes)).count();
+    assert!(
+        still_moving <= 2,
+        "state moved in {still_moving} of 10 rounds"
+    );
+    for node in &nodes {
+        assert_eq!(node.check(&rule, "c").unwrap(), 5);
+    }
+}
+
+/// A lost delta stays visible in the digest after a later delta for another
+/// client from the same writer is delivered.
+#[test]
+fn a_lost_delta_is_not_masked_by_a_later_one() {
+    let _clock = virtual_clock::install();
+    let rule = RuleName::default();
+    let mut writer = GossipState::new(NodeName::from("w").node_id(), settings(5, 60));
+    let mut peer = GossipState::new(NodeName::from("p").node_id(), settings(5, 60));
+    writer.limit(&rule, "alice").unwrap().unwrap();
+    let _lost = delta(&mut writer);
+    writer.limit(&rule, "bob").unwrap().unwrap();
+    peer.accept(&delta(&mut writer));
+
+    let differ = peer.on_heartbeat(&heartbeat(&mut writer)).partitions;
+    assert!(differ.contains(&partition_of("alice")));
 }

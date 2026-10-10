@@ -182,16 +182,20 @@ impl GossipCluster {
             }
             TickOutput::Heartbeat(digest) => {
                 let reply = self.nodes[receiver].on_heartbeat(digest);
+                let differ = !reply.partitions.is_empty();
                 if response_delivered {
-                    if reply.pull_state {
-                        let state = self.nodes[sender].full_state();
-                        self.nodes[receiver].accept(&state);
+                    if differ {
+                        // The receiver pushes its partitions and pulls the sender's.
+                        let pushed = self.nodes[receiver].partition_state(&reply.partitions);
+                        let pulled = self.nodes[sender].partition_state(&reply.partitions);
+                        self.nodes[sender].accept(&pushed);
+                        self.nodes[receiver].accept(&pulled);
                     }
                     if reply.push_rules {
                         self.send_rules(receiver, sender, true);
                     }
                 }
-                reply.pull_state || reply.push_rules
+                differ || reply.push_rules
             }
         }
     }
@@ -293,13 +297,42 @@ impl GossipCluster {
             .join("\n")
     }
 
+    /// Record each current writer's slots, before anything discards them.
+    fn observe_writers(&mut self) {
+        let high_of = |b: &DistributedBucketExternal, a: &ActorId| {
+            let (requests, expiries) = b.counter.slot(*a);
+            requests.max(expiries).max(b.counter.vclock.get(a))
+        };
+        for rule in Self::rules() {
+            for writer in 0..NUM_NODES {
+                let Some(v) = self.version_at(writer, &rule) else {
+                    continue;
+                };
+                let actor = self.actor(writer, self.incarnation[writer]);
+                for (client, bucket) in self.bucket_states(writer, &rule) {
+                    let high = self
+                        .writer_high
+                        .entry((rule.clone(), v, actor, client))
+                        .or_insert(0);
+                    *high = (*high).max(high_of(&bucket, &actor));
+                }
+            }
+        }
+    }
+
+    /// Forget a node's idle clients, recording what its writer held first.
+    fn expire_keys_at(&mut self, node: usize) {
+        self.observe_writers();
+        self.nodes[node].expire_keys();
+    }
+
     /// Run reliable gossip rounds until no state moves. Each round also
     /// forgets idle clients, as the server's key-expiry loop does.
     fn run_until_quiescent(&mut self) -> usize {
         let mut rounds = 0;
         loop {
-            for node in &mut self.nodes {
-                node.expire_keys();
+            for node in 0..NUM_NODES {
+                self.expire_keys_at(node);
             }
             let mut transferred = false;
             for sender in 0..NUM_NODES {
@@ -468,7 +501,7 @@ impl GossipCluster {
     fn expire_keys(&mut self, tc: TestCase) {
         let node = self.draw_node(&tc);
         let before = self.nodes[node].bucket_count();
-        self.nodes[node].expire_keys();
+        self.expire_keys_at(node);
         if self.nodes[node].bucket_count() < before {
             tc.event("expire_keys dropped a bucket");
         }
@@ -481,6 +514,7 @@ impl GossipCluster {
     #[rule]
     fn restart_node(&mut self, tc: TestCase) {
         let node = self.draw_node(&tc);
+        self.observe_writers();
         self.clock.advance(1);
         self.incarnation[node] += 1;
         if tc.draw(gs::weighted_booleans(0.2)) {
@@ -502,8 +536,8 @@ impl GossipCluster {
         self.run_until_quiescent();
         self.assert_settled_views("after gossip settled");
 
-        for node in &mut self.nodes {
-            node.expire_keys();
+        for node in 0..NUM_NODES {
+            self.expire_keys_at(node);
         }
         for rule in Self::rules() {
             let Some(v) = self.settled_version(&rule, "after expiring") else {
@@ -575,15 +609,15 @@ impl GossipCluster {
             let order = tc.draw(gs::permutations((0..NUM_NODES).collect::<Vec<_>>()));
             for sender in order {
                 let output = self.nodes[sender].tick();
-                self.nodes[sender].expire_keys();
+                self.expire_keys_at(sender);
                 for receiver in (0..NUM_NODES).filter(|&r| r != sender) {
                     self.deliver(&output, sender, receiver, true);
                 }
             }
         }
         self.run_until_quiescent();
-        for node in &mut self.nodes {
-            node.expire_keys();
+        for node in 0..NUM_NODES {
+            self.expire_keys_at(node);
         }
         for rule in Self::rules() {
             let Some(v) = self.settled_version(&rule, "after waiting") else {
@@ -619,6 +653,7 @@ impl GossipCluster {
     ///   (Replicas may count more of its expiries, having retired stale ones.)
     #[invariant(always_run)]
     fn writer_slot_never_goes_backwards(&mut self, _tc: TestCase) {
+        self.observe_writers();
         let high_of = |b: &DistributedBucketExternal, a: &ActorId| {
             let (requests, expiries) = b.counter.slot(*a);
             requests.max(expiries).max(b.counter.vclock.get(a))
@@ -635,15 +670,6 @@ impl GossipCluster {
                     continue;
                 };
                 let current = actor.incarnation == self.incarnation[writer];
-                if current {
-                    for (client, bucket) in &states[writer] {
-                        let high = self
-                            .writer_high
-                            .entry((rule.clone(), v, actor, client.clone()))
-                            .or_insert(0);
-                        *high = (*high).max(high_of(bucket, &actor));
-                    }
-                }
                 for replica in (0..NUM_NODES).filter(|&r| versions[r] == Some(v)) {
                     for (client, bucket) in &states[replica] {
                         let seen = high_of(bucket, &actor);

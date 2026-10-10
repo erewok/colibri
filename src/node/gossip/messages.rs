@@ -3,7 +3,6 @@
 //! Defines all message types for cluster communication.
 use std::net::SocketAddr;
 
-use crdts::VClock;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +17,7 @@ use crate::node::{ActorId, NodeId};
 /// positional), removing or reordering variants silently corrupts traffic on a
 /// mixed-version cluster. Bumping this constant and rejecting mismatches on the
 /// receive side turns that silent corruption into a hard, logged error.
-pub const GOSSIP_PROTOCOL_VERSION: u16 = 3;
+pub const GOSSIP_PROTOCOL_VERSION: u16 = 4;
 
 /// Error returned by [`GossipPacket::from_wire`].
 #[derive(Debug)]
@@ -59,9 +58,9 @@ pub enum GossipMessage {
         propagation_factor: u8, // To limit spread
     },
 
-    /// Request for specific state (anti-entropy)
+    /// Request for the sender's state in `partitions` (anti-entropy)
     StateRequest {
-        missing_keys: Option<Vec<String>>, // None = full sync
+        partitions: Vec<u16>,
         response_addr: SocketAddr,
         requesting_node_id: NodeId,
     },
@@ -71,8 +70,8 @@ pub enum GossipMessage {
         response_addr: SocketAddr,
         timestamp: u64,
         node_id: NodeId,
-        actor: ActorId,
-        vclock: VClock<ActorId>,
+        incarnations: Vec<ActorId>,
+        partitions: Vec<u64>,
         rules_digest: u64,
     },
 
@@ -212,7 +211,7 @@ mod tests {
     fn test_gossip_packet_serialization() {
         let message = GossipMessage::StateRequest {
             requesting_node_id: NodeName::from("node-1").node_id(),
-            missing_keys: None,
+            partitions: vec![3],
             response_addr: "127.0.0.1:8410".parse().unwrap(),
         };
         let packet = GossipPacket::new(message);
@@ -225,11 +224,11 @@ mod tests {
         match deserialized.message {
             GossipMessage::StateRequest {
                 requesting_node_id,
-                missing_keys,
+                partitions,
                 response_addr,
             } => {
                 assert_eq!(requesting_node_id, NodeName::from("node-1").node_id());
-                assert!(missing_keys.is_none());
+                assert_eq!(partitions, vec![3]);
                 assert_eq!(response_addr, "127.0.0.1:8410".parse().unwrap());
             }
             _ => panic!("Wrong message type after deserialization"),
@@ -240,7 +239,7 @@ mod tests {
     fn test_version_mismatch_is_rejected() {
         let message = GossipMessage::StateRequest {
             requesting_node_id: NodeName::from("node-1").node_id(),
-            missing_keys: None,
+            partitions: vec![3],
             response_addr: "127.0.0.1:8410".parse().unwrap(),
         };
         // Construct a packet with a stale version number (simulates a node

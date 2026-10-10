@@ -206,6 +206,7 @@ impl DistributedBucketExternal {
             writer: local,
             max_calls,
             last_changed: counter.actors().map(|a| (a, now - self.quiet(a))).collect(),
+            forgotten: BTreeMap::new(),
             counter,
             requests: Vec::new(),
             // Watermark at the incoming state so a release still gets gossiped.
@@ -234,6 +235,9 @@ struct DistributedBucket {
     last_gossiped_vclock: VClock<ActorId>,
     /// When each other actor's slot last changed here (monotonic ms).
     last_changed: BTreeMap<ActorId, i64>,
+    /// Compacted dead slots: (requests, when). Copies no higher are ignored
+    /// for a window, so a peer that hasn't compacted yet can't re-add them.
+    forgotten: BTreeMap<ActorId, (u64, i64)>,
 }
 
 impl DistributedBucket {
@@ -246,6 +250,7 @@ impl DistributedBucket {
             requests: Vec::new(),
             last_gossiped_vclock: VClock::new(),
             last_changed: BTreeMap::new(),
+            forgotten: BTreeMap::new(),
         }
     }
 
@@ -267,14 +272,21 @@ impl DistributedBucket {
         self.last_gossiped_vclock = self.counter.vclock.clone();
     }
 
-    /// Merge a peer's copy, noting which other actors' slots changed.
+    /// Merge a peer's copy, noting which other actors' slots changed, and
+    /// absorb its dots into the watermark so they aren't re-broadcast.
     fn merge_from(&mut self, incoming: &DistributedBucketExternal) {
-        let before: Vec<(ActorId, (u64, u64))> = incoming
-            .counter
+        let mut counter = incoming.counter.clone();
+        for (&actor, &(requests, _)) in &self.forgotten {
+            if counter.slot(actor).0 <= requests {
+                counter.forget(actor);
+            }
+        }
+        let before: Vec<(ActorId, (u64, u64))> = counter
             .actors()
             .map(|a| (a, self.counter.slot(a)))
             .collect();
-        self.counter.merge(incoming.counter.clone());
+        self.last_gossiped_vclock.merge(counter.vclock.clone());
+        self.counter.merge(counter);
         let now = monotonic_ms();
         for (actor, slot) in before {
             if actor != self.writer && self.counter.slot(actor) != slot {
@@ -308,8 +320,11 @@ impl DistributedBucket {
     }
 
     /// Forget the idle slots of processes known to be dead: a node's
-    /// incarnations older than the newest seen. Merges may re-add them.
-    fn compact(&mut self, newest: &BTreeMap<NodeId, u64>) {
+    /// incarnations older than the newest seen.
+    fn compact(&mut self, newest: &BTreeMap<NodeId, u64>, window_ms: i64) {
+        let now = monotonic_ms();
+        self.forgotten
+            .retain(|_, &mut (_, at)| now - at <= window_ms);
         let dead: Vec<ActorId> = self
             .counter
             .actors()
@@ -319,6 +334,8 @@ impl DistributedBucket {
             })
             .collect();
         for actor in dead {
+            self.forgotten
+                .insert(actor, (self.counter.slot(actor).0, now));
             self.counter.forget(actor);
             let mut clock = VClock::new();
             clock.dots.insert(actor, u64::MAX);
@@ -359,10 +376,6 @@ impl DistributedBucket {
             counter: self.counter.clone(),
             quiet_ms,
         }
-    }
-
-    pub fn vclock(&self) -> VClock<ActorId> {
-        self.counter.vclock.clone()
     }
 }
 
@@ -405,6 +418,9 @@ impl Bucket for DistributedBucket {
     }
 }
 
+/// A bucket's slots as (actor, requests, expiries).
+pub type SlotValues = Vec<(ActorId, u64, u64)>;
+
 /// The newest incarnation seen of each node, shared by a process's limiters.
 /// Older incarnations are dead processes.
 #[derive(Clone, Debug, Default)]
@@ -421,6 +437,14 @@ impl Incarnations {
         self.snapshot()
             .get(&actor.node)
             .is_some_and(|&n| n > actor.incarnation)
+    }
+
+    /// The newest incarnation known of each node.
+    pub fn newest(&self) -> Vec<ActorId> {
+        self.snapshot()
+            .into_iter()
+            .map(|(node, incarnation)| ActorId { node, incarnation })
+            .collect()
     }
 
     fn snapshot(&self) -> BTreeMap<NodeId, u64> {
@@ -501,6 +525,7 @@ impl DistributedBucketLimiter {
             .filter(|(_, bucket)| {
                 bucket.requests.is_empty()
                     && bucket.counter.is_idle()
+                    && bucket.forgotten.is_empty()
                     && !bucket.has_updates_since_last_gossip()
             })
             .map(|(key, bucket)| (key.clone(), bucket.counter.own_high(self.actor)))
@@ -598,11 +623,6 @@ impl DistributedBucketLimiter {
                 |existing| {
                     let mut bucket = existing.clone();
                     bucket.merge_from(incoming_bucket);
-                    // Absorb the peer's dots so this node doesn't re-broadcast
-                    // them; its own unsent writes stay above the watermark.
-                    bucket
-                        .last_gossiped_vclock
-                        .merge(incoming_bucket.counter.vclock.clone());
                     bucket
                 },
                 || {
@@ -625,25 +645,10 @@ impl DistributedBucketLimiter {
                 let mut b = b.clone();
                 b.expire_entries(threshold);
                 b.retire_stale(threshold);
-                b.compact(&newest);
+                b.compact(&newest, threshold);
                 b
             });
         }
-    }
-
-    /// Every bucket's vclock summed per actor, for heartbeats. (A max would let
-    /// one client's count hide another client's missing write.)
-    pub fn get_latest_updated_vclock(&self) -> VClock<ActorId> {
-        self.node_counters
-            .pin()
-            .values()
-            .fold(VClock::new(), |mut acc, bucket| {
-                for (actor, count) in bucket.vclock().dots {
-                    let total = acc.dots.entry(actor).or_insert(0);
-                    *total = total.saturating_add(count);
-                }
-                acc
-            })
     }
 
     /// For tests: (live requests in own slot, requests tracked). The first is at most
@@ -656,6 +661,33 @@ impl DistributedBucketLimiter {
                 bucket.tracked_requests(),
             )
         })
+    }
+
+    /// Each live bucket's slots as (actor, requests, expiries), for anti-entropy
+    /// digests. Idle buckets and dead processes' idle slots are left out: nodes
+    /// drop and compact them at different times.
+    pub fn digest_slots(&self) -> Vec<(String, SlotValues)> {
+        let newest = self.incarnations.snapshot();
+        let dead_and_idle = |counter: &DistributedRequestCounter, a: ActorId| {
+            newest.get(&a.node).is_some_and(|&n| n > a.incarnation) && counter.outstanding(a) == 0
+        };
+        self.node_counters
+            .pin()
+            .iter()
+            .filter(|(_, bucket)| !bucket.counter.is_idle())
+            .map(|(client, bucket)| {
+                let slots = bucket
+                    .counter
+                    .actors()
+                    .filter(|&a| !dead_and_idle(&bucket.counter, a))
+                    .map(|a| {
+                        let (requests, expiries) = bucket.counter.slot(a);
+                        (a, requests, expiries)
+                    })
+                    .collect();
+                (client.clone(), slots)
+            })
+            .collect()
     }
 
     /// For tests: the actors with a slot in `client`'s bucket.
@@ -1329,74 +1361,6 @@ mod tests {
         );
     }
 
-    /// Regression test for `get_latest_updated_vclock` returning the join of all
-    /// bucket vclocks rather than the max of any single bucket vclock.
-    ///
-    /// When multiple clients have buckets written by *different* nodes, their vclocks
-    /// are concurrent (each has dots the other lacks). The old implementation used
-    /// `acc > bucket.vclock()` to fold, and because `>` is false for concurrent
-    /// vclocks it dropped earlier actors on every step, producing a result that varied
-    /// with HashMap iteration order. This made heartbeat comparisons spuriously
-    /// `None` (concurrent) and triggered permanent anti-entropy `StateRequest` loops.
-    ///
-    /// The fix uses `acc.merge(vclock)` to compute the element-wise maximum (join),
-    /// which always produces a stable vclock that covers every known actor slot.
-    #[test]
-    fn test_get_latest_updated_vclock_is_join_of_all_buckets() {
-        let node_a = node_id();
-        let node_b = NodeName::from("b").node_id();
-        let node_c = NodeName::from("c").node_id();
-        let settings = test_settings();
-
-        let mut limiter = DistributedBucketLimiter::new(node_a, settings.clone());
-
-        // Each client is processed by a different writer node, so their bucket
-        // vclocks are concurrent (disjoint actor sets).
-        let mut limiter_b = DistributedBucketLimiter::new(node_b, settings.clone());
-        let mut limiter_c = DistributedBucketLimiter::new(node_c, settings);
-
-        limiter.limit_calls_for_client("client_a".to_string()); // vclock {node_a: n}
-        limiter_b.limit_calls_for_client("client_b".to_string()); // vclock {node_b: n}
-        limiter_c.limit_calls_for_client("client_c".to_string()); // vclock {node_c: n}
-
-        // Converge all state into `limiter`.
-        limiter.accept_delta_state(&limiter_b.gossip_delta_state());
-        limiter.accept_delta_state(&limiter_c.gossip_delta_state());
-
-        // The summary vclock must cover all three actor slots.
-        let summary = limiter.get_latest_updated_vclock();
-
-        // The summary must dominate each individual bucket vclock.
-        for ext in limiter.full_state_dump() {
-            let bucket_vc = ext.counter.vclock;
-            assert!(
-                matches!(
-                    summary.partial_cmp(&bucket_vc),
-                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
-                ),
-                "summary vclock must dominate every bucket vclock; \
-                 summary={:?} did not dominate bucket={:?}",
-                summary,
-                bucket_vc
-            );
-        }
-
-        // Specifically: the summary must not be concurrent with any peer's
-        // individual bucket vclock. If it were, heartbeat comparisons would
-        // produce None and trigger spurious StateRequests.
-        let b_vc = limiter_b.get_latest_updated_vclock();
-        let c_vc = limiter_c.get_latest_updated_vclock();
-
-        assert!(
-            summary.partial_cmp(&b_vc).is_some(),
-            "summary must not be concurrent with node_b's vclock after convergence"
-        );
-        assert!(
-            summary.partial_cmp(&c_vc).is_some(),
-            "summary must not be concurrent with node_c's vclock after convergence"
-        );
-    }
-
     /// Regression (found by tests/hegel_gossip.rs): receiving a peer's delta for
     /// a client must not swallow this node's own not-yet-gossiped write for that
     /// client. The next delta must still carry it.
@@ -1441,30 +1405,6 @@ mod tests {
         assert!(
             peer.gossip_delta_state().is_empty(),
             "a denied request must not change gossiped state"
-        );
-    }
-
-    /// Regression (found by tests/hegel_gossip.rs): when a delta is lost, the
-    /// heartbeat digest must still reveal the gap. With an element-wise-max
-    /// digest, the writer's later dot on another client masked the missing one.
-    #[test]
-    fn test_heartbeat_digest_reveals_lost_delta() {
-        let settings = test_settings();
-        let mut writer = DistributedBucketLimiter::new(node_id(), settings.clone());
-        let mut peer = DistributedBucketLimiter::new(NodeName::from("b").node_id(), settings);
-
-        writer.limit_calls_for_client("alice".to_string());
-        let _lost = writer.gossip_delta_state();
-        writer.limit_calls_for_client("bob".to_string());
-        peer.accept_delta_state(&writer.gossip_delta_state());
-
-        let peer_digest = peer.get_latest_updated_vclock();
-        let writer_digest = writer.get_latest_updated_vclock();
-        assert_eq!(
-            peer_digest.partial_cmp(&writer_digest),
-            Some(std::cmp::Ordering::Less),
-            "peer missing alice must see itself behind the writer: \
-             peer={peer_digest:?} writer={writer_digest:?}"
         );
     }
 

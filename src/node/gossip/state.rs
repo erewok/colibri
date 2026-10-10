@@ -2,10 +2,8 @@
 //! `GossipController` adds the UDP transport; tests drive this directly.
 //! Named rules are gossiped exactly like the default rule.
 
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use crdts::VClock;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ColibriError, Result};
@@ -36,22 +34,37 @@ pub struct RulesReply {
     pub request_state: bool,
 }
 
+/// Clients are split into this many partitions for anti-entropy.
+pub const PARTITIONS: u16 = 64;
+
+/// The anti-entropy partition of `client` (FNV-1a, stable across processes).
+pub fn partition_of(client: &str) -> u16 {
+    (fnv1a(client.as_bytes()) % u64::from(PARTITIONS)) as u16
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// What a heartbeat tells peers about the sender's state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeartbeatDigest {
-    /// The sender, so peers learn of its incarnation.
-    pub actor: ActorId,
-    /// Per-node write counts summed over every bucket of every rule.
-    pub buckets: VClock<ActorId>,
+    /// The newest incarnation the sender knows of each node, so peers agree
+    /// on which processes are dead.
+    pub incarnations: Vec<ActorId>,
+    /// A hash of each partition's live buckets.
+    pub partitions: Vec<u64>,
     /// `RuleConfig::digest` of the sender's rule configuration.
     pub rules: u64,
 }
 
 /// What a node should do about a peer's heartbeat.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeartbeatReply {
-    /// The peer has bucket state this node lacks.
-    pub pull_state: bool,
+    /// Partitions whose state differs: pull the peer's and push ours.
+    pub partitions: Vec<u16>,
     /// Rule configs differ: send ours to the peer (it does the same in turn).
     pub push_rules: bool,
 }
@@ -267,6 +280,18 @@ impl GossipState {
             .collect()
     }
 
+    /// The buckets of every rule in `partitions`.
+    pub fn partition_state(&self, partitions: &[u16]) -> Vec<RuleBuckets> {
+        let mut state = self.full_state();
+        for update in &mut state {
+            update
+                .buckets
+                .retain(|b| partitions.contains(&partition_of(&b.client_id)));
+        }
+        state.retain(|update| !update.buckets.is_empty());
+        state
+    }
+
     /// Merge a peer's buckets, ignoring rules (or rule versions) this node doesn't have.
     pub fn accept(&mut self, updates: &[RuleBuckets]) {
         for update in updates {
@@ -279,42 +304,37 @@ impl GossipState {
         }
     }
 
+    /// Partition hashes sum each bucket's hash, so they don't depend on order.
     pub fn digest(&self) -> HeartbeatDigest {
-        let mut buckets = VClock::new();
-        for limiter in self.limiters.values() {
-            for (actor, count) in limiter.get_latest_updated_vclock().dots {
-                let total = buckets.dots.entry(actor).or_insert(0);
-                *total = total.saturating_add(count);
+        let mut partitions = vec![0u64; usize::from(PARTITIONS)];
+        for (rule, limiter) in &self.limiters {
+            let version = self.versions.get(rule);
+            for (client, slots) in limiter.digest_slots() {
+                let bytes =
+                    postcard::to_allocvec(&(rule, version, &client, slots)).unwrap_or_default();
+                let partition = &mut partitions[usize::from(partition_of(&client))];
+                *partition = partition.wrapping_add(fnv1a(&bytes));
             }
         }
         HeartbeatDigest {
-            actor: self.actor,
-            buckets,
+            incarnations: self.incarnations.newest(),
+            partitions,
             rules: self.rules.digest(),
         }
     }
 
-    /// Decide what to do about a peer's heartbeat.
-    /// Dead processes' slots are ignored: we may have compacted them away.
+    /// Decide what to do about a peer's heartbeat: which partitions to
+    /// exchange, after learning which processes it knows are dead.
     pub fn on_heartbeat(&mut self, peer: &HeartbeatDigest) -> HeartbeatReply {
-        self.incarnations.note(peer.actor);
+        for &actor in &peer.incarnations {
+            self.incarnations.note(actor);
+        }
         let ours = self.digest();
-        let live = |clock: &VClock<ActorId>| VClock {
-            dots: clock
-                .dots
-                .iter()
-                .filter(|(a, _)| !self.incarnations.is_dead(**a))
-                .map(|(a, n)| (*a, *n))
-                .collect(),
-        };
-        let peer_buckets = live(&peer.buckets);
-        let pull_state = !peer_buckets.is_empty()
-            && matches!(
-                live(&ours.buckets).partial_cmp(&peer_buckets),
-                Some(Ordering::Less) | None
-            );
+        let partitions = (0..PARTITIONS)
+            .filter(|&p| ours.partitions.get(usize::from(p)) != peer.partitions.get(usize::from(p)))
+            .collect();
         HeartbeatReply {
-            pull_state,
+            partitions,
             push_rules: peer.rules != ours.rules,
         }
     }

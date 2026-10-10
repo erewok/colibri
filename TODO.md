@@ -3,7 +3,7 @@
 - [x] Add gossip-based system for propagating cluster state
 - [x] Add tests
 - [x] Make it possible to setup a rate-limiter key that diverges from settings
-- [x] Consistent hashing should offer replication.
+- [ ] Hashring: replicate each client's bucket to its ring neighbours. Replication existed (#7) but was removed in #9; only the unused `get_neighbor_bucket` remains, so each client lives on one node.
 - [ ] Alternatives for config: config files and env vars. Make a config file and use that for both *launching* a node *and* admin commands for all nodes.
 - [ ] Add deployment infra: config-file and kubernetes resource definitions
 - [ ] Snapshot node state to persistent storage and reload on crash
@@ -11,18 +11,17 @@
 - [ ] Fix config-file loading: `colibri.toml` values are overridden by CLI defaults (merged after the file), and `--name` is required before the file is read.
 - [x] Gossip: restarting a node under the same name over-admits; calls admitted before the first sync are credited back twice when they expire.
 - [x] Gossip: split delta and anti-entropy state across UDP datagrams (`--gossip-max-packet-bytes`, default 1400).
-- [ ] Gossip: partition anti-entropy (per-partition digests in heartbeats; pull only the partitions that differ) so a behind node doesn't pull every client in one burst.
+- [x] Gossip: partitioned anti-entropy: heartbeats hash 64 client partitions; nodes push and pull only the partitions that differ.
 - [x] Gossip: free idle client state (`GossipNode::expire_keys` is a no-op), without breaking the single-writer CRDT discipline.
 - [x] Gossip: expire requests from a node that is removed for good (peers retire a slot that has sat unchanged for a window).
 - [x] Hashring: free idle client buckets (`HashringNode::expire_keys` is a no-op).
-- [ ] Hashring: replication is not implemented; `get_neighbor_bucket` exists but nothing uses it, so each client lives on one node.
 - [ ] Implement `colibri-admin export-buckets` / `import-buckets` (currently stubs), and make `colibri-admin` work with gossip nodes.
 - [ ] Expose runtime membership changes (`AddNode`/`RemoveNode` messages exist but nothing can send them).
 - [ ] Graceful shutdown on SIGTERM (drain in-flight requests).
 - [ ] Authentication and TLS for the HTTP API and peer ports.
 - [ ] Metrics endpoint, and an option for JSON logs (the `tracing-subscriber` `json` feature is enabled but unused).
 - [x] Named rules reach every node (gossip and hashring) and get the same guarantees as the default rule.
-- [ ] Gossip: the heartbeat digest is skewed by which idle buckets a node still holds; use an equality digest, and push state back when a peer is behind.
+- [x] Gossip: the heartbeat digest ignores idle buckets, and a node pushes state back when a peer is behind.
 - [ ] Gossip: a bucket is dropped once its changes are sent, not delivered; a delayed relay can resurrect it on another node until anti-entropy repairs it.
 - [x] Gossip: each process is its own CRDT actor (node, incarnation), so restarts and duplicate names never reuse a slot.
 - [x] Named rules carry a version; a changed or recreated rule starts from zero everywhere.
@@ -31,9 +30,9 @@
 - [x] Gossip: incarnations are ordered by start time (seconds since 2020, plus 18 random bits).
 - [x] Gossip: compact retired slots of a node's older incarnations, so a busy client's state doesn't grow with restarts.
 - [ ] Gossip: compact the slots of a node removed for good (no newer incarnation ever appears); today they stay until the client goes idle.
-- [ ] Gossip: the heartbeat digest sums per-actor counts across buckets, so different states can produce equal sums; hash each bucket's vclock instead.
+- [x] Gossip: the heartbeat digest hashes each bucket's slots, so different states don't produce equal digests (barring hash collisions).
 - [ ] Gossip: a create on a node that never saw an earlier delete can lose to that delete (last-write-wins), so the rule silently disappears.
 - [ ] Gossip: deleted-rule tombstones are never garbage-collected, and `RuleConfigSync` is a single datagram.
 - [ ] Cluster messages: prefix a magic number before the protocol version, so an unversioned (older) message can't be misread.
 - [ ] Hashring: nodes with different topology views can briefly both own a client, and moved clients start fresh at the new owner.
-- [ ] TLA+: model the controller relay, datagram size limits, per-process clock drift, and the hashring; a receiver dating a merged slot by the sender alone (not the later of the two) isn't caught at current bounds.
+- [ ] TLA+: model the controller relay, datagram size limits, partition digests (push-pull is abstracted as any-time merges), per-process clock drift, and the hashring; a receiver dating a merged slot by the sender alone (not the later of the two) isn't caught at current bounds.

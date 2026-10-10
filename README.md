@@ -22,7 +22,7 @@ One primary design goal for this project is as mentioned above: **Colibri remain
 
 This project's status is considered **experimental**. I do not run it in production yet. It has the following major issues to solve:
 
-- Gossip anti-entropy resends every active client when a node falls behind, in one burst of datagrams (see [deploy.md](deploy.md)).
+- Gossip: a node that starts or rejoins receives every active client in one burst of datagrams (see [deploy.md](deploy.md)).
 - Crash-and-reload is not implemented
 - No upgrade paths (we have planned an admin command).
 - No authentication or TLS, no metrics, no graceful shutdown

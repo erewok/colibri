@@ -82,6 +82,9 @@ On each tick (`--gossip-interval-ms`, default 1000), a node sends its changes to
 
 - **Keep the tick well under the rate-limit interval.** With a 2-second interval and the default 1-second tick, changes sometimes arrive too late to matter. For example, the demo uses 250 ms ticks.
 - **Raise the fanout as the cluster grows**, so changes still reach every node in a few ticks.
+- **`--gossip-max-packet-bytes`** (default 1400) caps each gossip datagram; a tick's changes are split across as many datagrams as they need. The default fits a standard Ethernet frame without IP fragmentation, so a lost fragment never drops a whole datagram. Raise it on networks with larger frames (for example 8900 with jumbo frames) to send fewer datagrams.
+
+**Anti-entropy.** A node that has nothing new to send on a tick sends a heartbeat instead: a hash of each of 64 client partitions, plus the newest process it knows of each node. A peer whose hash for a partition differs sends back its copy of that partition and asks for the sender's, so lost datagrams are repaired one partition at a time. A node that is behind on everything, such as one that just started, receives every active client at once, about 700 datagrams for 10,000 clients. Datagrams its socket buffer drops are repaired on later heartbeats; raise the buffer (`net.core.rmem_max` and `rmem_default` on Linux) to make that rarer.
 
 ### Restarting a Gossip Node
 
@@ -91,11 +94,11 @@ Until a restarted node has heard from its peers, it doesn't know about their cal
 
 ### Current Limitations
 
-**Anti-entropy sends every client.** Gossip state is split into datagrams of at most `--gossip-max-packet-bytes` (default 1400, which fits a standard Ethernet frame without fragmenting). A client takes about 90 bytes in a 3-node cluster when one node serves it, and about 190 bytes when all three do, so a 1400-byte datagram carries 7 to 15 clients. A restarted process's entry is dropped about a window after the restart; a node removed for good keeps its entry until the client goes idle. A node that falls behind pulls the full state of every active client in one burst, for example about 700 datagrams for 10,000 clients. If the receiver's socket buffer overflows, the lost datagrams are retried on the next heartbeat. Raise the buffer (`net.core.rmem_max` and `rmem_default` on Linux) for large client counts.
+**Traffic grows with active clients.** Each tick sends every client whose count changed since the last tick to each fanout peer. A client takes about 90 bytes when one node serves it and about 190 bytes when three do, so 10,000 clients active every tick cost roughly 1-2 MB per peer per tick. A restarted process's entry in a client's state is dropped about a window after the restart; a node removed for good keeps its entry until the client goes idle.
 
 Each node forgets a client once nothing for it is live, on any node it has heard from. That is usually within an interval plus a few gossip ticks of the client's last call, so memory and message size track active clients, not every client ever seen.
 
-Gossip mode currently suits a small set of keys, such as per-tenant or per-route limits, rather than per-end-user limits.
+Gossip mode suits limits whose keys number in the thousands, such as per-tenant or per-route limits. For per-end-user limits with many active users, hashring mode sends far less traffic.
 
 ## Hashring Mode
 

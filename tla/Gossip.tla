@@ -21,7 +21,8 @@
 \*   ConsumeAt(n)     admit a request (rebasing an unused own slot first)
 \*   ExpireAt(n)      age out n's own requests: exps := reqs - still tracked
 \*   RetireAt(n, a)   expire another actor's slot unchanged for a window
-\*   CompactAt(n, a)  forget an idle slot of a dead incarnation
+\*   CompactAt(n, a)  forget an idle slot of a dead incarnation (tombstoned)
+\*   ExpireTombAt(n,a) drop a compaction tombstone after a window
 \*   GossipMerge(m,n) merge m's state (with its change ticks) into n, or adopt it
 \*   DropAt(n)        forget an idle bucket
 \*   RestartAt(n)     lose all state and start a new incarnation
@@ -61,6 +62,7 @@ VARIABLES
     present,     \* present[n] : n holds the bucket
     inc,         \* inc[n] : n's current incarnation
     dropHigh,    \* dropHigh[n] : highest own value in a bucket this process dropped
+    tomb,        \* tomb[n][a] : <<requests, tick>> of a compacted slot, or <<0, 0>>
     tick,
     totalOps,
     restarts,
@@ -69,7 +71,7 @@ VARIABLES
     lastWrite,   \* ghost: lastWrite[a] = tick of actor a's last write
     seen         \* ghost: seen[n][a] = highest reqs[n][a] since n's process started
 
-vars == <<reqs, exps, changed, opLog, present, inc, dropHigh, tick, totalOps,
+vars == <<reqs, exps, changed, opLog, present, inc, dropHigh, tomb, tick, totalOps,
           restarts, hw, admits, lastWrite, seen>>
 
 \* ---------------------------------------------------------------------------
@@ -79,6 +81,7 @@ vars == <<reqs, exps, changed, opLog, present, inc, dropHigh, tick, totalOps,
 Max(x, y) == IF x >= y THEN x ELSE y
 EWMax(f, g) == [a \in DOMAIN f |-> Max(f[a], g[a])]
 ZeroRow == [a \in Actors |-> 0]
+NoTombs == [a \in Actors |-> <<0, 0>>]
 
 RECURSIVE SumOver(_, _)
 SumOver(f, S) ==
@@ -117,6 +120,7 @@ Init ==
     /\ present  = [n \in Nodes |-> FALSE]
     /\ inc      = [n \in Nodes |-> 0]
     /\ dropHigh = [n \in Nodes |-> 0]
+    /\ tomb     = [n \in Nodes |-> NoTombs]
     /\ tick     = 0
     /\ totalOps = 0
     /\ restarts = 0
@@ -145,7 +149,7 @@ ConsumeAt(n) ==
     /\ hw'       = [hw EXCEPT ![a] = Max(@, r0 + 1)]
     /\ admits'   = [admits EXCEPT ![a] = @ \cup {<<r0 + 1, tick>>}]
     /\ lastWrite' = [lastWrite EXCEPT ![a] = tick]
-    /\ UNCHANGED <<changed, inc, dropHigh, tick, restarts>>
+    /\ UNCHANGED <<changed, inc, dropHigh, tomb, tick, restarts>>
 
 \* ---------------------------------------------------------------------------
 \* ExpireAt(n): age out n's own requests. Absolute: expiries become requests
@@ -161,7 +165,7 @@ ExpireAt(n) ==
     /\ exps'  = [exps EXCEPT ![n][a] = Max(@, target)]
     /\ hw'    = [hw EXCEPT ![a] = Max(@, Max(exps[n][a], target))]
     /\ lastWrite' = [lastWrite EXCEPT ![a] = tick]
-    /\ UNCHANGED <<reqs, changed, present, inc, dropHigh, tick, totalOps, restarts, admits>>
+    /\ UNCHANGED <<reqs, changed, present, inc, dropHigh, tomb, tick, totalOps, restarts, admits>>
 
 \* ---------------------------------------------------------------------------
 \* RetireAt(n, a): expire another actor's slot that has not changed here for
@@ -173,12 +177,12 @@ RetireAt(n, a) ==
     /\ reqs[n][a] > exps[n][a]
     /\ changed[n][a] + AgeingWindow < tick
     /\ exps' = [exps EXCEPT ![n][a] = reqs[n][a]]
-    /\ UNCHANGED <<reqs, changed, opLog, present, inc, dropHigh, tick, totalOps,
+    /\ UNCHANGED <<reqs, changed, opLog, present, inc, dropHigh, tomb, tick, totalOps,
                    restarts, hw, admits, lastWrite>>
 
 \* ---------------------------------------------------------------------------
 \* CompactAt(n, a): forget the idle slot of an incarnation older than its
-\* node's current one. A merge may bring it back.
+\* node's current one, keeping a tombstone so merges don't bring it back.
 \* ---------------------------------------------------------------------------
 CompactAt(n, a) ==
     /\ present[n]
@@ -187,7 +191,16 @@ CompactAt(n, a) ==
     /\ reqs[n][a] = exps[n][a]
     /\ reqs' = [reqs EXCEPT ![n][a] = 0]
     /\ exps' = [exps EXCEPT ![n][a] = 0]
+    /\ tomb' = [tomb EXCEPT ![n][a] = <<reqs[n][a], tick>>]
     /\ UNCHANGED <<changed, opLog, present, inc, dropHigh, tick, totalOps,
+                   restarts, hw, admits, lastWrite>>
+
+\* ExpireTombAt(n, a): drop a tombstone a window after the compaction.
+ExpireTombAt(n, a) ==
+    /\ tomb[n][a] # <<0, 0>>
+    /\ tomb[n][a][2] + AgeingWindow < tick
+    /\ tomb' = [tomb EXCEPT ![n][a] = <<0, 0>>]
+    /\ UNCHANGED <<reqs, exps, changed, opLog, present, inc, dropHigh, tick, totalOps,
                    restarts, hw, admits, lastWrite>>
 
 \* ---------------------------------------------------------------------------
@@ -197,13 +210,16 @@ CompactAt(n, a) ==
 \* ---------------------------------------------------------------------------
 GossipMerge(m, n) ==
     LET a  == Self(n)
-        r  == IF present[n] THEN EWMax(reqs[n], reqs[m]) ELSE reqs[m]
-        e1 == IF present[n] THEN EWMax(exps[n], exps[m]) ELSE exps[m]
+        Kept(b) == reqs[m][b] > tomb[n][b][1]
+        rm == [b \in Actors |-> IF Kept(b) THEN reqs[m][b] ELSE 0]
+        em == [b \in Actors |-> IF Kept(b) THEN exps[m][b] ELSE 0]
+        r  == IF present[n] THEN EWMax(reqs[n], rm) ELSE rm
+        e1 == IF present[n] THEN EWMax(exps[n], em) ELSE em
         e  == [e1 EXCEPT ![a] = Max(@, r[a] - Len(opLog[n]))]
     IN
     /\ m # n
     /\ present[m]
-    /\ IF ~present[n] /\ Idle(reqs[m], exps[m])
+    /\ IF ~present[n] /\ Idle(rm, em)
        THEN UNCHANGED <<reqs, exps, changed, present, hw>>
        ELSE /\ reqs'    = [reqs EXCEPT ![n] = r]
             /\ exps'    = [exps EXCEPT ![n] = e]
@@ -215,7 +231,7 @@ GossipMerge(m, n) ==
                                 ELSE changed[n][b]]]
             /\ present' = [present EXCEPT ![n] = TRUE]
             /\ hw'      = [hw EXCEPT ![a] = Max(@, e[a])]
-    /\ UNCHANGED <<opLog, inc, dropHigh, tick, totalOps, restarts, admits, lastWrite>>
+    /\ UNCHANGED <<opLog, inc, dropHigh, tomb, tick, totalOps, restarts, admits, lastWrite>>
 
 \* ---------------------------------------------------------------------------
 \* DropAt(n): forget an idle bucket, remembering the own slot's high value.
@@ -224,11 +240,12 @@ DropAt(n) ==
     /\ present[n]
     /\ opLog[n] = <<>>
     /\ Idle(reqs[n], exps[n])
+    /\ tomb[n] = NoTombs
     /\ dropHigh' = [dropHigh EXCEPT ![n] = Max(@, OwnHigh(n))]
     /\ reqs'     = [reqs EXCEPT ![n] = ZeroRow]
     /\ exps'     = [exps EXCEPT ![n] = ZeroRow]
     /\ present'  = [present EXCEPT ![n] = FALSE]
-    /\ UNCHANGED <<changed, opLog, inc, tick, totalOps, restarts, hw, admits, lastWrite>>
+    /\ UNCHANGED <<changed, opLog, inc, tomb, tick, totalOps, restarts, hw, admits, lastWrite>>
 
 \* ---------------------------------------------------------------------------
 \* RestartAt(n): lose all state; the new process is a new actor.
@@ -243,18 +260,19 @@ RestartAt(n) ==
     /\ opLog'    = [opLog EXCEPT ![n] = <<>>]
     /\ present'  = [present EXCEPT ![n] = FALSE]
     /\ dropHigh' = [dropHigh EXCEPT ![n] = 0]
+    /\ tomb'     = [tomb EXCEPT ![n] = NoTombs]
     /\ restarts' = restarts + 1
     /\ UNCHANGED <<tick, totalOps, hw, admits, lastWrite>>
 
 Tick ==
     /\ tick < MaxTicks
     /\ tick' = tick + 1
-    /\ UNCHANGED <<reqs, exps, changed, opLog, present, inc, dropHigh, totalOps,
+    /\ UNCHANGED <<reqs, exps, changed, opLog, present, inc, dropHigh, tomb, totalOps,
                    restarts, hw, admits, lastWrite>>
 
 Actions ==
     \/ \E n \in Nodes : ConsumeAt(n) \/ ExpireAt(n) \/ DropAt(n) \/ RestartAt(n)
-    \/ \E n \in Nodes, a \in Actors : RetireAt(n, a) \/ CompactAt(n, a)
+    \/ \E n \in Nodes, a \in Actors : RetireAt(n, a) \/ CompactAt(n, a) \/ ExpireTombAt(n, a)
     \/ \E m, n \in Nodes : GossipMerge(m, n)
     \/ Tick
 
@@ -277,6 +295,7 @@ TypeOK ==
     /\ present  \in [Nodes -> BOOLEAN]
     /\ inc      \in [Nodes -> 0..MaxRestarts]
     /\ dropHigh \in [Nodes -> Nat]
+    /\ tomb     \in [Nodes -> [Actors -> Nat \X Nat]]
 
 \* No release before ageing: a node never counts one of an actor's requests
 \* as expired (value <= its expiry count) before that request has aged out.

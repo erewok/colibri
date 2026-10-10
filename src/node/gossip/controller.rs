@@ -17,7 +17,7 @@ use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::{UdpReceiver, UdpTransport};
 
 use super::messages::delta_packets;
-use super::state::{GossipState, HeartbeatDigest, RuleBuckets, TickOutput};
+use super::state::{GossipState, HeartbeatDigest, PARTITIONS, RuleBuckets, TickOutput};
 use super::{GossipMessage, GossipPacket};
 
 /// Maximum number of recent packet IDs kept for receive-side deduplication.
@@ -472,8 +472,8 @@ impl GossipController {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                actor: digest.actor,
-                vclock: digest.buckets,
+                incarnations: digest.incarnations,
+                partitions: digest.partitions,
                 rules_digest: digest.rules,
                 response_addr: self.response_addr,
             },
@@ -519,7 +519,7 @@ impl GossipController {
                     GossipMessage::StateRequest {
                         requesting_node_id,
                         response_addr: requester_addr,
-                        ..
+                        partitions,
                     } => {
                         // Don't respond to our own requests (shouldn't happen but guard anyway)
                         if requesting_node_id == self.node_id {
@@ -531,12 +531,10 @@ impl GossipController {
                             self.node_id, requesting_node_id
                         );
 
-                        let state = self.with_state(|state| state.full_state())?;
+                        let state = self.with_state(|state| state.partition_state(&partitions))?;
 
                         if !state.is_empty() {
-                            // Respond with DeltaStateSyncs; the receiver relays them
-                            // once more (propagation_factor 1).
-                            for packet in self.delta_packets(state, self.node_id, 1) {
+                            for packet in self.delta_packets(state, self.node_id, 0) {
                                 if let Err(e) =
                                     self.send_gossip_packet_to(requester_addr, packet).await
                                 {
@@ -581,8 +579,8 @@ impl GossipController {
                     GossipMessage::Heartbeat {
                         node_id: heartbeat_node_id,
                         timestamp: _,
-                        actor,
-                        vclock,
+                        incarnations,
+                        partitions,
                         rules_digest,
                         response_addr: peer_response_addr,
                     } => {
@@ -591,20 +589,35 @@ impl GossipController {
                             return Ok(());
                         }
                         let peer = HeartbeatDigest {
-                            actor,
-                            buckets: vclock,
+                            incarnations,
+                            partitions,
                             rules: rules_digest,
                         };
                         let reply = self.with_state(|state| state.on_heartbeat(&peer))?;
 
-                        if reply.pull_state {
+                        if !reply.partitions.is_empty() {
                             info!(
-                                "[GOSSIP_ANTI_ENTROPY] node:{} behind peer:{}, sending StateRequest to {}",
-                                self.node_id, heartbeat_node_id, peer_response_addr
+                                "[GOSSIP_ANTI_ENTROPY] node:{} differs from peer:{} in {} partitions",
+                                self.node_id,
+                                heartbeat_node_id,
+                                reply.partitions.len()
                             );
+                            // Push ours: a busy peer never heartbeats, so it can't pull.
+                            let ours =
+                                self.with_state(|state| state.partition_state(&reply.partitions))?;
+                            for packet in self.delta_packets(ours, self.node_id, 0) {
+                                if let Err(e) =
+                                    self.send_gossip_packet_to(peer_response_addr, packet).await
+                                {
+                                    warn!(
+                                        "[{}] Failed to push state to {}: {}",
+                                        self.node_id, peer_response_addr, e
+                                    );
+                                }
+                            }
                             let request = GossipMessage::StateRequest {
                                 requesting_node_id: self.node_id,
-                                missing_keys: None,
+                                partitions: reply.partitions,
                                 response_addr: self.response_addr,
                             };
                             if let Err(e) = self
@@ -669,7 +682,7 @@ impl GossipController {
                         if reply.request_state {
                             let request = GossipMessage::StateRequest {
                                 requesting_node_id: self.node_id,
-                                missing_keys: None,
+                                partitions: (0..PARTITIONS).collect(),
                                 response_addr: self.response_addr,
                             };
                             if let Err(e) = self

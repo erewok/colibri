@@ -7,6 +7,7 @@
 pub mod controller;
 pub mod gossip_node;
 pub mod messages;
+pub mod state;
 
 pub use controller::GossipController;
 pub use gossip_node::GossipNode;

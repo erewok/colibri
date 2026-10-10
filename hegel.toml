@@ -1,0 +1,12 @@
+# Settings for the hegel property tests in tests/hegel_*.rs.
+# Override per run with HEGEL_TEST_CASES, HEGEL_SEED, or HEGEL_DEFAULT_PROFILE.
+
+[profiles.development]
+test_cases = 300
+
+[profiles.ci]
+test_cases = 1000
+
+# Long exploratory run: `just test-deep`
+[profiles.deep]
+test_cases = 20000

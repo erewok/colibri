@@ -22,24 +22,28 @@ build *args:
 check:
     #!/bin/bash -eux
     cargo check
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
     cargo fmt --all -- --check
 
 # Run code formatting
 fmt:
     cargo fmt
 
-# Run API Server (single-node mode)
+# Run API Server (single-node mode, HTTP on port 8411)
 run:
-    cargo run
+    cargo run -- --name local-node
 
 # Run API Server on specific port (single-node mode)
 run-port port:
-    cargo run -- --listen-port {{port}}
+    cargo run -- --name local-node --client-listen-port {{port}}
 
 # Run a demo: single, hashring, or gossip
 demo mode="single":
     bash demo/{{mode}}.sh
+
+# Run a demo's validations, stop the nodes, and exit with the verdict
+demo-check mode="single":
+    DEMO_EXIT=1 bash demo/{{mode}}.sh
 
 # Test multi-node cluster (assumes cluster is running)
 test-cluster:
@@ -67,6 +71,10 @@ test *args:
     cargo nextest run {{args}}
     # Doctests next
     cargo test --doc
+
+# Run the hegel property tests with many more cases (see hegel.toml)
+test-deep *args:
+    HEGEL_DEFAULT_PROFILE=deep cargo nextest run --test 'hegel_*' {{args}}
 
 # Run benchmarks (full execution)
 bench:

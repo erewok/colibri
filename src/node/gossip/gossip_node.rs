@@ -97,7 +97,7 @@ impl Node for GossipNode {
         let message = Message::RateLimitRequest(request);
 
         match self.controller.handle_message(message).await? {
-            Message::RateLimitResponse(response) => Ok(Some(response)),
+            Message::RateLimitResponse(response) => Ok(response),
             _ => Err(ColibriError::Node(
                 "Unexpected response from controller".to_string(),
             )),
@@ -115,13 +115,7 @@ impl Node for GossipNode {
         let message = Message::RateLimitRequest(request);
 
         match self.controller.handle_message(message).await? {
-            Message::RateLimitResponse(response) => {
-                if response.calls_remaining > 0 {
-                    Ok(Some(response))
-                } else {
-                    Ok(None)
-                }
-            }
+            Message::RateLimitResponse(response) => Ok(response),
             _ => Err(ColibriError::Node(
                 "Unexpected response from controller".to_string(),
             )),
@@ -141,7 +135,7 @@ impl Node for GossipNode {
         let message = Message::RateLimitRequest(request);
 
         match self.controller.handle_message(message).await? {
-            Message::RateLimitResponse(response) => Ok(Some(response)),
+            Message::RateLimitResponse(response) => Ok(response),
             _ => Err(ColibriError::Node(
                 "Unexpected response from controller".to_string(),
             )),
@@ -161,13 +155,7 @@ impl Node for GossipNode {
         let message = Message::RateLimitRequest(request);
 
         match self.controller.handle_message(message).await? {
-            Message::RateLimitResponse(response) => {
-                if response.calls_remaining > 0 {
-                    Ok(Some(response))
-                } else {
-                    Ok(None)
-                }
-            }
+            Message::RateLimitResponse(response) => Ok(response),
             _ => Err(ColibriError::Node(
                 "Unexpected response from controller".to_string(),
             )),
@@ -176,7 +164,7 @@ impl Node for GossipNode {
 
     /// Expire keys from local buckets
     async fn expire_keys(&self) -> Result<()> {
-        Ok(())
+        self.controller.expire_keys()
     }
 
     // Configurable rate limit methods
@@ -377,5 +365,19 @@ mod tests {
         // Test stop_all_tasks method
         node.stop_all_tasks();
         assert!(node.controller.msg_eval_handle.lock().unwrap().is_none());
+    }
+
+    /// Regression (found by the demo scripts): the request that takes the last
+    /// token is admitted with 0 remaining, not reported as rate limited.
+    #[tokio::test]
+    async fn test_last_token_is_admitted() {
+        let mut settings = settings::tests::sample();
+        settings.rate_limit_max_calls_allowed = 1;
+        let node = GossipNode::new(settings).await.unwrap();
+        let client_id = "last_token_client".to_string();
+
+        let first = node.rate_limit(client_id.clone()).await.unwrap();
+        assert_eq!(first.map(|r| r.calls_remaining), Some(0));
+        assert!(node.rate_limit(client_id).await.unwrap().is_none());
     }
 }

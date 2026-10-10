@@ -1,54 +1,29 @@
 //! Distributed token bucket using CRDT for eventual consistency
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crdts::{CmRDT, CvRDT, PNCounter, ResetRemove, VClock};
+use crdts::pncounter::{Dir, Op};
+use crdts::{CmRDT, CvRDT, Dot, PNCounter, ResetRemove, VClock};
 use num_bigint::BigInt;
 use num_traits::cast::ToPrimitive;
 use papaya::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::clock::monotonic_ms;
 use crate::limiters::token_bucket::Bucket;
-use crate::node::NodeId;
+use crate::node::{ActorId, NodeId};
 use crate::settings;
 
-/// Monotonic millisecond clock for all elapsed-time decisions in `DistributedBucket`.
-///
-/// Backed by `std::time::Instant`, which is guaranteed not to go backwards
-/// regardless of NTP corrections, leap seconds, or operator clock resets.
-/// The epoch is anchored at the first call (effectively process start) and is
-/// process-local — values are not meaningful across process restarts or node
-/// boundaries. That is fine: `DistributedBucket` state is in-memory only, and
-/// the fields that use this clock (`last_call`, `InternalRequestEntry::timestamp_ms`)
-/// are never included in the gossip wire format.
-///
-/// `TokenBucket` intentionally retains wall-clock time because its `last_call`
-/// field *is* serialized and imported by other nodes in cluster mode, where
-/// cross-node timestamp comparability matters.
-static PROCESS_START: OnceLock<Instant> = OnceLock::new();
-
-fn monotonic_ms() -> i64 {
-    PROCESS_START
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_millis() as i64
-}
-
-/// Distributed request counter using CRDT PN-counters
+/// Distributed request counter using CRDT PN-counters, one slot per actor
+/// (node process). Each actor writes only its own slot.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DistributedRequestCounter {
-    /// Origin metadata: the node that first created this counter.
-    ///
-    /// IMPORTANT: this field is **not** consulted when performing local writes.
-    /// The owning `DistributedBucket` holds `writer_node_id` separately, and all
-    /// mutation methods below take the writer identity as an explicit parameter.
-    /// Mixing these up would violate the GCounter single-writer-per-actor invariant
-    /// under concurrent cross-node updates.
+    /// Origin metadata: the node that first created this counter. Not used for writes.
     pub node_id: NodeId,
-    refills: PNCounter<NodeId>,
-    requests: PNCounter<NodeId>,
-    pub vclock: VClock<NodeId>,
+    requests: PNCounter<ActorId>,
+    pub vclock: VClock<ActorId>,
 }
 
 impl DistributedRequestCounter {
@@ -56,135 +31,148 @@ impl DistributedRequestCounter {
     pub fn new(node_id: NodeId) -> Self {
         Self {
             node_id,
-            refills: PNCounter::new(),
             requests: PNCounter::new(),
             vclock: VClock::new(),
         }
     }
 
-    /// Apply expiration decrements as the given `writer`. The caller is responsible
-    /// for passing the local node's identity — never the counter's origin `node_id`,
-    /// which may belong to a remote node if this bucket was adopted via gossip.
-    fn expire_op_steps(&mut self, writer: NodeId, op: &InternalPnCounterOp) {
-        match op {
-            InternalPnCounterOp::Fills(steps) => {
-                let op = self.refills.dec_many(writer, *steps);
-                self.refills.apply(op);
-            }
-            InternalPnCounterOp::Requests(steps) => {
-                let op = self.requests.dec_many(writer, *steps);
-                self.requests.apply(op);
-            }
-        }
-        let op = self.vclock.inc(writer);
-        self.vclock.apply(op);
-    }
-
-    pub fn inc_refills(&mut self, node_id: NodeId, amount: u64) {
-        let op = self.refills.inc_many(node_id, amount);
-        self.refills.apply(op);
-        let op = self.vclock.inc(node_id);
-        self.vclock.apply(op);
-    }
-
-    pub fn inc_request(&mut self, node_id: NodeId) {
-        let op = self.requests.inc(node_id);
+    pub fn inc_request(&mut self, actor: impl Into<ActorId>) {
+        let actor = actor.into();
+        let op = self.requests.inc(actor);
         self.requests.apply(op);
-        let op = self.vclock.inc(node_id);
+        let op = self.vclock.inc(actor);
         self.vclock.apply(op);
     }
 
+    /// `actor`'s slot as (requests, expiries).
+    pub fn slot(&self, actor: impl Into<ActorId>) -> (u64, u64) {
+        let actor = actor.into();
+        // `inc`/`dec` return the next dot, one past the current value.
+        let requests = self.requests.inc(actor).dot.counter - 1;
+        let expiries = self.requests.dec(actor).dot.counter - 1;
+        (requests, expiries)
+    }
+
+    /// Requests `actor`'s slot still counts as live.
+    pub fn outstanding(&self, actor: impl Into<ActorId>) -> u64 {
+        let (requests, expiries) = self.slot(actor);
+        requests.saturating_sub(expiries)
+    }
+
+    /// Highest value in `actor`'s slot (requests, expiries or vclock dot).
+    fn own_high(&self, actor: ActorId) -> u64 {
+        let (requests, expiries) = self.slot(actor);
+        requests.max(expiries).max(self.vclock.get(&actor))
+    }
+
+    /// Actors with a slot in this counter.
+    fn actors(&self) -> impl Iterator<Item = ActorId> + '_ {
+        self.vclock.dots.keys().copied()
+    }
+
+    /// Set `writer`'s requests, expiries and dot to `base` (> `own_high`), leaving nothing live.
+    fn rebase_own_slot(&mut self, writer: ActorId, base: u64) {
+        let dot = Dot::new(writer, base);
+        self.requests.apply(Op { dot, dir: Dir::Pos });
+        self.requests.apply(Op { dot, dir: Dir::Neg });
+        self.vclock.apply(dot);
+    }
+
+    /// Make `writer`'s slot count at most its `tracked` requests as live, by raising
+    /// its expiries to requests - tracked. Absolute, so a peer having already retired
+    /// some of them (see `retire`) is never counted twice.
+    fn expire_untracked(&mut self, writer: ActorId, tracked: u64) {
+        let (requests, expiries) = self.slot(writer);
+        let target = requests.saturating_sub(tracked);
+        if expiries < target {
+            self.requests.apply(Op {
+                dot: Dot::new(writer, target),
+                dir: Dir::Neg,
+            });
+            let op = self.vclock.inc(writer);
+            self.vclock.apply(op);
+        }
+    }
+
+    /// Expire everything `actor`'s slot counts as live (see `DistributedBucket::retire_stale`).
+    fn retire(&mut self, actor: ActorId) {
+        let (requests, _) = self.slot(actor);
+        self.requests.apply(Op {
+            dot: Dot::new(actor, requests),
+            dir: Dir::Neg,
+        });
+    }
+
+    /// No actor has live requests (expiries never exceed requests per actor).
+    pub fn is_idle(&self) -> bool {
+        self.requests.read() == BigInt::from(0)
+    }
+
+    /// Net change to the bucket's capacity: minus the requests not yet expired.
     pub fn tokens(&self) -> BigInt {
-        let refills = self.refills.read();
-        let requests = self.requests.read();
-        let val = &refills - &requests;
-        debug!(
-            "Calculating tokens {}: refills={}, requests={}",
-            val, refills, requests
-        );
+        let val = -self.requests.read();
+        debug!("Calculating tokens {}", val);
         val
     }
 }
 
 // Operation-based CRDT implementation
 impl CmRDT for DistributedRequestCounter {
-    type Op = (
-        crdts::pncounter::Op<NodeId>,
-        crdts::pncounter::Op<NodeId>,
-        VClock<NodeId>,
-    );
-    type Validation = <PNCounter<NodeId> as CmRDT>::Validation;
+    type Op = (crdts::pncounter::Op<ActorId>, VClock<ActorId>);
+    type Validation = <PNCounter<ActorId> as CmRDT>::Validation;
 
     fn apply(&mut self, op: Self::Op) {
-        self.refills.apply(op.0);
-        self.requests.apply(op.1);
-        self.vclock.merge(op.2);
+        self.requests.apply(op.0);
+        self.vclock.merge(op.1);
     }
 
     fn validate_op(&self, op: &Self::Op) -> Result<(), Self::Validation> {
-        self.refills.validate_op(&op.0)?;
-        self.requests.validate_op(&op.1)?;
-        self.vclock.validate_merge(&op.2)?;
+        self.requests.validate_op(&op.0)?;
+        self.vclock.validate_merge(&op.1)?;
         Ok(())
     }
 }
 
 // State-based CRDT merge implementation
 impl CvRDT for DistributedRequestCounter {
-    type Validation = <PNCounter<NodeId> as CvRDT>::Validation;
+    type Validation = <PNCounter<ActorId> as CvRDT>::Validation;
 
     fn merge(&mut self, other: Self) {
-        // Apply other's state
-        self.refills.merge(other.refills);
         self.requests.merge(other.requests);
         self.vclock.merge(other.vclock);
     }
 
     fn validate_merge(&self, other: &Self) -> Result<(), Self::Validation> {
-        self.refills.validate_merge(&other.refills)?;
         self.requests.validate_merge(&other.requests)?;
         self.vclock.validate_merge(&other.vclock)?;
         Ok(())
     }
 }
 
-impl ResetRemove<NodeId> for DistributedRequestCounter {
-    fn reset_remove(&mut self, clock: &VClock<NodeId>) {
-        self.refills.reset_remove(clock);
+impl ResetRemove<ActorId> for DistributedRequestCounter {
+    fn reset_remove(&mut self, clock: &VClock<ActorId>) {
         self.requests.reset_remove(clock);
         self.vclock.reset_remove(clock);
     }
 }
 
 impl Default for DistributedRequestCounter {
-    /// Null node check; null-value is not used for NodeId
-    /// If this is a null node, it indicates a bucket that will never get updated.
-    /// However, this is required for the CRDT Default implementation.
     fn default() -> Self {
-        Self {
-            node_id: NodeId::default(),
-            refills: PNCounter::new(),
-            requests: PNCounter::new(),
-            vclock: VClock::new(),
-        }
+        Self::new(NodeId::default())
     }
 }
 
 /// Internal operation entry for tracking requests with timestamps and vector clocks
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Hash)]
 enum InternalPnCounterOp {
-    Fills(u64),
     Requests(u64),
 }
 
-/// We use these entries to expire old operations from the request tracker
-/// and then PN refills *and* requests for the expired entries.
-/// These types are internal-only and not serialized/gossiped.
+/// A request this node admitted and has not yet aged out. Local only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InternalRequestEntry {
     op: InternalPnCounterOp,
     timestamp_ms: i64,
-    vclock: VClock<NodeId>,
 }
 
 /// External representation for gossip protocol
@@ -193,78 +181,76 @@ pub struct DistributedBucketExternal {
     pub client_id: String,
     pub node_id: NodeId,
     pub counter: DistributedRequestCounter,
+    /// How long each actor's slot has been unchanged at the sender (ms), so a
+    /// receiver doesn't restart the countdown to retirement.
+    pub quiet_ms: BTreeMap<ActorId, u32>,
 }
 
-/// Convert external gossiped bucket into internal bucket
-/// Used when receiving gossiped state from other nodes
-/// when we've never seen this client before.
 impl DistributedBucketExternal {
-    /// Adopt a gossiped bucket into local state.
-    ///
-    /// `local_node_id` must be the receiving limiter's node id. It becomes the
-    /// adopted bucket's `writer_node_id`, so any subsequent local mutations write
-    /// into this node's own PNCounter actor slot rather than the sender's.
-    /// The origin `node_id` is preserved from the gossip message so that
-    /// `DistributedBucketLimiter::expire_keys` continues to refuse to GC buckets
-    /// this node did not create.
-    /// `max_calls` is the limiter's configured capacity. It is stored locally on
-    /// the bucket and never written into the CRDT (no immortal seed tokens).
-    fn bucket(&self, local_node_id: NodeId, max_calls: u32) -> DistributedBucket {
+    /// Adopt a gossiped bucket as `local` (the receiving limiter's actor).
+    /// `max_calls` is the local capacity; it is never written into the CRDT.
+    fn bucket(&self, local: ActorId, max_calls: u32) -> DistributedBucket {
+        let mut counter = self.counter.clone();
+        counter.expire_untracked(local, 0);
+        let now = monotonic_ms();
         DistributedBucket {
             node_id: self.node_id,
-            writer_node_id: local_node_id,
+            writer: local,
             max_calls,
-            counter: self.counter.clone(),
+            last_changed: counter.actors().map(|a| (a, now - self.quiet(a))).collect(),
+            counter,
             requests: Vec::new(),
-            last_call: monotonic_ms(),
-            // Initialise the watermark to the incoming state rather than VClock::new().
-            // A freshly-adopted bucket has nothing local to re-broadcast: the
-            // original sender already gossiped it. Only local writes that arrive
-            // *after* adoption should trigger a push.
+            // Watermark at the incoming state so a release still gets gossiped.
             last_gossiped_vclock: self.counter.vclock.clone(),
         }
+    }
+
+    fn quiet(&self, actor: ActorId) -> i64 {
+        let quiet = self.quiet_ms.get(&actor).copied().unwrap_or(0);
+        i64::from(quiet).min(monotonic_ms())
     }
 }
 
 #[derive(Clone, Debug)]
 struct DistributedBucket {
-    /// Origin identity: the node that first created this bucket. Used by
-    /// `DistributedBucketLimiter::expire_keys` to refuse GC of buckets adopted
-    /// from peers (we cannot trust foreign timestamps for expiration decisions).
+    /// Origin identity: the node that first created this bucket.
     pub node_id: NodeId,
-    /// Writer identity: the PNCounter actor slot this node writes into for this
-    /// bucket. Always the local limiter's node id, regardless of whether the
-    /// bucket was created locally or adopted from a gossip peer. Every call
-    /// into `DistributedRequestCounter` mutation methods must pass this value
-    /// as the writer — never `counter.node_id`, which may be a remote origin.
-    pub writer_node_id: NodeId,
-    /// The configured capacity for this bucket. Kept as a local constant and
-    /// never written into the CRDT (no immortal seed tokens).
-    ///
-    /// `tokens_to_u32()` returns `max_calls + counter.tokens()` so the full
-    /// capacity is visible at the API level without polluting gossip state.
-    /// All nodes must agree on this value via their rate-limit configuration.
+    /// The local actor: the only slot this node writes.
+    pub writer: ActorId,
+    /// Capacity, a local constant; `tokens_to_u32` adds it to the CRDT's net count.
     pub max_calls: u32,
     pub counter: DistributedRequestCounter,
     // internal state only: timestamps
     requests: Vec<InternalRequestEntry>,
-    last_call: i64,
     // vclock at the time this bucket was last included in a gossip batch
-    last_gossiped_vclock: VClock<NodeId>,
+    last_gossiped_vclock: VClock<ActorId>,
+    /// When each other actor's slot last changed here (monotonic ms).
+    last_changed: BTreeMap<ActorId, i64>,
 }
 
 impl DistributedBucket {
-    pub fn can_expire(&self, expiration_threshold_ms: i64) -> bool {
-        let now_ms = monotonic_ms();
-        for entry in self.requests.iter() {
-            if now_ms - (entry.timestamp_ms) <= expiration_threshold_ms {
-                // Found an entry that is still valid; cannot expire
-                return false;
-            }
+    fn created(max_calls: u32, writer: ActorId) -> Self {
+        Self {
+            node_id: writer.node,
+            writer,
+            max_calls,
+            counter: DistributedRequestCounter::new(writer.node),
+            requests: Vec::new(),
+            last_gossiped_vclock: VClock::new(),
+            last_changed: BTreeMap::new(),
         }
-        // All entries are expired
-        true
     }
+
+    /// Requests this node made that have not aged out yet.
+    fn tracked_requests(&self) -> u64 {
+        self.requests
+            .iter()
+            .map(|entry| match entry.op {
+                InternalPnCounterOp::Requests(steps) => steps,
+            })
+            .sum()
+    }
+
     pub fn has_updates_since_last_gossip(&self) -> bool {
         self.counter.vclock > self.last_gossiped_vclock
     }
@@ -273,110 +259,100 @@ impl DistributedBucket {
         self.last_gossiped_vclock = self.counter.vclock.clone();
     }
 
-    pub fn expire_entries(&mut self, expiration_threshold_ms: i64) {
-        let now_ms = monotonic_ms();
-        let mut entries_to_remove = Vec::new();
-        for (idx, entry) in self.requests.iter().enumerate() {
-            if now_ms - (entry.timestamp_ms) > expiration_threshold_ms {
-                // Expire this entry. Decrements go to the local writer slot —
-                // never to `counter.node_id`, which may point at a remote origin.
-                debug!(
-                    "Expiring entry {:?} from bucket for node {}: timestamp_ms={}, now_ms={}",
-                    entry, self.node_id, entry.timestamp_ms, now_ms
-                );
-                self.counter.expire_op_steps(self.writer_node_id, &entry.op);
-                entries_to_remove.push(idx);
+    /// Merge a peer's copy, noting which other actors' slots changed.
+    fn merge_from(&mut self, incoming: &DistributedBucketExternal) {
+        let before: Vec<(ActorId, (u64, u64))> = incoming
+            .counter
+            .actors()
+            .map(|a| (a, self.counter.slot(a)))
+            .collect();
+        self.counter.merge(incoming.counter.clone());
+        let now = monotonic_ms();
+        for (actor, slot) in before {
+            if actor != self.writer && self.counter.slot(actor) != slot {
+                // The new values last changed at the sender `quiet` ms ago.
+                let changed = now - incoming.quiet(actor);
+                let entry = self.last_changed.entry(actor).or_insert(changed);
+                *entry = (*entry).max(changed);
             }
         }
-        debug!(
-            "Expired {} entries from bucket for node {}",
-            entries_to_remove.len(),
-            self.node_id
-        );
-        // Remove expired entries from the requests vector
-        for &idx in entries_to_remove.iter().rev() {
-            self.requests.remove(idx);
+        let tracked = self.tracked_requests();
+        self.counter.expire_untracked(self.writer, tracked);
+    }
+
+    /// Expire other actors' live requests once their slot has been unchanged here
+    /// for longer than the window: every request it counts is then older than the
+    /// window. Releases requests of crashed, restarted or removed nodes.
+    fn retire_stale(&mut self, window_ms: i64) {
+        let now = monotonic_ms();
+        let stale: Vec<ActorId> = self
+            .counter
+            .actors()
+            .filter(|&a| {
+                a != self.writer
+                    && self.counter.outstanding(a) > 0
+                    && now - self.last_changed.get(&a).copied().unwrap_or(now) > window_ms
+            })
+            .collect();
+        for actor in stale {
+            self.counter.retire(actor);
         }
     }
+
+    pub fn expire_entries(&mut self, expiration_threshold_ms: i64) {
+        let now_ms = monotonic_ms();
+        self.requests
+            .retain(|entry| now_ms - entry.timestamp_ms <= expiration_threshold_ms);
+        let tracked = self.tracked_requests();
+        self.counter.expire_untracked(self.writer, tracked);
+    }
+
     pub fn to_external(&self, client_id: &str) -> DistributedBucketExternal {
+        let now = monotonic_ms();
+        let quiet_ms = self
+            .counter
+            .actors()
+            .map(|a| {
+                let changed = if a == self.writer {
+                    // Our own slot last changed with our newest tracked request.
+                    self.requests.iter().map(|e| e.timestamp_ms).max()
+                } else {
+                    self.last_changed.get(&a).copied()
+                };
+                let quiet =
+                    changed.map_or(if a == self.writer { i64::MAX } else { 0 }, |t| now - t);
+                // Saturating only understates the age, which delays retirement.
+                (a, quiet.clamp(0, i64::from(u32::MAX)) as u32)
+            })
+            .collect();
         DistributedBucketExternal {
             client_id: client_id.to_string(),
             node_id: self.node_id,
             counter: self.counter.clone(),
+            quiet_ms,
         }
     }
 
-    pub fn vclock(&self) -> VClock<NodeId> {
+    pub fn vclock(&self) -> VClock<ActorId> {
         self.counter.vclock.clone()
     }
 }
 
 impl Bucket for DistributedBucket {
     fn new(max_calls: u32, node_id: NodeId) -> Self {
-        // Local creation: this node is both the origin (for GC) and the writer
-        // (for CRDT actor slot). The two become different only after adoption
-        // via `DistributedBucketExternal::bucket`.
-        //
-        // Do NOT write max_calls into the CRDT as a seed refill. The
-        // capacity is stored as the local `max_calls` field and added as a
-        // constant offset in `tokens_to_u32`. This prevents the seed from
-        // living forever in gossip state as untracked, un-ageable CRDT tokens.
-        Self {
-            node_id,
-            writer_node_id: node_id,
-            max_calls,
-            counter: DistributedRequestCounter::new(node_id),
-            requests: Vec::new(),
-            last_call: monotonic_ms(),
-            last_gossiped_vclock: VClock::new(),
-        }
+        Self::created(max_calls, node_id.into())
     }
 
+    /// Return tokens by ageing out this node's requests older than the
+    /// rate-limit interval: the bucket is a sliding window, and expiry is the
+    /// only way tokens come back.
     fn add_tokens_to_bucket(
         &mut self,
         rate_limit_settings: &settings::RateLimitSettings,
     ) -> &mut Self {
-        // clear out old entries first: these decs will get shared via CRDT merge
         let expiration_threshold_ms =
             (rate_limit_settings.rate_limit_interval_seconds * 1000 + 1) as i64;
-
         self.expire_entries(expiration_threshold_ms);
-
-        // Same token replenishment logic as TokenBucket
-        let now_ms = monotonic_ms();
-        let diff_ms: i64 = now_ms - self.last_call;
-        // For this algorithm we arbitrarily do not trust intervals less than 5ms,
-        // so we only *add* tokens if the diff is greater than that.
-        debug!("Token bucket diff_ms: {}", diff_ms);
-        if diff_ms < 5i64 {
-            // no-op
-            debug!("Not adding tokens to bucket: diff_ms < 5ms");
-            return self;
-        }
-        // Tokens are added at the token rate,
-        // but for distributed bucket, we only add whole tokens
-        // let participants: usize = self.vclock().dots.len();
-        let tokens_to_add: f64 = rate_limit_settings.token_rate_milliseconds() * (diff_ms as f64);
-        let steps = tokens_to_add.trunc() as u64;
-        debug!(
-            "Adding tokens to bucket: diff_ms={}, tokens_to_add={} as steps={}",
-            diff_ms, tokens_to_add, steps
-        );
-        // Stamp the fill entry with the current time, not the previous last_call.
-        // Using self.last_call here would give the entry a stale timestamp, causing
-        // expire_entries to immediately remove fills that were just recorded when
-        // the elapsed gap exceeds the expiration threshold.
-        self.requests.push(InternalRequestEntry {
-            op: InternalPnCounterOp::Fills(steps),
-            timestamp_ms: now_ms,
-            vclock: self.vclock(),
-        });
-        // Writes must go to the local writer slot. Using `counter.node_id` here
-        // would attribute writes to a remote origin on adopted buckets, which
-        // GCounter::merge would then silently drop via its per-actor max.
-        self.counter.inc_refills(self.writer_node_id, steps);
-        debug!("Updated bucket after adding tokens: {:?}", self.counter);
-        self.last_call = now_ms;
         self
     }
 
@@ -384,23 +360,16 @@ impl Bucket for DistributedBucket {
         self.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Requests(1),
             timestamp_ms: monotonic_ms(),
-            vclock: self.vclock(),
         });
-        // See `add_tokens_to_bucket` — mutate the local writer slot, not the origin.
-        self.counter.inc_request(self.writer_node_id);
+        self.counter.inc_request(self.writer);
         self
     }
 
     fn check_if_allowed(&self) -> bool {
-        let tokens = self.tokens_to_u32();
-        debug!("Checking if allowed: tokens={}", tokens);
-        tokens >= 1
+        self.tokens_to_u32() >= 1
     }
 
     fn tokens_to_u32(&self) -> u32 {
-        // Add max_calls as a local constant offset. The CRDT only tracks
-        // *changes* (periodic refills and consumption); the initial capacity is
-        // not gossiped and never lives in PNCounter state.
         (self.counter.tokens() + BigInt::from(self.max_calls))
             .clamp(BigInt::from(0), BigInt::from(u32::MAX))
             .to_u32()
@@ -412,19 +381,40 @@ impl Bucket for DistributedBucket {
 #[derive(Clone, Debug)]
 pub struct DistributedBucketLimiter {
     pub node_id: NodeId,
+    /// This process's actor: the slot it writes in every bucket.
+    pub actor: ActorId,
     node_counters: HashMap<String, DistributedBucket>,
     rate_limit_settings: settings::RateLimitSettings,
+    /// Highest own-slot value in any bucket this node dropped; new slots start above it.
+    dropped_high: Arc<AtomicU64>,
 }
 
-/// Question: how to garbage collect old entries?
-/// We can only safely remove entries that belong to this node,
-/// because we can only trust our own timestamps.
 impl DistributedBucketLimiter {
-    pub fn new(node_id: NodeId, rate_limit_settings: settings::RateLimitSettings) -> Self {
+    pub fn new(
+        actor: impl Into<ActorId>,
+        rate_limit_settings: settings::RateLimitSettings,
+    ) -> Self {
+        let actor = actor.into();
         Self {
-            node_id,
+            node_id: actor.node,
+            actor,
             node_counters: HashMap::new(),
             rate_limit_settings,
+            dropped_high: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn expiration_threshold_ms(&self) -> i64 {
+        (self.rate_limit_settings.rate_limit_interval_seconds * 1000 + 1) as i64
+    }
+
+    /// Before writing with nothing live, restart the own slot above anything it
+    /// held before, including in buckets this process dropped.
+    fn rebase_if_unused(&self, bucket: &mut DistributedBucket) {
+        if bucket.requests.is_empty() {
+            let floor = self.dropped_high.load(Ordering::Relaxed) + 1;
+            let base = floor.max(bucket.counter.own_high(self.actor) + 1);
+            bucket.counter.rebase_own_slot(self.actor, base);
         }
     }
 
@@ -440,56 +430,46 @@ impl DistributedBucketLimiter {
             .unwrap_or(self.rate_limit_settings.rate_limit_max_calls_allowed)
     }
 
+    /// Drop idle buckets (nothing live anywhere) whose changes have already been gossiped.
     pub fn expire_keys(&mut self) {
-        let expiration_threshold_ms =
-            (self.rate_limit_settings.rate_limit_interval_seconds * 1000) as i64 * 2;
-        let keys_to_expire: Vec<String> = self
-            .node_counters
-            .pin()
+        let guard = self.node_counters.pin();
+        let idle: Vec<(String, u64)> = guard
             .iter()
-            .filter_map(|(key, bucket)| {
-                // We only feel comfortable expiring entries that belong to this node.
-                // because we are looking at *local* timestamps only. This means
-                // ultimately that *this node* hasn't seen an update for this client beyond the threshold
-                // for our rate-limiting implementation: thus, old entries should be ignored in future calls.
-                if bucket.node_id == self.node_id && bucket.can_expire(expiration_threshold_ms) {
-                    // Never expire null nodes
-                    Some(key.to_string())
-                } else {
-                    None
-                }
+            .filter(|(_, bucket)| {
+                bucket.requests.is_empty()
+                    && bucket.counter.is_idle()
+                    && !bucket.has_updates_since_last_gossip()
             })
+            .map(|(key, bucket)| (key.clone(), bucket.counter.own_high(self.actor)))
             .collect();
-
-        for client in keys_to_expire {
-            self.node_counters.pin().remove(&client);
+        for (client, own_high) in idle {
+            self.dropped_high.fetch_max(own_high, Ordering::Relaxed);
+            guard.remove(&client);
         }
     }
 
     pub fn limit_calls_for_client(&mut self, key: String) -> Option<u32> {
-        // Update the map with the modified bucket
         let guard = self.node_counters.pin();
         let bucket = guard.update_or_insert_with(
             key.clone(),
-            |_counter: &DistributedBucket| {
-                let mut counter = _counter.clone();
-                debug!("Existing bucket found for client {}", key);
-                counter.add_tokens_to_bucket(&self.rate_limit_settings);
-                counter
+            |existing: &DistributedBucket| {
+                let mut bucket = existing.clone();
+                bucket.add_tokens_to_bucket(&self.rate_limit_settings);
+                bucket
             },
             || {
-                debug!("Creating new bucket for client {}", key);
-                DistributedBucket::new(
+                DistributedBucket::created(
                     self.rate_limit_settings.rate_limit_max_calls_allowed,
-                    self.node_id,
+                    self.actor,
                 )
             },
         );
-        // Now check if allowed
+        // Only an admitted request writes, so only it rebases the slot.
         if bucket.check_if_allowed() {
             guard
                 .update(key, |b| {
                     let mut b = b.clone();
+                    self.rebase_if_unused(&mut b);
                     b.decrement();
                     b
                 })
@@ -499,49 +479,24 @@ impl DistributedBucketLimiter {
         }
     }
 
-    /// Create state suitable for gossiping to other nodes.
-    /// Only includes buckets with local changes since the last gossip batch,
-    /// then advances each included bucket's gossip watermark so they are
-    /// not re-sent until they have new operations.
+    /// Buckets with changes not yet gossiped; advances each one's gossip watermark.
     pub fn gossip_delta_state(&self) -> Vec<DistributedBucketExternal> {
         let guard = self.node_counters.pin();
-
-        // 1: collect buckets that have changed since last gossip
         let result: Vec<DistributedBucketExternal> = guard
             .iter()
-            .filter_map(|(client_id, bucket)| {
-                if bucket.has_updates_since_last_gossip() {
-                    Some(bucket.to_external(client_id))
-                } else {
-                    None
-                }
-            })
+            .filter(|(_, bucket)| bucket.has_updates_since_last_gossip())
+            .map(|(client_id, bucket)| bucket.to_external(client_id))
             .collect();
-
-        // 2: advance the gossip watermark for each included bucket.
-        // The || branch is the "insert if absent" path; in practice it should
-        // not fire here because we just iterated over the live entries. If it
-        // does, adopt the bucket with *this* limiter as the writer.
-        let local_node_id = self.node_id;
         for ext in &result {
-            guard.update_or_insert_with(
-                ext.client_id.clone(),
-                |bucket| {
-                    let mut b = bucket.clone();
-                    b.mark_gossiped();
-                    b
-                },
-                || {
-                    ext.bucket(
-                        local_node_id,
-                        self.rate_limit_settings.rate_limit_max_calls_allowed,
-                    )
-                },
-            );
+            guard.update(ext.client_id.clone(), |bucket| {
+                let mut b = bucket.clone();
+                b.mark_gossiped();
+                b
+            });
         }
-
         result
     }
+
     pub fn client_delta_state_for_gossip(
         &self,
         client_id: &String,
@@ -552,13 +507,7 @@ impl DistributedBucketLimiter {
             .map(|counter| counter.to_external(client_id))
     }
 
-    /// Return the full CRDT state for all known clients, regardless of whether
-    /// each bucket has been gossiped since its last update.
-    ///
-    /// Used for anti-entropy: when a peer requests a full sync, we send everything
-    /// we have so they can merge it idempotently. Unlike `gossip_delta_state`, this
-    /// does NOT advance the gossip watermark — the regular delta loop continues
-    /// normally after an anti-entropy exchange.
+    /// Every bucket, for anti-entropy. Does not advance gossip watermarks.
     pub fn full_state_dump(&self) -> Vec<DistributedBucketExternal> {
         self.node_counters
             .pin()
@@ -568,75 +517,77 @@ impl DistributedBucketLimiter {
     }
 
     pub fn accept_delta_state(&mut self, delta: &[DistributedBucketExternal]) {
-        let local_node_id = self.node_id;
+        let local = self.actor;
         for incoming_bucket in delta.iter() {
+            // Don't resurrect idle buckets.
+            let known = self
+                .node_counters
+                .pin()
+                .contains_key(&incoming_bucket.client_id);
+            if !known && incoming_bucket.counter.is_idle() {
+                continue;
+            }
             self.node_counters.pin().update_or_insert_with(
                 incoming_bucket.client_id.clone(),
-                |_existing_counter| {
-                    let mut existing_counter = _existing_counter.clone();
-                    existing_counter
-                        .counter
-                        .merge(incoming_bucket.counter.clone());
-                    // Advance the watermark to the post-merge vclock so this node DOES NOT
-                    // re-broadcast state it just received from a peer.
-                    // Only local writes that happen *after* this merge will advance
-                    // counter.vclock past last_gossiped_vclock and trigger
-                    // the next delta push.
-                    existing_counter.last_gossiped_vclock = existing_counter.counter.vclock.clone();
-                    existing_counter
+                |existing| {
+                    let mut bucket = existing.clone();
+                    bucket.merge_from(incoming_bucket);
+                    // Absorb the peer's dots so this node doesn't re-broadcast
+                    // them; its own unsent writes stay above the watermark.
+                    bucket
+                        .last_gossiped_vclock
+                        .merge(incoming_bucket.counter.vclock.clone());
+                    bucket
                 },
                 || {
-                    incoming_bucket.bucket(
-                        local_node_id,
-                        self.rate_limit_settings.rate_limit_max_calls_allowed,
-                    )
+                    incoming_bucket
+                        .bucket(local, self.rate_limit_settings.rate_limit_max_calls_allowed)
                 },
             );
         }
     }
 
-    /// Age out expired operations on every live bucket.
-    ///
-    /// Addresses the Case where origin alive but idle: without traffic on a given
-    /// bucket, `add_tokens_to_bucket` is never called, so `expire_entries` is
-    /// never driven and the CRDT counter keeps the un-aged fill/request ops
-    /// forever. Calling this on every gossip tick ensures expirations happen
-    /// even for quiescent buckets.
-    ///
-    /// Preserves the single-writer-per-actor invariant: `expire_entries`
-    /// only writes to `self.writer_node_id`, which is always the local node's
-    /// slot, never a remote origin's. Case B (origin dead with un-aged ops at
-    /// remote replicas) is not addressed here; see the review doc.
+    /// Age out this node's expired requests, and retire other actors' stale
+    /// ones, in every bucket. Runs on each gossip tick.
     pub fn tick_expirations(&self) {
-        let expiration_threshold_ms =
-            (self.rate_limit_settings.rate_limit_interval_seconds * 1000 + 1) as i64;
+        let threshold = self.expiration_threshold_ms();
         let guard = self.node_counters.pin();
         let keys: Vec<String> = guard.iter().map(|(k, _)| k.clone()).collect();
         for key in keys {
             guard.update(key, |b| {
                 let mut b = b.clone();
-                b.expire_entries(expiration_threshold_ms);
+                b.expire_entries(threshold);
+                b.retire_stale(threshold);
                 b
             });
         }
     }
 
-    /// Return the join (element-wise maximum) of every bucket's vclock.
-    ///
-    /// This is the correct summary of "all state this node has seen": a single
-    /// vclock whose value at each actor slot is the highest dot observed across
-    /// any bucket. Using `>` (strict dominance) instead of merge would silently
-    /// drop dots from concurrent vclocks whose iteration order is non-deterministic,
-    /// causing heartbeat comparisons to be spuriously `None` (concurrent) and
-    /// triggering permanent anti-entropy state requests.
-    pub fn get_latest_updated_vclock(&self) -> VClock<NodeId> {
+    /// Every bucket's vclock summed per actor, for heartbeats. (A max would let
+    /// one client's count hide another client's missing write.)
+    pub fn get_latest_updated_vclock(&self) -> VClock<ActorId> {
         self.node_counters
             .pin()
             .values()
             .fold(VClock::new(), |mut acc, bucket| {
-                acc.merge(bucket.vclock());
+                for (actor, count) in bucket.vclock().dots {
+                    let total = acc.dots.entry(actor).or_insert(0);
+                    *total = total.saturating_add(count);
+                }
                 acc
             })
+    }
+
+    /// For tests: (live requests in own slot, requests tracked). The first is at most
+    /// the second; less only when peers retired requests this node has yet to age.
+    #[doc(hidden)]
+    pub fn own_slot_audit(&self, client: &str) -> Option<(u64, u64)> {
+        self.node_counters.pin().get(client).map(|bucket| {
+            (
+                bucket.counter.outstanding(self.actor),
+                bucket.tracked_requests(),
+            )
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -677,12 +628,12 @@ mod tests {
         // Should start with 0 tokens
         assert_eq!(counter.tokens(), BigInt::from(0));
 
-        // Add tokens and consume them
-        counter.inc_refills(node_id, 5);
-        assert_eq!(counter.tokens(), BigInt::from(5));
+        // Each request consumes one token from the bucket's capacity
+        counter.inc_request(node_id);
+        assert_eq!(counter.tokens(), BigInt::from(-1));
 
         counter.inc_request(node_id);
-        assert_eq!(counter.tokens(), BigInt::from(4)); // 5 - 1
+        assert_eq!(counter.tokens(), BigInt::from(-2));
     }
 
     #[test]
@@ -694,20 +645,17 @@ mod tests {
         let mut counter2 = DistributedRequestCounter::new(node2);
 
         // Each counter operates independently
-        counter1.inc_refills(node1, 3);
         counter1.inc_request(node1);
 
-        counter2.inc_refills(node2, 2);
         counter2.inc_request(node2);
         counter2.inc_request(node2);
 
-        // Before merge: counter1 = 3 (1+3-1), counter2 = 1 (1+2-2)
-        assert_eq!(counter1.tokens(), BigInt::from(2));
-        assert_eq!(counter2.tokens(), BigInt::from(0));
+        assert_eq!(counter1.tokens(), BigInt::from(-1));
+        assert_eq!(counter2.tokens(), BigInt::from(-2));
 
-        // After merge: should see combined state = 2 (2 + 0)
+        // After merge: requests from distinct writers add up
         counter1.merge(counter2.clone());
-        assert_eq!(counter1.tokens(), BigInt::from(2));
+        assert_eq!(counter1.tokens(), BigInt::from(-3));
     }
 
     // === Bucket-Level Tests ===
@@ -733,23 +681,25 @@ mod tests {
     }
 
     #[test]
-    fn test_bucket_token_replenishment() {
+    fn test_bucket_tokens_return_only_by_expiry() {
         let node_id = node_id();
-        let mut bucket = DistributedBucket::new(1000, node_id);
+        let mut bucket = DistributedBucket::new(2, node_id);
         let settings = settings::RateLimitSettings {
-            rate_limit_max_calls_allowed: 1000,
+            rate_limit_max_calls_allowed: 2,
             rate_limit_interval_seconds: 1,
         };
 
-        let initial_tokens = bucket.counter.tokens();
-
-        // Sleep to ensure time passes for token calculation
+        bucket.decrement();
         thread::sleep(Duration::from_millis(100));
-
         bucket.add_tokens_to_bucket(&settings);
+        // Elapsed time alone adds nothing: the request is still in the window.
+        assert_eq!(bucket.tokens_to_u32(), 1);
 
-        // Should have added tokens
-        assert!(bucket.counter.tokens() > initial_tokens);
+        // Once the request ages out of the window its token comes back,
+        // but never beyond capacity.
+        bucket.requests[0].timestamp_ms = monotonic_ms() - 5000;
+        bucket.add_tokens_to_bucket(&settings);
+        assert_eq!(bucket.tokens_to_u32(), 2);
     }
 
     #[test]
@@ -761,13 +711,11 @@ mod tests {
         bucket.requests.push(InternalRequestEntry {
             op: InternalPnCounterOp::Requests(1),
             timestamp_ms: monotonic_ms() - 2000, // Old
-            vclock: bucket.vclock(),
         });
 
         bucket.requests.push(InternalRequestEntry {
-            op: InternalPnCounterOp::Fills(1),
+            op: InternalPnCounterOp::Requests(1),
             timestamp_ms: monotonic_ms() - 200, // Recent
-            vclock: bucket.vclock(),
         });
 
         assert_eq!(bucket.requests.len(), 2);
@@ -777,13 +725,6 @@ mod tests {
 
         // Should have removed the old entry only
         assert_eq!(bucket.requests.len(), 1);
-
-        // Empty bucket should be expirable
-        let empty_bucket = DistributedBucket::new(1000, node_id);
-        assert!(empty_bucket.can_expire(1000));
-
-        // Bucket with recent activity should not be expirable
-        assert!(!bucket.can_expire(1000));
     }
 
     // === Limiter-Level Tests ===
@@ -915,7 +856,6 @@ mod tests {
             bucket.requests.push(InternalRequestEntry {
                 op: InternalPnCounterOp::Requests(1),
                 timestamp_ms: monotonic_ms() - threshold_ms - 500,
-                vclock: bucket.vclock(),
             });
             guard.insert(client_id.clone(), bucket);
         }
@@ -957,7 +897,8 @@ mod tests {
         let mut counter_a = DistributedRequestCounter::new(node1);
         let mut counter_b = DistributedRequestCounter::new(node2);
 
-        counter_a.inc_refills(node1, 5);
+        counter_a.inc_request(node1);
+        counter_a.inc_request(node1);
         counter_b.inc_request(node2);
 
         // Commutative: a + b = b + a
@@ -1028,9 +969,9 @@ mod tests {
         assert_eq!(external.node_id, node_id);
 
         // Convert back to internal format (as if adopted by the same node).
-        let restored_bucket = external.bucket(node_id, 10);
+        let restored_bucket = external.bucket(node_id.into(), 10);
         assert_eq!(restored_bucket.node_id, node_id);
-        assert_eq!(restored_bucket.writer_node_id, node_id);
+        assert_eq!(restored_bucket.writer, node_id.into());
         assert_eq!(restored_bucket.counter.tokens(), bucket.counter.tokens());
     }
 
@@ -1046,8 +987,8 @@ mod tests {
         let node_b = NodeName::from("b").node_id();
 
         // Node A creates a bucket for a client and consumes one token.
-        // Use the bucket API directly (not the limiter) so wall-clock refills
-        // don't contaminate the exact-count assertion below.
+        // Use the bucket API directly (not the limiter) so wall-clock expiry
+        // can't contaminate the exact-count assertion below.
         let mut bucket_a = DistributedBucket::new(100, node_a);
         bucket_a.decrement(); // A local: 1 request
 
@@ -1055,12 +996,13 @@ mod tests {
         // step would copy A's `counter.node_id` into B's bucket and silently
         // route all of B's future writes into slot A of the PNCounter.
         let external = bucket_a.to_external("test_client");
-        let mut bucket_b = external.bucket(node_b, 100);
+        let mut bucket_b = external.bucket(node_b.into(), 100);
 
         // Post-adoption invariants: origin preserved for GC, writer is local.
         assert_eq!(bucket_b.node_id, node_a, "origin must be preserved");
         assert_eq!(
-            bucket_b.writer_node_id, node_b,
+            bucket_b.writer,
+            ActorId::from(node_b),
             "writer must be the local (adopting) node"
         );
 
@@ -1076,7 +1018,7 @@ mod tests {
 
         // Total requests counted across the cluster:
         //   1 (A's original, already in both replicas) + 2 (A's new) + 1 (B's new) = 4
-        // With seed refills = 100, net tokens after merge must be 100 - 4 = 96.
+        // With capacity 100, net tokens after merge must be 100 - 4 = 96.
         //
         // With safety bug present, B's decrement landed in slot A. Node A's own slot A
         // reached 3 requests locally, while B's slot A reached 2 (1 inherited + 1 new).
@@ -1282,7 +1224,7 @@ mod tests {
         // must also show zero tokens in the CRDT — no seed doubles on adoption.
         let node_b = NodeName::from("b").node_id();
         let external = bucket.to_external("client_a");
-        let adopted = external.bucket(node_b, 100);
+        let adopted = external.bucket(node_b.into(), 100);
         assert_eq!(
             adopted.counter.tokens(),
             BigInt::from(0),
@@ -1296,7 +1238,7 @@ mod tests {
         bucket_a.decrement(); // A: 1 request
 
         let external_a = bucket_a.to_external("client_a");
-        let mut bucket_b = external_a.bucket(node_b, 100);
+        let mut bucket_b = external_a.bucket(node_b.into(), 100);
         bucket_b.decrement(); // B: 1 additional request
 
         // Merge B → A
@@ -1369,12 +1311,83 @@ mod tests {
         let c_vc = limiter_c.get_latest_updated_vclock();
 
         assert!(
-            !matches!(summary.partial_cmp(&b_vc), None),
+            summary.partial_cmp(&b_vc).is_some(),
             "summary must not be concurrent with node_b's vclock after convergence"
         );
         assert!(
-            !matches!(summary.partial_cmp(&c_vc), None),
+            summary.partial_cmp(&c_vc).is_some(),
             "summary must not be concurrent with node_c's vclock after convergence"
+        );
+    }
+
+    /// Regression (found by tests/hegel_gossip.rs): receiving a peer's delta for
+    /// a client must not swallow this node's own not-yet-gossiped write for that
+    /// client. The next delta must still carry it.
+    #[test]
+    fn test_accept_delta_keeps_unsent_local_writes_above_watermark() {
+        let settings = test_settings();
+        let mut local = DistributedBucketLimiter::new(node_id(), settings.clone());
+        let mut peer = DistributedBucketLimiter::new(NodeName::from("b").node_id(), settings);
+
+        peer.limit_calls_for_client("alice".to_string());
+        local.limit_calls_for_client("alice".to_string());
+        local.accept_delta_state(&peer.gossip_delta_state());
+
+        let delta = local.gossip_delta_state();
+        assert_eq!(
+            delta.len(),
+            1,
+            "local write to alice must still be gossiped"
+        );
+        peer.accept_delta_state(&delta);
+        assert_eq!(
+            peer.check_calls_remaining_for_client(&"alice".to_string()),
+            local.check_calls_remaining_for_client(&"alice".to_string()),
+        );
+    }
+
+    /// A denied request must not produce gossip.
+    #[test]
+    fn test_denied_request_produces_no_delta() {
+        let settings = settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 1,
+            rate_limit_interval_seconds: 60,
+        };
+        let mut writer = DistributedBucketLimiter::new(node_id(), settings.clone());
+        let mut peer = DistributedBucketLimiter::new(NodeName::from("b").node_id(), settings);
+
+        assert!(writer.limit_calls_for_client("alice".to_string()).is_some());
+        peer.accept_delta_state(&writer.gossip_delta_state());
+        assert!(peer.gossip_delta_state().is_empty());
+
+        assert!(peer.limit_calls_for_client("alice".to_string()).is_none());
+        assert!(
+            peer.gossip_delta_state().is_empty(),
+            "a denied request must not change gossiped state"
+        );
+    }
+
+    /// Regression (found by tests/hegel_gossip.rs): when a delta is lost, the
+    /// heartbeat digest must still reveal the gap. With an element-wise-max
+    /// digest, the writer's later dot on another client masked the missing one.
+    #[test]
+    fn test_heartbeat_digest_reveals_lost_delta() {
+        let settings = test_settings();
+        let mut writer = DistributedBucketLimiter::new(node_id(), settings.clone());
+        let mut peer = DistributedBucketLimiter::new(NodeName::from("b").node_id(), settings);
+
+        writer.limit_calls_for_client("alice".to_string());
+        let _lost = writer.gossip_delta_state();
+        writer.limit_calls_for_client("bob".to_string());
+        peer.accept_delta_state(&writer.gossip_delta_state());
+
+        let peer_digest = peer.get_latest_updated_vclock();
+        let writer_digest = writer.get_latest_updated_vclock();
+        assert_eq!(
+            peer_digest.partial_cmp(&writer_digest),
+            Some(std::cmp::Ordering::Less),
+            "peer missing alice must see itself behind the writer: \
+             peer={peer_digest:?} writer={writer_digest:?}"
         );
     }
 
@@ -1452,9 +1465,9 @@ mod tests {
                     .collect();
                 for (i, delta) in deltas.iter().enumerate() {
                     if !delta.is_empty() {
-                        for j in 0..NUM_NODES {
+                        for (j, limiter) in limiters.iter_mut().enumerate() {
                             if i != j {
-                                limiters[j].accept_delta_state(delta);
+                                limiter.accept_delta_state(delta);
                             }
                         }
                     }
@@ -1569,11 +1582,11 @@ mod tests {
                     .iter()
                     .map(|l| l.full_state_dump())
                     .collect();
-                for i in 0..NUM_NODES {
-                    if !full_states[i].is_empty() {
-                        for j in 0..NUM_NODES {
+                for (i, state) in full_states.iter().enumerate() {
+                    if !state.is_empty() {
+                        for (j, limiter) in limiters.iter_mut().enumerate() {
                             if i != j {
-                                limiters[j].accept_delta_state(&full_states[i]);
+                                limiter.accept_delta_state(state);
                             }
                         }
                     }

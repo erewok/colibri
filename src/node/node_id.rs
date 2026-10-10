@@ -12,6 +12,46 @@ pub struct NodeName(String);
 )]
 pub struct NodeId(u32);
 
+/// A node process: the node, plus an incarnation chosen when the process starts.
+/// Each process writes its own CRDT slot, so a restarted node never reuses
+/// its previous incarnation's slot.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, PartialOrd, Ord, Eq, Hash,
+)]
+pub struct ActorId {
+    pub node: NodeId,
+    pub incarnation: u64,
+}
+
+impl ActorId {
+    /// A new incarnation of `node`: start time (seconds since 2020) in the high
+    /// bits, so later processes compare greater, and 18 random bits.
+    pub fn fresh(node: NodeId) -> Self {
+        const EPOCH_2020_S: i64 = 1_577_836_800;
+        let started = (crate::clock::wall_ms() / 1000 - EPOCH_2020_S).max(0) as u64;
+        Self {
+            node,
+            incarnation: (started << 18) | (rand::random::<u64>() & 0x3_FFFF),
+        }
+    }
+}
+
+/// Incarnation 0 of a node; for tests and single-incarnation callers.
+impl From<NodeId> for ActorId {
+    fn from(node: NodeId) -> Self {
+        Self {
+            node,
+            incarnation: 0,
+        }
+    }
+}
+
+impl std::fmt::Display for ActorId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.node, self.incarnation)
+    }
+}
+
 impl NodeName {
     pub fn new(id: String) -> Self {
         Self(id)

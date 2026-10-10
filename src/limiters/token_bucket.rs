@@ -1,9 +1,9 @@
 //! Token bucket rate limiting algorithm
-use chrono::Utc;
 use papaya::{Guard, HashMap};
 use serde::{Deserialize, Serialize};
 
 use super::rules;
+use crate::clock;
 use crate::node::NodeId;
 use crate::settings;
 
@@ -36,7 +36,7 @@ impl Default for TokenBucket {
     fn default() -> Self {
         Self {
             tokens: 1f64,
-            last_call: Utc::now().timestamp_millis(),
+            last_call: clock::wall_ms(),
         }
     }
 }
@@ -45,7 +45,7 @@ impl Bucket for TokenBucket {
     fn new(max_calls: u32, _: NodeId) -> Self {
         TokenBucket {
             tokens: max_calls as f64,
-            last_call: Utc::now().timestamp_millis(),
+            last_call: clock::wall_ms(),
         }
     }
     /// Function for adding tokens to the bucket.
@@ -55,7 +55,7 @@ impl Bucket for TokenBucket {
         rate_limit_settings: &settings::RateLimitSettings,
     ) -> &mut Self {
         // epoch time in milliseconds here from `chrono` is an i64
-        let diff_ms: i64 = Utc::now().timestamp_millis() - self.last_call;
+        let diff_ms: i64 = clock::wall_ms() - self.last_call;
         // For this algorithm we arbitrarily do not trust intervals less than 5ms,
         // so we only *add* tokens if the diff is greater than that.
         if diff_ms < 5i64 {
@@ -66,7 +66,7 @@ impl Bucket for TokenBucket {
             0.0,
             f64::from(rate_limit_settings.rate_limit_max_calls_allowed),
         );
-        self.last_call = Utc::now().timestamp_millis();
+        self.last_call = clock::wall_ms();
         self
     }
 
@@ -133,18 +133,23 @@ impl TokenBucketLimiter {
     }
 
     /// Return actual calls remaining or a default value
+    /// Read-only: the refill is applied to a copy and not stored.
     pub fn check_calls_remaining_for_client(&self, key: &str) -> u32 {
         self.cache
             .pin()
             .get(key)
-            .map(|b| b.tokens_to_u32())
+            .map(|b| {
+                b.clone()
+                    .add_tokens_to_bucket(&self.settings)
+                    .tokens_to_u32()
+            })
             .unwrap_or(self.settings.rate_limit_max_calls_allowed)
     }
 
     /// Expire all keys older than a threshold to keep cache from growing endlessly
     pub fn expire_keys(&mut self) {
         let threshold = (self.settings.rate_limit_interval_seconds * 1000) as i64 * 2;
-        let cutoff = Utc::now().timestamp_millis() - threshold;
+        let cutoff = clock::wall_ms() - threshold;
         // pin_owned is expensive but we need to mutate potentially the whole map
         self.cache.pin_owned().retain(|_k, bucket| {
             // check that last call was within cutoff
@@ -172,15 +177,18 @@ impl TokenBucketLimiter {
                 None
             }
         } else {
-            // Create new bucket. First call is always allowed
+            // Create a full bucket, then check before decrementing, exactly as
+            // for an existing bucket: the first call is allowed whenever the
+            // capacity is at least one.
             let mut new_bucket = self.new_bucket();
-            new_bucket.decrement(); // Use one token
-            // if negative here, we'll have an unreliable value.
-            // so we need to safe-check *first* before returning `remaining`
-            let is_allowed = new_bucket.check_if_allowed();
-            let remaining = Some(new_bucket.tokens_to_u32());
+            let remaining = if new_bucket.check_if_allowed() {
+                new_bucket.decrement();
+                Some(new_bucket.tokens_to_u32())
+            } else {
+                None
+            };
             self.cache.pin().insert(key, new_bucket);
-            if is_allowed { remaining } else { None }
+            remaining
         }
     }
 
@@ -287,16 +295,31 @@ impl TokenBucketRules {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use tokio::time::{self, Duration};
+
+    /// Regression (found by tests/hegel_token_bucket.rs): with a capacity of
+    /// one, a client's first call must be allowed.
+    #[test]
+    fn first_call_allowed_at_capacity_one() {
+        let mut limiter = TokenBucketLimiter::new(settings::RateLimitSettings {
+            rate_limit_max_calls_allowed: 1,
+            rate_limit_interval_seconds: 60,
+        });
+        assert_eq!(limiter.limit_calls_for_client("alice".to_string()), Some(0));
+        assert_eq!(limiter.limit_calls_for_client("alice".to_string()), None);
+    }
 
     #[test]
     fn check_allowed() {
-        let mut bucket = TokenBucket::default();
-        bucket.tokens = 2.0;
+        let mut bucket = TokenBucket {
+            tokens: 2.0,
+            ..Default::default()
+        };
         bucket.decrement();
         assert!(bucket.check_if_allowed());
         bucket.decrement();
-        assert_eq!(bucket.check_if_allowed(), false);
+        assert!(!bucket.check_if_allowed());
     }
 
     #[test]
@@ -362,8 +385,10 @@ mod tests {
 
     #[test]
     fn test_token_bucket_depletion() {
-        let mut bucket = TokenBucket::default();
-        bucket.tokens = 2.0;
+        let mut bucket = TokenBucket {
+            tokens: 2.0,
+            ..Default::default()
+        };
 
         // First request should succeed
         assert!(bucket.check_if_allowed());
@@ -384,10 +409,11 @@ mod tests {
             rate_limit_interval_seconds: 1,
         };
 
-        let mut bucket = TokenBucket::default();
-        bucket.tokens = 10.0; // Above maximum
-        // Set timestamp to trigger token addition
-        bucket.last_call = Utc::now().timestamp_millis() - 1000; // 1 second ago
+        let mut bucket = TokenBucket {
+            tokens: 10.0, // Above maximum
+            // Set timestamp to trigger token addition
+            last_call: Utc::now().timestamp_millis() - 1000, // 1 second ago
+        };
 
         bucket.add_tokens_to_bucket(&settings);
 
@@ -417,8 +443,10 @@ mod tests {
     #[test]
     fn test_tokens_to_u32_edge_cases() {
         // Test negative values
-        let mut bucket = TokenBucket::default();
-        bucket.tokens = -5.0;
+        let mut bucket = TokenBucket {
+            tokens: -5.0,
+            ..Default::default()
+        };
         assert_eq!(bucket.tokens_to_u32(), 0);
 
         // Test very large values
@@ -458,8 +486,10 @@ mod tests {
             rate_limit_interval_seconds: 1,
         };
 
-        let mut bucket = TokenBucket::default();
-        bucket.tokens = 0.0;
+        let mut bucket = TokenBucket {
+            tokens: 0.0,
+            ..Default::default()
+        };
 
         // Simulate 500ms passage
         bucket.last_call = Utc::now().timestamp_millis() - 500;

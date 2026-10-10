@@ -15,7 +15,7 @@ use crate::settings;
 pub use gossip::GossipNode;
 pub use hashring::HashringNode;
 pub use messages::{BucketExport, ExportMetadata};
-pub use node_id::{NodeAddress, NodeId, NodeName};
+pub use node_id::{ActorId, NodeAddress, NodeId, NodeName};
 pub use single_node::SingleNode;
 
 #[async_trait]

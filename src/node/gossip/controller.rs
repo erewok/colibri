@@ -3,16 +3,12 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use papaya::HashMap;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{
-    distributed_bucket::{DistributedBucketExternal, DistributedBucketLimiter},
-    rules::{DEFAULT_RULE_NAME, RuleList, RuleName, SerializableRule},
-};
+use crate::limiters::rules::{RuleList, RuleName, SerializableRule};
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
 };
@@ -20,6 +16,7 @@ use crate::node::{NodeAddress, NodeId, NodeName};
 use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::{UdpReceiver, UdpTransport};
 
+use super::state::{GossipState, HeartbeatDigest, TickOutput};
 use super::{GossipMessage, GossipPacket};
 
 /// Maximum number of recent packet IDs kept for receive-side deduplication.
@@ -36,8 +33,8 @@ pub struct GossipController {
     node_id: NodeId,
     topology: Arc<RwLock<ClusterTopology>>,
     transport: Arc<UdpTransport>,
-    /// Concurrent HashMap for rate limiters (papaya provides lock-free reads)
-    pub named_rate_limiters: HashMap<String, Arc<Mutex<DistributedBucketLimiter>>>,
+    /// Limiters for every rule, and the replicated rule configuration
+    pub state: Arc<Mutex<GossipState>>,
     pub response_addr: SocketAddr,
     pub gossip_interval_ms: u64,
     pub gossip_fanout: usize,
@@ -81,15 +78,10 @@ impl GossipController {
             settings.peer_listen_port
         );
 
-        let named_rate_limiters = HashMap::new();
-        let rl_settings = settings.rate_limit_settings();
-        let default_limiter = Arc::new(Mutex::new(DistributedBucketLimiter::new(
+        let state = Arc::new(Mutex::new(GossipState::new(
             node_id,
-            rl_settings.clone(),
+            settings.rate_limit_settings(),
         )));
-        named_rate_limiters
-            .pin()
-            .insert(DEFAULT_RULE_NAME.to_string(), default_limiter);
 
         let transport_config = settings.transport_config();
         let transport = UdpTransport::new(&transport_config).await?;
@@ -105,7 +97,7 @@ impl GossipController {
             node_id,
             topology: Arc::new(RwLock::new(topology)),
             transport: Arc::new(transport),
-            named_rate_limiters,
+            state,
             response_addr,
             gossip_interval_ms: settings.gossip_interval_ms,
             gossip_fanout: settings.gossip_fanout,
@@ -118,36 +110,34 @@ impl GossipController {
         })
     }
 
-    /// Get rate limiter Arc for a given rule name (or default if None)
-    fn get_limiter(&self, rule_name: Option<&str>) -> Result<Arc<Mutex<DistributedBucketLimiter>>> {
-        let key = rule_name.unwrap_or(DEFAULT_RULE_NAME);
-        self.named_rate_limiters
-            .pin()
-            .get(key)
-            .cloned()
-            .ok_or_else(|| ColibriError::Api(format!("Rate limit rule '{}' not found", key)))
+    fn with_state<R>(&self, f: impl FnOnce(&mut GossipState) -> R) -> Result<R> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+        Ok(f(&mut state))
     }
 
     async fn handle_rate_limit_request(
         &self,
         request: CheckCallsRequest,
-    ) -> Result<CheckCallsResponse> {
-        let limiter_arc = self.get_limiter(request.rule_name.as_ref().map(|r| r.as_str()))?;
-        let mut limiter = limiter_arc
-            .lock()
-            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+    ) -> Result<Option<CheckCallsResponse>> {
+        let rule = request.rule_name.clone().unwrap_or_default();
+        let calls_remaining = self.with_state(|state| {
+            if request.consume_token {
+                state.limit(&rule, &request.client_id)
+            } else {
+                state.check(&rule, &request.client_id).map(Some)
+            }
+        })??;
 
-        let calls_remaining = if request.consume_token {
-            limiter.limit_calls_for_client(request.client_id.clone())
-        } else {
-            Some(limiter.check_calls_remaining_for_client(&request.client_id))
-        };
-
-        Ok(CheckCallsResponse {
+        // `None` means rate limited; it must not be collapsed into
+        // `calls_remaining: 0`, which is also what the last admitted call sees.
+        Ok(calls_remaining.map(|calls_remaining| CheckCallsResponse {
             client_id: request.client_id,
             rule_name: request.rule_name,
-            calls_remaining: calls_remaining.unwrap_or(0),
-        })
+            calls_remaining,
+        }))
     }
 
     async fn get_status(&self) -> Result<StatusResponse> {
@@ -220,87 +210,60 @@ impl GossipController {
         rule_name: String,
         settings: RateLimitSettings,
     ) -> Result<()> {
-        // Reject empty or whitespace-only rule names
-        let rule_name = rule_name.trim();
-        if rule_name.is_empty() {
-            warn!(
-                "[{}] Ignoring create_rate_limit_rule with empty rule name",
-                self.node_id
-            );
-            return Ok(());
-        }
-
-        // Don't allow creating/overwriting the default rule
-        if rule_name == DEFAULT_RULE_NAME {
-            debug!(
-                "[{}] Ignoring request to create/modify default rule",
-                self.node_id
-            );
-            return Ok(());
-        }
-
-        let limiter = Arc::new(Mutex::new(DistributedBucketLimiter::new(
-            self.node_id,
-            settings.clone(),
-        )));
-        self.named_rate_limiters
-            .pin()
-            .insert(rule_name.to_string(), limiter);
-        tracing::info!("Created named rule '{}' in gossip node", rule_name);
+        let name = RuleName::from(rule_name.trim());
+        self.with_state(|state| state.create_rule(name.clone(), settings))??;
+        tracing::info!("Created named rule '{}' in gossip node", name);
+        self.broadcast_rules().await;
         Ok(())
     }
 
     async fn delete_rate_limit_rule(&self, rule_name: RuleName) -> Result<()> {
-        // Don't allow deleting the default rule
-        if rule_name.as_str() == DEFAULT_RULE_NAME {
-            return Err(ColibriError::Api(
-                "Cannot delete the default rule".to_string(),
-            ));
-        }
-
-        if self
-            .named_rate_limiters
-            .pin()
-            .remove(rule_name.as_str())
-            .is_some()
-        {
-            tracing::info!("Deleted named rule '{}' from gossip node", rule_name);
-        } else {
-            tracing::warn!("Attempted to delete non-existent rule '{}'", rule_name);
-        }
+        self.with_state(|state| state.delete_rule(rule_name.clone()))??;
+        tracing::info!("Deleted named rule '{}' from gossip node", rule_name);
+        self.broadcast_rules().await;
         Ok(())
     }
 
     async fn get_rate_limit_rule(&self, rule_name: RuleName) -> Result<Option<SerializableRule>> {
-        let key = rule_name.as_str();
-        if let Some(limiter_arc) = self.named_rate_limiters.pin().get(key).cloned() {
-            let limiter = limiter_arc
-                .lock()
-                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-            let settings = limiter.get_settings().clone();
-            return Ok(Some(SerializableRule {
-                name: rule_name,
-                settings,
-            }));
-        }
-        Ok(None)
+        self.with_state(|state| state.get_rule(&rule_name))
     }
 
     async fn list_rate_limit_rules(&self) -> Result<Vec<SerializableRule>> {
-        let guard = self.named_rate_limiters.pin();
-        let mut rules = Vec::new();
+        self.with_state(|state| state.list_rules())
+    }
 
-        for (name, limiter_arc) in guard.iter() {
-            let limiter = limiter_arc
-                .lock()
-                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-            rules.push(SerializableRule {
-                name: RuleName::from(name.as_str()),
-                settings: limiter.get_settings().clone(),
+    /// Send this node's rule configuration to every peer. Heartbeat digests
+    /// repair any peer this misses.
+    async fn broadcast_rules(&self) {
+        let rules = match self.with_state(|state| state.rule_config().clone()) {
+            Ok(rules) => rules,
+            Err(e) => {
+                error!(
+                    "[{}] Failed to read rule configuration: {}",
+                    self.node_id, e
+                );
+                return;
+            }
+        };
+        let peers: Vec<SocketAddr> = {
+            let topology = self.topology.read().await;
+            topology
+                .all_nodes()
+                .into_iter()
+                .filter(|(name, _)| name.as_str() != self.node_name.as_str())
+                .map(|(_, addr)| addr)
+                .collect()
+        };
+        for peer in peers {
+            let packet = GossipPacket::new(GossipMessage::RuleConfigSync {
+                response_addr: self.response_addr,
+                sender_node_id: self.node_id,
+                rules: rules.clone(),
             });
+            if let Err(e) = self.send_gossip_packet_to(peer, packet).await {
+                debug!("[{}] Failed to send rules to {}: {}", self.node_id, peer, e);
+            }
         }
-
-        Ok(rules)
     }
 
     /// Start the UDP receiver and gossip packet processing loop
@@ -426,95 +389,11 @@ impl GossipController {
                 Ok(Message::ListRateLimitRulesResponse(RuleList(rules)))
             }
 
-            Message::GossipDeltaSync {
-                updates,
-                propagation_factor,
-            } => {
-                self.handle_delta_sync(updates, propagation_factor).await?;
-                Ok(Message::Ack)
-            }
-
-            Message::GossipHeartbeat { timestamp, vclock } => {
-                self.handle_heartbeat(timestamp, vclock).await?;
-                Ok(Message::Ack)
-            }
-
-            Message::GossipStateRequest { missing_keys } => {
-                let data = self.handle_state_request(missing_keys).await?;
-                Ok(Message::GossipStateResponse { data })
-            }
-
             _ => Err(ColibriError::Api(format!(
                 "Unsupported message type for GossipController: {:?}",
                 message
             ))),
         }
-    }
-
-    /// Gossip-specific: Handle delta synchronization
-    async fn handle_delta_sync(
-        &self,
-        updates: Vec<DistributedBucketExternal>,
-        propagation_factor: u8,
-    ) -> Result<()> {
-        {
-            let limiter_arc = self.get_limiter(None)?;
-            let mut limiter = limiter_arc
-                .lock()
-                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-            limiter.accept_delta_state(&updates);
-            debug!(
-                "[{}] Merged {} delta updates from gossip",
-                self.node_id,
-                updates.len()
-            );
-        }
-
-        // Propagate to random peers if propagation_factor > 0
-        if propagation_factor > 0 {
-            let message = GossipMessage::DeltaStateSync {
-                updates,
-                sender_node_id: self.node_id,
-                response_addr: self.response_addr,
-                propagation_factor: propagation_factor - 1,
-            };
-
-            let packet = GossipPacket::new(message);
-            self.send_gossip_packet(packet).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Gossip-specific: Handle heartbeat
-    async fn handle_heartbeat(&self, timestamp: u64, _vclock: crdts::VClock<NodeId>) -> Result<()> {
-        // Update peer liveness tracking
-        // For now, just acknowledge receipt
-        debug!(
-            "[{}] Received heartbeat from peer at timestamp {}",
-            self.node_id, timestamp
-        );
-        Ok(())
-    }
-
-    /// Gossip-specific: Handle state request (HTTP path).
-    ///
-    /// Returns the full state dump for anti-entropy. We always dump everything
-    /// regardless of which keys were requested — state-based CRDT merge is
-    /// idempotent so extra data is harmless, and simplicity beats precision here.
-    async fn handle_state_request(
-        &self,
-        _missing_keys: Option<Vec<String>>,
-    ) -> Result<Vec<DistributedBucketExternal>> {
-        let limiter_arc = self.get_limiter(None)?;
-        let limiter = limiter_arc
-            .lock()
-            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-        debug!(
-            "[{}] State request: returning full state dump",
-            self.node_id
-        );
-        Ok(limiter.full_state_dump())
     }
 
     /// Send a gossip packet to a specific peer address (unicast).
@@ -539,13 +418,7 @@ impl GossipController {
 
     /// Log current statistics about the gossip node state for debugging
     pub async fn log_stats(&self) {
-        let bucket_count = match self.get_limiter(None) {
-            Ok(arc) => arc.lock().map_or(0, |l| l.len()),
-            Err(_) => {
-                error!("Failed to get default limiter");
-                0
-            }
-        };
+        let bucket_count = self.with_state(|state| state.bucket_count()).unwrap_or(0);
         debug!(
             "[{}] Gossip node stats: {} active client buckets",
             self.node_name.as_str(),
@@ -583,79 +456,31 @@ impl GossipController {
     }
 
     pub async fn handle_gossip_tick(&self) -> Result<()> {
-        // Fix origin alive but idle: age out expired ops on idle buckets before collecting
-        // deltas, so any resulting decrements ride this same gossip round.
-        self.tick_all_expirations()?;
-        // Send delta updates for buckets that have changed
-        let updates = self.collect_gossip_updates().await?;
-        if !updates.is_empty() {
-            let message = GossipMessage::DeltaStateSync {
+        // Ages every bucket first, so expiries ride this same gossip round.
+        let message = match self.with_state(|state| state.tick())? {
+            TickOutput::Delta(updates) => GossipMessage::DeltaStateSync {
                 updates,
                 sender_node_id: self.node_id,
                 response_addr: self.response_addr,
                 propagation_factor: 1,
-            };
-
-            let packet = GossipPacket::new(message);
-            self.send_gossip_packet(packet).await?;
-        } else {
-            // Send heartbeat if no updates to share
-            let vclock = {
-                let limiter_arc = self.get_limiter(None).map_err(|_| {
-                    tracing::error!("Failed to get default limiter");
-                    crate::error::ColibriError::Concurrency(
-                        "Failed to get default limiter".to_string(),
-                    )
-                })?;
-                let guard = limiter_arc
-                    .lock()
-                    .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-                guard.get_latest_updated_vclock()
-            };
-
-            let message = GossipMessage::Heartbeat {
+            },
+            TickOutput::Heartbeat(digest) => GossipMessage::Heartbeat {
                 node_id: self.node_id,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                vclock,
+                vclock: digest.buckets,
+                rules_digest: digest.rules,
                 response_addr: self.response_addr,
-            };
-
-            let packet = GossipPacket::new(message);
-            self.send_gossip_packet(packet).await?;
-        }
-
-        Ok(())
+            },
+        };
+        self.send_gossip_packet(GossipPacket::new(message)).await
     }
 
-    /// Drive ageing on every known limiter's live buckets.
-    ///
-    /// Without this, an idle bucket's ops never age out: `expire_entries` is
-    /// otherwise only called transitively from `add_tokens_to_bucket`, which
-    /// only runs when the bucket receives a new request. Called on each gossip
-    /// tick so that un-aged ops are expired locally and the resulting CRDT
-    /// decrements are picked up by the very next `collect_gossip_updates`.
-    pub fn tick_all_expirations(&self) -> Result<()> {
-        let limiters: Vec<Arc<Mutex<DistributedBucketLimiter>>> =
-            self.named_rate_limiters.pin().values().cloned().collect();
-        for limiter_arc in limiters {
-            let limiter = limiter_arc
-                .lock()
-                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-            limiter.tick_expirations();
-        }
-        Ok(())
-    }
-
-    /// Collect buckets that have been updated and should be gossiped
-    pub async fn collect_gossip_updates(&self) -> Result<Vec<DistributedBucketExternal>> {
-        let limiter_arc = self.get_limiter(None)?;
-        let guard = limiter_arc
-            .lock()
-            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-        Ok(guard.gossip_delta_state())
+    /// Forget idle clients under every rule.
+    pub fn expire_keys(&self) -> Result<()> {
+        self.with_state(|state| state.expire_keys())
     }
 
     /// Process an incoming gossip packet
@@ -703,18 +528,11 @@ impl GossipController {
                             self.node_id, requesting_node_id
                         );
 
-                        let state = {
-                            let limiter_arc = self.get_limiter(None)?;
-                            let limiter = limiter_arc.lock().map_err(|e| {
-                                ColibriError::Concurrency(format!("Lock poisoned: {}", e))
-                            })?;
-                            limiter.full_state_dump()
-                        };
+                        let state = self.with_state(|state| state.full_state())?;
 
                         if !state.is_empty() {
-                            // Respond with a DeltaStateSync (propagation_factor 1 so the
-                            // anti-entropy response is not re-gossiped further). The receiver
-                            // already handles DeltaStateSync idempotently via CRDT merge.
+                            // Respond with a DeltaStateSync; the receiver relays it
+                            // once more (propagation_factor 1).
                             let response = GossipMessage::DeltaStateSync {
                                 updates: state,
                                 sender_node_id: self.node_id,
@@ -753,7 +571,7 @@ impl GossipController {
                             sender_node_id,
                             updates.len()
                         );
-                        self.merge_gossip_state(&updates).await;
+                        self.with_state(|state| state.accept(&updates))?;
                         // Propagate further if propagation_factor > 0
                         if propagation_factor > 0 {
                             let message = GossipMessage::DeltaStateSync {
@@ -766,191 +584,106 @@ impl GossipController {
                             self.send_gossip_packet(packet).await?;
                         }
                     }
-                    GossipMessage::StateResponse {
-                        responding_node_id,
-                        requested_data,
-                        response_addr: _,
-                    } => {
-                        // Don't process our own messages
-                        if responding_node_id == self.node_id {
-                            return Ok(());
-                        }
-
-                        info!(
-                            "[GOSSIP_RESP] node:{} from:{} client:{}",
-                            self.node_id, responding_node_id, requested_data.client_id
-                        );
-                        let req = vec![requested_data];
-                        // Merge each incoming update
-                        self.merge_gossip_state(&req).await;
-                    }
                     GossipMessage::Heartbeat {
                         node_id: heartbeat_node_id,
                         timestamp: _,
-                        vclock: peer_vclock,
+                        vclock,
+                        rules_digest,
                         response_addr: peer_response_addr,
                     } => {
                         // Don't process our own heartbeat
                         if heartbeat_node_id == self.node_id {
                             return Ok(());
                         }
+                        let peer = HeartbeatDigest {
+                            buckets: vclock,
+                            rules: rules_digest,
+                        };
+                        let reply = self.with_state(|state| state.on_heartbeat(&peer))?;
 
-                        // Anti-entropy: if the peer's vclock has dots we don't have,
-                        // request their full state. The CRDT merge is idempotent so
-                        // requesting unnecessarily is safe; missing an update is not.
-                        //
-                        // `our_vclock >= peer_vclock` (causal dominance) means we have
-                        // seen every event the peer has. If that is not the case, the peer
-                        // is ahead on at least one actor slot — request a full sync.
-                        if !peer_vclock.is_empty() {
-                            let our_vclock = {
-                                let limiter_arc = self.get_limiter(None)?;
-                                let limiter = limiter_arc.lock().map_err(|e| {
-                                    ColibriError::Concurrency(format!("Lock poisoned: {}", e))
-                                })?;
-                                limiter.get_latest_updated_vclock()
+                        if reply.pull_state {
+                            info!(
+                                "[GOSSIP_ANTI_ENTROPY] node:{} behind peer:{}, sending StateRequest to {}",
+                                self.node_id, heartbeat_node_id, peer_response_addr
+                            );
+                            let request = GossipMessage::StateRequest {
+                                requesting_node_id: self.node_id,
+                                missing_keys: None,
+                                response_addr: self.response_addr,
                             };
-
-                            // Request state when our clock is strictly behind the peer
-                            // (Some(Less)) OR concurrent with it (None — both nodes have
-                            // events the other hasn't seen). Both cases mean the peer has
-                            // at least one update we're missing.
-                            let peer_has_unseen_state = matches!(
-                                our_vclock.partial_cmp(&peer_vclock),
-                                Some(std::cmp::Ordering::Less) | None
-                            );
-
-                            if peer_has_unseen_state {
-                                info!(
-                                    "[GOSSIP_ANTI_ENTROPY] node:{} vclock behind peer:{}, sending StateRequest to {}",
-                                    self.node_id, heartbeat_node_id, peer_response_addr
-                                );
-                                let request = GossipMessage::StateRequest {
-                                    requesting_node_id: self.node_id,
-                                    missing_keys: None,
-                                    response_addr: self.response_addr,
-                                };
-                                let packet = GossipPacket::new(request);
-                                if let Err(e) =
-                                    self.send_gossip_packet_to(peer_response_addr, packet).await
-                                {
-                                    warn!(
-                                        "[{}] Failed to send StateRequest to {}: {}",
-                                        self.node_id, peer_response_addr, e
-                                    );
-                                }
-                            } else {
-                                debug!(
-                                    "[{}] Heartbeat from {}: vclock is current, no anti-entropy needed",
-                                    self.node_id, heartbeat_node_id
-                                );
-                            }
-                        }
-                    }
-
-                    // Handle rate limit configuration messages
-                    GossipMessage::RateLimitConfigCreate {
-                        sender_node_id,
-                        rule,
-                        timestamp: _,
-                        response_addr: _,
-                    } => {
-                        if sender_node_id == self.node_id {
-                            return Ok(());
-                        }
-
-                        let rule_name = rule.name.as_str().to_string();
-                        if let Err(e) = self
-                            .create_named_rule_local(rule_name.clone(), rule.settings)
-                            .await
-                        {
-                            error!(
-                                "[{}] Failed to apply gossiped rule creation for '{}': {}",
-                                self.node_id, rule_name, e
-                            );
-                        } else {
-                            info!(
-                                "[{}] Applied gossiped rule creation: '{}'",
-                                self.node_id, rule_name
-                            );
-                        }
-                    }
-
-                    GossipMessage::RateLimitConfigDelete {
-                        sender_node_id,
-                        rule_name,
-                        timestamp: _,
-                        response_addr: _,
-                    } => {
-                        if sender_node_id == self.node_id {
-                            return Ok(());
-                        }
-
-                        if let Err(e) = self.delete_named_rule_local(rule_name.clone()).await {
-                            debug!(
-                                "[{}] Failed to apply gossiped rule deletion for '{}': {}",
-                                self.node_id, rule_name, e
-                            );
-                        } else {
-                            info!(
-                                "[{}] Applied gossiped rule deletion: '{}'",
-                                self.node_id, rule_name
-                            );
-                        }
-                    }
-
-                    GossipMessage::RateLimitConfigRequest {
-                        requesting_node_id,
-                        rule_name,
-                        response_addr: _,
-                    } => {
-                        if requesting_node_id == self.node_id {
-                            return Ok(());
-                        }
-
-                        let rules = if let Some(rn) = rule_name {
-                            if let Ok(config_rules) = self.list_named_rules_local().await {
-                                config_rules.into_iter().filter(|r| r.name == rn).collect()
-                            } else {
-                                vec![]
-                            }
-                        } else {
-                            self.list_named_rules_local().await.unwrap_or_default()
-                        };
-
-                        let response_message = GossipMessage::RateLimitConfigResponse {
-                            response_addr: self.response_addr,
-                            responding_node_id: self.node_id,
-                            rules: RuleList(rules),
-                        };
-
-                        let response_packet = GossipPacket::new(response_message);
-                        if let Err(e) = self.send_gossip_packet(response_packet).await {
-                            warn!("Failed to send gossip config response: {}", e);
-                        }
-                    }
-
-                    GossipMessage::RateLimitConfigResponse {
-                        responding_node_id,
-                        rules,
-                        response_addr: _,
-                    } => {
-                        if responding_node_id == self.node_id {
-                            return Ok(());
-                        }
-
-                        for rule in rules {
-                            let rule_name = rule.name.as_str().to_string();
                             if let Err(e) = self
-                                .create_named_rule_local(rule_name.clone(), rule.settings)
+                                .send_gossip_packet_to(
+                                    peer_response_addr,
+                                    GossipPacket::new(request),
+                                )
                                 .await
                             {
-                                debug!(
-                                    "[{}] Failed to apply received rule '{}': {}",
-                                    self.node_id, rule_name, e
+                                warn!(
+                                    "[{}] Failed to send StateRequest to {}: {}",
+                                    self.node_id, peer_response_addr, e
                                 );
-                            } else {
-                                debug!("[{}] Applied received rule: '{}'", self.node_id, rule_name);
+                            }
+                        }
+                        if reply.push_rules {
+                            let rules = self.with_state(|state| state.rule_config().clone())?;
+                            let sync = GossipMessage::RuleConfigSync {
+                                response_addr: self.response_addr,
+                                sender_node_id: self.node_id,
+                                rules,
+                            };
+                            if let Err(e) = self
+                                .send_gossip_packet_to(peer_response_addr, GossipPacket::new(sync))
+                                .await
+                            {
+                                warn!(
+                                    "[{}] Failed to send rules to {}: {}",
+                                    self.node_id, peer_response_addr, e
+                                );
+                            }
+                        }
+                    }
+
+                    GossipMessage::RuleConfigSync {
+                        sender_node_id,
+                        rules,
+                        response_addr: peer_addr,
+                    } => {
+                        if sender_node_id == self.node_id {
+                            return Ok(());
+                        }
+                        let (reply, ours) = self.with_state(|state| {
+                            (state.merge_rules(&rules), state.rule_config().clone())
+                        })?;
+                        if reply.send_rules {
+                            let sync = GossipMessage::RuleConfigSync {
+                                response_addr: self.response_addr,
+                                sender_node_id: self.node_id,
+                                rules: ours,
+                            };
+                            if let Err(e) = self
+                                .send_gossip_packet_to(peer_addr, GossipPacket::new(sync))
+                                .await
+                            {
+                                warn!(
+                                    "[{}] Failed to send rules to {}: {}",
+                                    self.node_id, peer_addr, e
+                                );
+                            }
+                        }
+                        if reply.request_state {
+                            let request = GossipMessage::StateRequest {
+                                requesting_node_id: self.node_id,
+                                missing_keys: None,
+                                response_addr: self.response_addr,
+                            };
+                            if let Err(e) = self
+                                .send_gossip_packet_to(peer_addr, GossipPacket::new(request))
+                                .await
+                            {
+                                warn!(
+                                    "[{}] Failed to send StateRequest to {}: {}",
+                                    self.node_id, peer_addr, e
+                                );
                             }
                         }
                     }
@@ -1035,155 +768,6 @@ impl GossipController {
             ))
         }
     }
-
-    /// Merge incoming gossip state from other nodes (public interface)
-    pub async fn merge_gossip_state(&self, entries: &[DistributedBucketExternal]) {
-        let node_id = self.node_id;
-        debug!(
-            "[{}] Processing {} gossip entries for merge",
-            node_id,
-            entries.len()
-        );
-        match self.get_limiter(None) {
-            Ok(arc) => match arc.lock() {
-                Ok(mut limiter) => {
-                    limiter.accept_delta_state(entries);
-                    debug!("[{}] merge_gossip_state_static completed", node_id);
-                }
-                Err(e) => {
-                    error!("[{}] Failed to acquire limiter lock: {}", node_id, e);
-                }
-            },
-            Err(e) => {
-                error!("[{}] Failed to get default limiter: {}", node_id, e);
-            }
-        }
-    }
-
-    /// Create a named rate limit rule locally (without gossiping)
-    pub async fn create_named_rule_local(
-        &self,
-        rule_name: String,
-        settings: settings::RateLimitSettings,
-    ) -> Result<()> {
-        if rule_name.is_empty() {
-            warn!(
-                "[{}] Received gossip request to create rule with empty name, ignoring",
-                self.node_id
-            );
-            return Ok(());
-        }
-
-        // Check if already exists
-        if self.get_named_rule_local(&rule_name).await?.is_some() {
-            return Ok(());
-        }
-
-        let rate_limiter = Arc::new(Mutex::new(DistributedBucketLimiter::new(
-            self.node_id,
-            settings,
-        )));
-        self.named_rate_limiters
-            .pin()
-            .insert(rule_name.clone(), rate_limiter);
-
-        Ok(())
-    }
-
-    /// Get a named rate limit rule locally (without gossiping)
-    pub async fn get_named_rule_local(&self, rule_name: &str) -> Result<Option<SerializableRule>> {
-        if let Some(limiter_arc) = self.named_rate_limiters.pin().get(rule_name).cloned() {
-            let limiter = limiter_arc
-                .lock()
-                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-            let settings = limiter.get_settings().clone();
-            return Ok(Some(SerializableRule {
-                name: RuleName::from(rule_name),
-                settings,
-            }));
-        }
-
-        Ok(None)
-    }
-
-    /// Delete a named rate limit rule locally (without gossiping)
-    pub async fn delete_named_rule_local(&self, rule_name: RuleName) -> Result<()> {
-        if rule_name.as_str() == DEFAULT_RULE_NAME {
-            return Err(ColibriError::Api(
-                "Cannot delete the default rule".to_string(),
-            ));
-        }
-
-        if self
-            .named_rate_limiters
-            .pin()
-            .remove(rule_name.as_str())
-            .is_some()
-        {
-            Ok(())
-        } else {
-            Err(ColibriError::Api(format!("Rule '{}' not found", rule_name)))
-        }
-    }
-
-    /// List all named rate limit rules locally
-    pub async fn list_named_rules_local(&self) -> Result<Vec<SerializableRule>> {
-        let guard = self.named_rate_limiters.pin();
-        let mut rules = Vec::new();
-
-        for (name, limiter_arc) in guard.iter() {
-            let limiter = limiter_arc
-                .lock()
-                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-            rules.push(SerializableRule {
-                name: RuleName::from(name.as_str()),
-                settings: limiter.get_settings().clone(),
-            });
-        }
-
-        Ok(rules)
-    }
-
-    /// Apply rate limiting using a custom named rule locally
-    pub async fn rate_limit_custom_local(
-        &self,
-        rule_name: RuleName,
-        key: String,
-    ) -> Result<Option<CheckCallsResponse>> {
-        let limiter_arc = self.get_limiter(Some(rule_name.as_str()))?;
-        let mut limiter = limiter_arc
-            .lock()
-            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-
-        let calls_left = limiter.limit_calls_for_client(key.clone());
-        calls_left
-            .map(|calls_remaining| {
-                Ok(Some(CheckCallsResponse {
-                    client_id: key,
-                    calls_remaining,
-                    rule_name: Some(rule_name),
-                }))
-            })
-            .unwrap_or_else(|| Ok(None))
-    }
-
-    /// Check remaining calls using a custom named rule locally
-    pub async fn check_limit_custom_local(
-        &self,
-        rule_name: RuleName,
-        key: String,
-    ) -> Result<CheckCallsResponse> {
-        let limiter_arc = self.get_limiter(Some(rule_name.as_str()))?;
-        let limiter = limiter_arc
-            .lock()
-            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
-        let calls_remaining = limiter.check_calls_remaining_for_client(&key);
-        Ok(CheckCallsResponse {
-            client_id: key,
-            calls_remaining,
-            rule_name: Some(rule_name),
-        })
-    }
 }
 
 // ===== Tx4: Controller-level tests for deduplication and packet processing =====
@@ -1191,7 +775,9 @@ impl GossipController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limiters::distributed_bucket::DistributedBucketLimiter;
     use crate::node::NodeName;
+    use crate::node::gossip::state::RuleBuckets;
     use crate::settings;
 
     /// Helper: build a serialized `DeltaStateSync` packet whose updates come
@@ -1208,7 +794,11 @@ mod tests {
         let rl = controller_settings.rate_limit_settings();
         let mut sender_limiter = DistributedBucketLimiter::new(sender_id, rl);
         sender_limiter.limit_calls_for_client(client_id.to_string());
-        let updates = sender_limiter.gossip_delta_state();
+        let updates = vec![RuleBuckets {
+            rule: RuleName::default(),
+            version: None,
+            buckets: sender_limiter.gossip_delta_state(),
+        }];
 
         let message = GossipMessage::DeltaStateSync {
             updates,
@@ -1293,17 +883,11 @@ mod tests {
             .await
             .unwrap();
 
-        let limiter_arc = controller
-            .named_rate_limiters
-            .pin()
-            .get(DEFAULT_RULE_NAME)
-            .cloned()
-            .unwrap();
-        let guard = limiter_arc.lock().unwrap();
+        let state = controller.state.lock().unwrap();
 
         // Both clients should have been merged into the limiter.
-        let alice = guard.check_calls_remaining_for_client(&"alice".to_string());
-        let bob = guard.check_calls_remaining_for_client(&"bob".to_string());
+        let alice = state.check(&RuleName::default(), "alice").unwrap();
+        let bob = state.check(&RuleName::default(), "bob").unwrap();
 
         // sender consumed one token each; both should be below the full limit.
         assert!(
@@ -1314,5 +898,37 @@ mod tests {
             bob < settings.rate_limit_max_calls_allowed,
             "bob's bucket not merged (tokens={bob})"
         );
+    }
+
+    /// A rule configuration received from a peer creates its rules here.
+    #[tokio::test]
+    async fn test_rule_config_sync_creates_rules() {
+        let settings = settings::tests::sample();
+        let controller = GossipController::new(settings.clone()).await.unwrap();
+        let peer_id = NodeName::from("peer").node_id();
+        let rule = RuleName::from("checkout");
+        let rule_settings = RateLimitSettings {
+            rate_limit_max_calls_allowed: 7,
+            rate_limit_interval_seconds: 2,
+        };
+
+        let mut peer = GossipState::new(peer_id, settings.rate_limit_settings());
+        peer.create_rule(rule.clone(), rule_settings.clone())
+            .unwrap();
+        let packet = GossipPacket::new(GossipMessage::RuleConfigSync {
+            response_addr: "127.0.0.1:9003".parse().unwrap(),
+            sender_node_id: peer_id,
+            rules: peer.rule_config().clone(),
+        });
+        controller
+            .process_gossip_packet(
+                packet.serialize().unwrap(),
+                "127.0.0.1:9003".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let created = controller.get_rate_limit_rule(rule).await.unwrap();
+        assert_eq!(created.map(|r| r.settings), Some(rule_settings));
     }
 }

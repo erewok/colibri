@@ -1,181 +1,125 @@
 #!/usr/bin/env bash
+# How nodes share a client's limit. This differs by mode:
+#
+# - hashring: each client belongs to one owner node, and every node forwards
+#   both requests and checks to it. All nodes therefore report the same
+#   count at once, and the client gets exactly max_calls however its requests
+#   are spread across nodes.
+# - gossip: every node keeps its own replica and gossips changes. A node
+#   always counts its own requests, so it admits at most max_calls per window.
+#   Nodes can admit concurrently before hearing of each other, so the cluster
+#   admits at most (number of nodes) * max_calls per window. Once gossip has
+#   spread, every node enforces the shared limit.
+#
+# Uses: max_calls, interval_seconds, mode, ports
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+source "$(dirname "$0")/validation-utils.sh"
+check_dependencies
 
-# Configuration
-MAX_CALLS=${max_calls:-5}
-INTERVAL_SECONDS=${interval_seconds:-3}
-MODE=${mode:-"gossip"}  # gossip or hashring
-TEST_CLIENT="consistency-test"
+FIRST=${PORTS%% *}
+OTHERS=${PORTS#* }
+NODE_COUNT=$(echo "$PORTS" | wc -w | tr -d ' ')
 
-echo -e "${BLUE}=== Distributed Consistency Validation (${MODE} mode) ===${NC}"
-echo -e "Rate limit: ${MAX_CALLS} calls per ${INTERVAL_SECONDS}s"
-echo
+echo -e "${BLUE}=== Distributed Consistency Validation (${MODE} mode, $(rule_label)) ===${NC}"
+echo "Rate limit: ${MAX_CALLS} calls per ${INTERVAL_SECONDS}s across ports ${PORTS}"
 
-# Function to get remaining tokens from specific port
-get_remaining() {
-    local port=$1
-    response=$(curl -s -X GET "http://localhost:${port}/rl-check/${TEST_CLIENT}" 2>/dev/null)
-    remaining=$(echo "$response" | jq -r '.calls_remaining // 0' 2>/dev/null || echo "0")
-    echo $remaining
-}
+if [ "$MODE" = "hashring" ]; then
+    section "Phase 1: Every node reports the owner's count"
+    client=$(fresh_client routing)
+    post "$FIRST" "$client"
+    post "$FIRST" "$client"
+    for port in $PORTS; do
+        expect_eq "port $port calls remaining after 2 requests" "$(remaining "$port" "$client")" "$((MAX_CALLS - 2))"
+    done
 
-# Function to make rate limit request
-make_request() {
-    local port=$1
-    response=$(curl -s -w "HTTPCODE:%{http_code}" -X POST "http://localhost:${port}/rl/${TEST_CLIENT}" 2>/dev/null)
-    http_code=$(echo "$response" | grep -o "HTTPCODE:[0-9]*" | cut -d: -f2)
-    echo $http_code
-}
+    section "Phase 2: One limit per client, wherever requests land"
+    client=$(fresh_client shared)
+    admitted=0
+    for i in $(seq 1 $((NODE_COUNT * MAX_CALLS))); do
+        set -- $PORTS
+        shift $(((i - 1) % NODE_COUNT))
+        post "$1" "$client"
+        [ "$HTTP_CODE" = "200" ] && admitted=$((admitted + 1))
+    done
+    expect_eq "admitted out of $((NODE_COUNT * MAX_CALLS)) spread round-robin" "$admitted" "$MAX_CALLS"
 
-echo -e "\n${YELLOW}Phase 1: Initial consistency check${NC}"
-echo "Checking initial token state across all nodes:"
-for port in 8001 8002 8003; do
-    remaining=$(get_remaining $port)
-    echo "Node ${port}: ${remaining} tokens"
-done
+    section "Phase 3: Capacity returns after the interval on every node"
+    sleep "$INTERVAL_SECONDS"
+    sleep 0.25
+    for port in $PORTS; do
+        expect_eq "port $port calls remaining" "$(remaining "$port" "$client")" "$MAX_CALLS"
+    done
 
-echo -e "\n${YELLOW}Phase 2: Single node consumption${NC}"
-echo "Consuming 2 tokens on node 8001..."
-make_request 8001 > /dev/null
-make_request 8001 > /dev/null
-
-echo "Token state after consumption on node 8001:"
-node1_tokens=$(get_remaining 8001)
-node2_tokens=$(get_remaining 8002)
-node3_tokens=$(get_remaining 8003)
-
-echo "Node 8001: ${node1_tokens} tokens"
-echo "Node 8002: ${node2_tokens} tokens"
-echo "Node 8003: ${node3_tokens} tokens"
-
-if [ "$MODE" = "gossip" ]; then
-    echo -e "\n${BLUE}GOSSIP MODE EXPECTATIONS:${NC}"
-    echo "- All nodes should eventually have same reduced token count"
-    echo "- May take a few seconds for gossip propagation"
-
-    # Wait for gossip propagation
-    echo "Waiting 3s for gossip propagation..."
-    sleep 3
-
-    echo "Token state after gossip propagation:"
-    node1_tokens=$(get_remaining 8001)
-    node2_tokens=$(get_remaining 8002)
-    node3_tokens=$(get_remaining 8003)
-
-    echo "Node 8001: ${node1_tokens} tokens"
-    echo "Node 8002: ${node2_tokens} tokens"
-    echo "Node 8003: ${node3_tokens} tokens"
-
-    if [ $node1_tokens -eq $node2_tokens ] && [ $node2_tokens -eq $node3_tokens ]; then
-        echo -e "${GREEN}✓${NC} Complete gossip consistency achieved"
-    elif [ $((node1_tokens + node2_tokens + node3_tokens)) -lt $((MAX_CALLS * 3 - 2)) ]; then
-        echo -e "${YELLOW}⚠${NC} Partial gossip consistency (some state shared)"
+elif [ "$MODE" = "gossip" ]; then
+    section "Phase 1: A change on one node reaches every node"
+    client=$(fresh_client propagation)
+    post "$FIRST" "$client"
+    post "$FIRST" "$client"
+    info "right after: $(remaining_everywhere "$client")"
+    if await_everywhere "$client" "$((MAX_CALLS - 2))" "$CONVERGE_TIMEOUT_SECONDS"; then
+        pass "all nodes report $((MAX_CALLS - 2)) remaining after ${WAITED}s"
     else
-        echo -e "${RED}✗${NC} No gossip consistency detected"
+        fail "nodes did not converge within ${CONVERGE_TIMEOUT_SECONDS}s: $(remaining_everywhere "$client")"
     fi
 
-elif [ "$MODE" = "hashring" ]; then
-    echo -e "\n${BLUE}HASHRING MODE EXPECTATIONS:${NC}"
-    echo "- Only the bucket owner should show token consumption"
-    echo "- Other nodes should maintain full tokens"
-
-    # In hashring mode, requests to different nodes should route to bucket owners
-    total_tokens=$((node1_tokens + node2_tokens + node3_tokens))
-    consumed_tokens=$((MAX_CALLS * 3 - total_tokens))
-
-    if [ $consumed_tokens -eq 2 ]; then
-        echo -e "${GREEN}✓${NC} Correct hashring behavior: ${consumed_tokens} tokens consumed total"
+    section "Phase 2: Once gossip has spread, every node enforces the shared limit"
+    client=$(fresh_client enforcement)
+    burst "$FIRST" "$client" "$MAX_CALLS"
+    expect_eq "admitted on port $FIRST" "$ADMITTED" "$MAX_CALLS"
+    if await_everywhere "$client" 0 "$CONVERGE_TIMEOUT_SECONDS"; then
+        pass "all nodes report 0 remaining after ${WAITED}s"
     else
-        echo -e "${YELLOW}⚠${NC} Unexpected token consumption pattern: ${consumed_tokens} tokens consumed"
+        fail "nodes did not converge within ${CONVERGE_TIMEOUT_SECONDS}s: $(remaining_everywhere "$client")"
     fi
-fi
+    for port in $OTHERS; do
+        post "$port" "$client"
+        expect_eq "request on port $port" "$HTTP_CODE" "429"
+    done
 
-echo -e "\n${YELLOW}Phase 3: Cross-node request distribution${NC}"
-echo "Making requests to different nodes to test routing..."
+    section "Phase 3: Concurrent admission is bounded"
+    echo "Sending $((NODE_COUNT * MAX_CALLS + NODE_COUNT)) requests round-robin, faster than gossip..."
+    client=$(fresh_client concurrent)
+    total=0
+    for port in $PORTS; do
+        eval "admitted_$port=0"
+    done
+    for i in $(seq 1 $((NODE_COUNT * MAX_CALLS + NODE_COUNT))); do
+        set -- $PORTS
+        shift $(((i - 1) % NODE_COUNT))
+        post "$1" "$client"
+        if [ "$HTTP_CODE" = "200" ]; then
+            total=$((total + 1))
+            eval "admitted_$1=\$((admitted_$1 + 1))"
+        fi
+    done
+    for port in $PORTS; do
+        eval "count=\$admitted_$port"
+        expect_between "admitted on port $port" "$count" 0 "$MAX_CALLS"
+    done
+    expect_between "admitted across the cluster" "$total" "$MAX_CALLS" "$((NODE_COUNT * MAX_CALLS))"
+    info "the cluster admitted $total; anything above ${MAX_CALLS} is nodes admitting before they heard of each other"
 
-# Make requests to each node and track responses
-for port in 8001 8002 8003; do
-    http_code=$(make_request $port)
-    if [ "$http_code" = "200" ]; then
-        result="SUCCESS"
+    section "Phase 4: Nodes converge after concurrent admission"
+    if await_everywhere "$client" 0 "$CONVERGE_TIMEOUT_SECONDS"; then
+        pass "all nodes report 0 remaining after ${WAITED}s"
     else
-        result="RATE_LIMITED"
+        fail "nodes did not converge within ${CONVERGE_TIMEOUT_SECONDS}s: $(remaining_everywhere "$client")"
     fi
-    echo "Request to node ${port}: $result"
-done
 
-echo -e "\n${YELLOW}Phase 4: Token exhaustion test${NC}"
-echo "Attempting to exhaust rate limit across all nodes..."
-
-# Keep making requests until we hit rate limits
-total_requests=0
-success_requests=0
-
-for attempt in $(seq 1 $((MAX_CALLS * 2))); do
-    port=$((8001 + (attempt % 3)))  # Round-robin across nodes
-    http_code=$(make_request $port)
-    ((total_requests++))
-
-    if [ "$http_code" = "200" ]; then
-        ((success_requests++))
-        echo "Request ${total_requests} to ${port}: SUCCESS"
+    section "Phase 5: Capacity returns on every node after the window"
+    echo "Waiting ${INTERVAL_SECONDS}s for the window to pass..."
+    sleep "$INTERVAL_SECONDS"
+    # Each node ages its own requests on its next tick, then gossip spreads
+    # the expiries; nothing here races the window, so allow a little longer.
+    recovery_timeout=$((CONVERGE_TIMEOUT_SECONDS + 2))
+    if await_everywhere "$client" "$MAX_CALLS" "$recovery_timeout"; then
+        pass "all nodes report $MAX_CALLS remaining ${WAITED}s after the window"
     else
-        echo "Request ${total_requests} to ${port}: RATE_LIMITED"
-        break  # Stop once we hit rate limit
+        fail "capacity not restored everywhere within ${recovery_timeout}s: $(remaining_everywhere "$client")"
     fi
-done
 
-echo -e "\nExhaustion test results:"
-echo "Total requests made: ${total_requests}"
-echo "Successful requests: ${success_requests}"
-
-if [ "$MODE" = "gossip" ]; then
-    # In gossip mode, we expect around MAX_CALLS successful requests total
-    if [ $success_requests -le $((MAX_CALLS + 1)) ] && [ $success_requests -ge $((MAX_CALLS - 1)) ]; then
-        echo -e "${GREEN}✓${NC} Correct gossip behavior: ~${MAX_CALLS} requests allowed"
-    else
-        echo -e "${YELLOW}⚠${NC} Unexpected gossip behavior: ${success_requests} requests allowed"
-    fi
-elif [ "$MODE" = "hashring" ]; then
-    # In hashring mode, we might see different behavior depending on consistent hashing
-    echo -e "${BLUE}ℹ${NC} Hashring behavior: ${success_requests}/${MAX_CALLS} requests succeeded"
-fi
-
-echo -e "\n${YELLOW}Phase 5: Recovery validation${NC}"
-echo "Waiting ${INTERVAL_SECONDS}s for token recovery..."
-sleep $((INTERVAL_SECONDS + 1))
-
-echo "Token state after recovery period:"
-for port in 8001 8002 8003; do
-    remaining=$(get_remaining $port)
-    echo "Node ${port}: ${remaining} tokens"
-done
-
-# Test that requests work again
-echo -e "\nTesting post-recovery requests:"
-recovery_success=0
-for port in 8001 8002 8003; do
-    http_code=$(make_request $port)
-    if [ "$http_code" = "200" ]; then
-        ((recovery_success++))
-        echo "Node ${port}: SUCCESS"
-    else
-        echo "Node ${port}: STILL_LIMITED"
-    fi
-done
-
-if [ $recovery_success -eq 3 ]; then
-    echo -e "${GREEN}✓${NC} Full recovery achieved on all nodes"
-elif [ $recovery_success -gt 0 ]; then
-    echo -e "${YELLOW}⚠${NC} Partial recovery (${recovery_success}/3 nodes)"
 else
-    echo -e "${RED}✗${NC} No recovery detected"
+    info "nothing to check across nodes in ${MODE} mode"
 fi
 
-echo -e "\n${BLUE}=== Distributed Consistency Validation Complete ===${NC}"
+finish

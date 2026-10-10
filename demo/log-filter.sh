@@ -12,31 +12,13 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 while IFS= read -r line; do
-    # Rate limiting validation messages
-    if echo "$line" | grep -q '\[RATE_CHECK\]'; then
-        echo -e "${GREEN}$line${NC}"
-    elif echo "$line" | grep -q '\[RATE_LIMIT\]'; then
-        if echo "$line" | grep -q 'allowed:false'; then
-            echo -e "${RED}$line${NC}"
-        else
-            echo -e "${GREEN}$line${NC}"
-        fi
-    elif echo "$line" | grep -q '\[GOSSIP_CHECK\]'; then
-        echo -e "${CYAN}$line${NC}"
-    elif echo "$line" | grep -q '\[GOSSIP_LIMIT\]'; then
-        if echo "$line" | grep -q 'allowed:false'; then
-            echo -e "${RED}$line${NC}"
-        else
-            echo -e "${CYAN}$line${NC}"
-        fi
-    elif echo "$line" | grep -q '\[GOSSIP_SYNC\]'; then
+    # Gossip protocol messages
+    if echo "$line" | grep -q '\[GOSSIP_SYNC\]'; then
         echo -e "${BLUE}$line${NC}"
-    elif echo "$line" | grep -q '\[TCP_RESPONSE\]'; then
+    elif echo "$line" | grep -q '\[GOSSIP_RESP\]'; then
+        echo -e "${CYAN}$line${NC}"
+    elif echo "$line" | grep -q '\[GOSSIP_ANTI_ENTROPY\]'; then
         echo -e "${YELLOW}$line${NC}"
-    elif echo "$line" | grep -q '\[ROUTE_FALLBACK\]'; then
-        echo -e "${YELLOW}$line${NC}"
-    elif echo "$line" | grep -q '\[BUCKET_MISSING\]'; then
-        echo -e "${RED}$line${NC}"
     # Error messages
     elif echo "$line" | grep -q -i 'error'; then
         echo -e "${RED}$line${NC}"

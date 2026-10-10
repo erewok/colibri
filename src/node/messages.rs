@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::error::{ColibriError, Result};
-use crate::limiters::{DistributedBucketExternal, rules};
-use crate::node::{NodeAddress, NodeId, NodeName};
+use crate::limiters::rule_config::RuleConfig;
+use crate::limiters::rules;
+use crate::node::{NodeAddress, NodeName};
 use crate::settings::{RateLimitSettings, RunMode};
 
 /// Unified command type for controller queues
@@ -55,6 +56,9 @@ pub fn serialize<T: Serialize>(msg: &T) -> Result<bytes::Bytes> {
 pub fn deserialize<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T> {
     from_bytes(data).map_err(ColibriError::from)
 }
+
+/// Version of the `Message` wire format. Bump it whenever `Message` changes.
+pub const MESSAGE_PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum forwarding depth to prevent loops in case of topology inconsistency
 pub const MAX_FORWARDING_DEPTH: u8 = 3;
@@ -161,15 +165,16 @@ impl MessageEnvelopeV2 {
 /// - Rate limiting operations (both gossip and hashring modes)
 /// - Configuration operations (both modes)
 /// - Cluster operations (both modes)
-/// - Gossip-specific operations (gossip mode only)
 /// - Admin operations (all modes)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     // ===== Rate limiting operations =====
     /// Request to check or consume rate limit tokens
     RateLimitRequest(CheckCallsRequest),
-    /// Response with remaining tokens
-    RateLimitResponse(CheckCallsResponse),
+    /// Response with remaining tokens. `None` means a consuming request was
+    /// rate limited; a request that takes the last token is `Some` with
+    /// `calls_remaining == 0`.
+    RateLimitResponse(Option<CheckCallsResponse>),
 
     ExpireKeys, // Internal message to trigger key expiry
     // ===== Configuration operations =====
@@ -208,28 +213,8 @@ pub enum Message {
     /// Response with status information
     StatusResponse(StatusResponse),
 
-    // ===== Gossip-specific operations (gossip mode only) =====
-    /// Delta-state synchronization with recent updates
-    GossipDeltaSync {
-        updates: Vec<DistributedBucketExternal>,
-        propagation_factor: u8,
-    },
-
-    /// Request for missing state data (anti-entropy)
-    GossipStateRequest {
-        missing_keys: Option<Vec<String>>,
-    },
-
-    /// Response with requested state data
-    GossipStateResponse {
-        data: Vec<DistributedBucketExternal>,
-    },
-
-    /// Heartbeat with vector clock for anti-entropy
-    GossipHeartbeat {
-        timestamp: u64,
-        vclock: crdts::VClock<NodeId>,
-    },
+    /// A node's full rule configuration (hashring mode)
+    RuleConfigSync(RuleConfig),
 
     // ===== Admin operations (both modes) =====
     /// Add a new node to cluster topology
@@ -273,13 +258,26 @@ pub enum Message {
 
 impl Message {
     /// Serialize message using postcard binary format
+    /// Encode with a leading protocol version, so nodes on different versions
+    /// refuse each other's messages instead of misreading them.
     pub fn serialize(&self) -> Result<bytes::Bytes> {
-        serialize(self)
+        let mut data = MESSAGE_PROTOCOL_VERSION.to_be_bytes().to_vec();
+        data.extend_from_slice(&serialize(self)?);
+        Ok(bytes::Bytes::from(data))
     }
 
-    /// Deserialize message using postcard binary format
+    /// Decode a message, refusing one from a different protocol version.
     pub fn deserialize(data: &[u8]) -> Result<Self> {
-        deserialize(data)
+        let (version, body) = data
+            .split_first_chunk::<2>()
+            .ok_or_else(|| ColibriError::Transport("Message too short".to_string()))?;
+        let version = u16::from_be_bytes(*version);
+        if version != MESSAGE_PROTOCOL_VERSION {
+            return Err(ColibriError::Transport(format!(
+                "Message protocol version mismatch: expected {MESSAGE_PROTOCOL_VERSION}, got {version}"
+            )));
+        }
+        deserialize(body)
     }
 }
 
@@ -430,11 +428,11 @@ mod message_tests {
         );
 
         // Simulate sending a response
-        let response = Message::RateLimitResponse(CheckCallsResponse {
+        let response = Message::RateLimitResponse(Some(CheckCallsResponse {
             client_id: "test-key".to_string(),
             rule_name: None,
             calls_remaining: 100,
-        });
+        }));
 
         command.response_tx.send(Ok(response)).unwrap();
 
@@ -445,6 +443,21 @@ mod message_tests {
             received.unwrap().unwrap(),
             Message::RateLimitResponse(_)
         ));
+    }
+
+    /// A message from a node running a different protocol version is refused,
+    /// not misread: postcard encodes enum variants by position.
+    #[test]
+    fn test_protocol_version_mismatch_is_refused() {
+        let message = Message::GetStatus;
+        let mut bytes = message.serialize().unwrap().to_vec();
+        assert!(Message::deserialize(&bytes).is_ok());
+        bytes[0] ^= 0xff;
+        let err = Message::deserialize(&bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("version"),
+            "unexpected error: {err}"
+        );
     }
 }
 

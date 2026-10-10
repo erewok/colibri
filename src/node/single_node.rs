@@ -173,7 +173,7 @@ impl Node for SingleNode {
         let limiters = self.named_rate_limiters.read().map_err(|e| {
             ColibriError::Concurrency(format!("Failed to acquire limiters lock: {}", e))
         })?;
-        for (_rule_name, rate_limiter) in limiters.iter() {
+        for rate_limiter in limiters.values() {
             let mut rl = rate_limiter.lock().map_err(|e| {
                 ColibriError::Concurrency(format!("Failed to acquire rate_limiter lock: {}", e))
             })?;
@@ -219,20 +219,35 @@ pub async fn local_rate_limit(
             ))
         }
         Ok(mut rate_limiter) => {
+            // `None` means rate limited. `Some(0)` is an admitted request that
+            // took the last token.
             let calls_left = rate_limiter.limit_calls_for_client(client_id.to_string());
-            if let Some(calls_remaining) = calls_left {
-                if calls_remaining == 0 {
-                    Ok(None)
-                } else {
-                    Ok(Some(CheckCallsResponse {
-                        client_id,
-                        calls_remaining,
-                        rule_name,
-                    }))
-                }
-            } else {
-                Ok(None)
-            }
+            Ok(calls_left.map(|calls_remaining| CheckCallsResponse {
+                client_id,
+                calls_remaining,
+                rule_name,
+            }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{self, RunMode};
+
+    /// Regression (found by the demo scripts): the request that takes the last
+    /// token is admitted with 0 remaining, not reported as rate limited.
+    #[tokio::test]
+    async fn test_last_token_is_admitted() {
+        let mut settings = settings::tests::sample();
+        settings.rate_limit_max_calls_allowed = 1;
+        settings.run_mode = RunMode::Single;
+        let node = SingleNode::new(settings).await.unwrap();
+        let client_id = "last_token_client".to_string();
+
+        let first = node.rate_limit(client_id.clone()).await.unwrap();
+        assert_eq!(first.map(|r| r.calls_remaining), Some(0));
+        assert!(node.rate_limit(client_id).await.unwrap().is_none());
     }
 }

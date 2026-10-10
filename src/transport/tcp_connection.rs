@@ -371,7 +371,7 @@ mod tests {
         match deserialized.unwrap() {
             Message::RateLimitRequest(req) => {
                 assert_eq!(req.client_id, "test-key");
-                assert_eq!(req.consume_token, true);
+                assert!(req.consume_token);
             }
             _ => panic!("Wrong message variant"),
         }
@@ -403,11 +403,11 @@ mod tests {
         let config = create_test_transport_config();
         let transport = TcpTransport::new(&config).await.unwrap();
 
-        let message = Message::RateLimitResponse(CheckCallsResponse {
+        let message = Message::RateLimitResponse(Some(CheckCallsResponse {
             client_id: "test".to_string(),
             rule_name: None,
             calls_remaining: 10,
-        });
+        }));
 
         // Broadcasting to empty list should fail
         let result = transport.broadcast_message(vec![], &message).await;

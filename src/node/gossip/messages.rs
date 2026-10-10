@@ -7,9 +7,9 @@ use crdts::VClock;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
-use crate::limiters::distributed_bucket::DistributedBucketExternal;
-use crate::limiters::{RuleList, RuleName, SerializableRule};
-use crate::node::NodeId;
+use super::state::RuleBuckets;
+use crate::limiters::rule_config::RuleConfig;
+use crate::node::{ActorId, NodeId};
 
 /// Wire protocol version. Bump this whenever the `GossipMessage` enum or
 /// `GossipPacket` layout changes in a backward-incompatible way.
@@ -18,7 +18,7 @@ use crate::node::NodeId;
 /// positional), removing or reordering variants silently corrupts traffic on a
 /// mixed-version cluster. Bumping this constant and rejecting mismatches on the
 /// receive side turns that silent corruption into a hard, logged error.
-pub const GOSSIP_PROTOCOL_VERSION: u16 = 1;
+pub const GOSSIP_PROTOCOL_VERSION: u16 = 2;
 
 /// Error returned by [`GossipPacket::from_wire`].
 #[derive(Debug)]
@@ -54,7 +54,7 @@ pub enum GossipMessage {
     /// Delta-state synchronization - only recently updated keys
     DeltaStateSync {
         response_addr: SocketAddr,
-        updates: Vec<DistributedBucketExternal>, // Only changed keys
+        updates: Vec<RuleBuckets>, // Only changed keys
         sender_node_id: NodeId,
         propagation_factor: u8, // To limit spread
     },
@@ -66,46 +66,20 @@ pub enum GossipMessage {
         requesting_node_id: NodeId,
     },
 
-    /// Response to state request with missing data
-    StateResponse {
-        response_addr: SocketAddr,
-        responding_node_id: NodeId,
-        requested_data: DistributedBucketExternal,
-    },
-
-    /// Heartbeat with version vectors for anti-entropy
+    /// Heartbeat with digests of the sender's state, for anti-entropy
     Heartbeat {
         response_addr: SocketAddr,
         timestamp: u64,
         node_id: NodeId,
-        vclock: VClock<NodeId>,
+        vclock: VClock<ActorId>,
+        rules_digest: u64,
     },
 
-    /// Rate limit configuration synchronization messages
-    RateLimitConfigCreate {
+    /// The sender's full rule configuration
+    RuleConfigSync {
         response_addr: SocketAddr,
         sender_node_id: NodeId,
-        rule: SerializableRule,
-        timestamp: u64,
-    },
-
-    RateLimitConfigDelete {
-        response_addr: SocketAddr,
-        sender_node_id: NodeId,
-        rule_name: RuleName,
-        timestamp: u64,
-    },
-
-    RateLimitConfigRequest {
-        response_addr: SocketAddr,
-        requesting_node_id: NodeId,
-        rule_name: Option<RuleName>, // None = request all rules
-    },
-
-    RateLimitConfigResponse {
-        response_addr: SocketAddr,
-        responding_node_id: NodeId,
-        rules: RuleList,
+        rules: RuleConfig,
     },
 }
 

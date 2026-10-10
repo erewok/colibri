@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -8,27 +9,31 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::TokenBucketLimiter;
+use crate::limiters::rule_config::{RuleConfig, RuleVersion};
 use crate::limiters::rules::{self, RuleName, SerializableRule};
 use crate::node::messages::{
     CheckCallsRequest, CheckCallsResponse, Message, Status, StatusResponse, TopologyResponse,
 };
-use crate::node::{NodeAddress, NodeId, NodeName};
+use crate::node::{ActorId, NodeAddress, NodeId, NodeName};
 use crate::settings::{self, ClusterTopology, RunMode};
 use crate::transport::traits::{RequestSender, Sender};
 use crate::transport::{TcpReceiver, TcpTransport, tcp_receiver::TcpRequest};
 
 use super::consistent_hashing;
 
+/// How often a node re-sends its rule configuration to every peer, so one
+/// that missed a change catches up.
+const RULE_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Controller for consistent hash ring distributed rate limiter
 #[derive(Clone)]
 pub struct HashringController {
     node_name: NodeName,
-    /// This node's positional index in topology.sorted_nodes() — its owned bucket.
-    bucket: u32,
     topology: Arc<RwLock<ClusterTopology>>,
     transport: Arc<TcpTransport>,
-    /// Concurrent HashMap for rate limiters (papaya provides lock-free reads)
-    pub named_rate_limiters: HashMap<String, Arc<Mutex<TokenBucketLimiter>>>,
+    /// Rate limiters per rule. Shared, not cloned, with the receiver task's
+    /// copy of the controller: cloning a papaya map copies its entries.
+    pub named_rate_limiters: Arc<HashMap<String, Arc<Mutex<TokenBucketLimiter>>>>,
     /// Receiver address for logging
     receiver_addr: SocketAddr,
     /// Receiver for incoming TCP messages
@@ -39,13 +44,18 @@ pub struct HashringController {
     msg_receive_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Handle for the message evaluation loop (reads from channel, calls handle_message)
     msg_eval_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Named rules, replicated on every node, and the version each limiter runs
+    rules: Arc<Mutex<(RuleConfig, BTreeMap<RuleName, RuleVersion>)>>,
+    /// This process, for versioning its rule changes
+    actor: ActorId,
+    /// Handle for the periodic rule sync loop
+    rule_sync_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for HashringController {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HashringController")
             .field("node_name", &self.node_name)
-            .field("bucket", &self.bucket)
             .finish()
     }
 }
@@ -62,19 +72,12 @@ impl HashringController {
             ));
         }
 
-        // Bucket = positional index in sorted_nodes(). This is the only correct assignment:
-        // find_owner_if_not_self uses sorted_nodes()[bucket], so both sides must use position,
-        // not jump_consistent_hash(node_name) which is not a bijection over node names.
-        let sorted = cluster_topology.sorted_nodes();
-        let bucket = sorted
-            .iter()
-            .position(|(name, _)| name == &node_name)
-            .ok_or_else(|| {
-                ColibriError::Config(format!(
-                    "Node '{}' not found in its own topology — ensure the topology includes this node",
-                    node_name
-                ))
-            })? as u32;
+        if !cluster_topology.contains_node(&node_name) {
+            return Err(ColibriError::Config(format!(
+                "Node '{}' not found in its own topology — ensure the topology includes this node",
+                node_name
+            )));
+        }
 
         // Initialize HashMap with default limiter
         let named_rate_limiters = HashMap::new();
@@ -94,17 +97,20 @@ impl HashringController {
         let (message_tx, receive_chan) = tokio::sync::mpsc::channel(1000);
         let receiver = TcpReceiver::new(receiver_addr, Arc::new(message_tx)).await?;
 
+        let actor = ActorId::fresh(node_name.node_id());
         Ok(Self {
             node_name,
-            bucket,
             topology: Arc::new(RwLock::new(cluster_topology)),
             transport: Arc::new(transport),
-            named_rate_limiters,
+            named_rate_limiters: Arc::new(named_rate_limiters),
             receiver_addr,
             receiver: Arc::new(receiver),
             receive_chan: Arc::new(Mutex::new(Some(receive_chan))),
             msg_receive_handle: Arc::new(Mutex::new(None)),
             msg_eval_handle: Arc::new(Mutex::new(None)),
+            rules: Arc::new(Mutex::new((RuleConfig::default(), BTreeMap::new()))),
+            actor,
+            rule_sync_handle: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -198,8 +204,104 @@ impl HashringController {
         Ok(())
     }
 
+    /// Forget clients idle for two intervals in every limiter this node owns.
+    /// Their buckets have refilled to capacity, so this changes no decision.
+    pub fn expire_keys(&self) -> Result<()> {
+        for limiter in self.named_rate_limiters.pin().values() {
+            limiter
+                .lock()
+                .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?
+                .expire_keys();
+        }
+        Ok(())
+    }
+
+    /// Re-send the rule configuration to every peer every `RULE_SYNC_INTERVAL`.
+    pub fn start_rule_sync(&self) -> Result<()> {
+        let controller = self.clone();
+        let handle = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(RULE_SYNC_INTERVAL);
+            loop {
+                timer.tick().await;
+                controller.broadcast_rules().await;
+            }
+        });
+        *self
+            .rule_sync_handle
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))? =
+            Some(handle);
+        Ok(())
+    }
+
+    /// Send this node's rule configuration to every peer, ignoring failures.
+    async fn broadcast_rules(&self) {
+        let config = match self.rules.lock() {
+            Ok(rules) if rules.0 != RuleConfig::default() => rules.0.clone(),
+            Ok(_) => return,
+            Err(e) => {
+                error!("Rule configuration lock poisoned: {}", e);
+                return;
+            }
+        };
+        let peers: Vec<NodeId> = {
+            let topology = self.topology.read().await;
+            topology
+                .all_nodes()
+                .into_iter()
+                .filter(|(name, _)| *name != self.node_name)
+                .map(|(name, _)| name.node_id())
+                .collect()
+        };
+        let message = Message::RuleConfigSync(config);
+        for peer in peers {
+            if let Err(e) = self.forward_request(peer, &message).await {
+                debug!("Failed to send rules to {:?}: {}", peer, e);
+            }
+        }
+    }
+
+    /// Merge a rule configuration and keep one limiter per live rule.
+    fn apply_rules(&self, update: impl FnOnce(&mut RuleConfig)) -> Result<()> {
+        let mut guard = self
+            .rules
+            .lock()
+            .map_err(|e| ColibriError::Concurrency(format!("Lock poisoned: {}", e)))?;
+        let (rules, versions) = &mut *guard;
+        update(rules);
+        let limiters = self.named_rate_limiters.pin();
+        let stale: Vec<String> = limiters
+            .keys()
+            .filter(|name| {
+                name.as_str() != rules::DEFAULT_RULE_NAME
+                    && rules.get(&RuleName::from(name.as_str())).is_none()
+            })
+            .cloned()
+            .collect();
+        for name in stale {
+            limiters.remove(&name);
+        }
+        versions.retain(|name, _| rules.get(name).is_some());
+        // A new version (created, changed or recreated) starts from zero.
+        for (name, settings, version) in rules.live_versions() {
+            if versions.get(name) != Some(&version) {
+                limiters.insert(
+                    name.as_str().to_string(),
+                    Arc::new(Mutex::new(TokenBucketLimiter::new(settings.clone()))),
+                );
+                versions.insert(name.clone(), version);
+            }
+        }
+        Ok(())
+    }
+
     /// Stop both the TCP accept loop and the message evaluation loop
     pub fn stop_receiver(&self) {
+        if let Ok(mut h) = self.rule_sync_handle.lock()
+            && let Some(handle) = h.take()
+        {
+            handle.abort();
+        }
         if let Ok(mut h) = self.msg_receive_handle.lock() {
             if let Some(handle) = h.take() {
                 handle.abort();
@@ -239,7 +341,7 @@ impl HashringController {
     /// Returns `None` if this node owns the client's bucket, or `Some(NodeId)` of the owner.
     /// Acquires the topology lock once so both the ownership check and the owner lookup
     /// use the same N — eliminating the TOCTOU between separate lock acquisitions.
-    async fn find_owner_if_not_self(&self, client_id: &str) -> Result<Option<NodeId>> {
+    pub(crate) async fn find_owner_if_not_self(&self, client_id: &str) -> Result<Option<NodeId>> {
         let topology = self.topology.read().await;
         let sorted = topology.sorted_nodes();
         let n = sorted.len() as u32;
@@ -248,12 +350,9 @@ impl HashringController {
             return Err(ColibriError::Node("Topology is empty".to_string()));
         }
 
+        // A client's owner is the node at its bucket's position in the sorted
+        // ring, read under the same lock, so it follows topology changes.
         let client_bucket = consistent_hashing::jump_consistent_hash(client_id, n);
-
-        if client_bucket == self.bucket {
-            return Ok(None);
-        }
-
         if client_bucket as usize >= sorted.len() {
             return Err(ColibriError::Node(format!(
                 "Bucket {} out of range for {} nodes",
@@ -263,6 +362,9 @@ impl HashringController {
         }
 
         let (name, _) = &sorted[client_bucket as usize];
+        if *name == self.node_name {
+            return Ok(None);
+        }
         Ok(Some(name.node_id()))
     }
 
@@ -277,7 +379,7 @@ impl HashringController {
     async fn handle_rate_limit_request(
         &self,
         mut request: CheckCallsRequest,
-    ) -> Result<CheckCallsResponse> {
+    ) -> Result<Option<CheckCallsResponse>> {
         // Prevent forwarding loops
         if request.forwarding_depth >= crate::node::messages::MAX_FORWARDING_DEPTH {
             warn!(
@@ -321,11 +423,13 @@ impl HashringController {
             }
         })?;
 
-        Ok(CheckCallsResponse {
+        // `None` means rate limited; it must not be collapsed into
+        // `calls_remaining: 0`, which is also what the last admitted call sees.
+        Ok(calls_remaining.map(|calls_remaining| CheckCallsResponse {
             client_id: request.client_id,
             rule_name: request.rule_name,
-            calls_remaining: calls_remaining.unwrap_or(0),
-        })
+            calls_remaining,
+        }))
     }
 
     async fn get_status(&self) -> Result<StatusResponse> {
@@ -393,40 +497,33 @@ impl HashringController {
         Ok(())
     }
 
-    async fn create_rate_limit_rule(&self, rule: SerializableRule) -> Result<()> {
-        let rule_name_str = rule.name.as_str().to_string();
-        // Validate rule name
-        if rule_name_str.is_empty() {
+    async fn create_rate_limit_rule(&self, mut rule: SerializableRule) -> Result<()> {
+        rule.name = RuleName::from(rule.name.as_str().trim());
+        if rule.name.as_str().is_empty() {
             return Err(ColibriError::Api("Rule name cannot be empty".to_string()));
         }
-
-        // Don't allow creating/overwriting the default rule
-        if rule_name_str == rules::DEFAULT_RULE_NAME {
+        if rule.name.as_str() == rules::DEFAULT_RULE_NAME {
             return Err(ColibriError::Api(
                 "Cannot create or modify the default rule".to_string(),
             ));
         }
-
-        // Only create if it doesn't already exist
-        if self.named_rate_limiters.pin().contains_key(&rule_name_str) {
-            return Ok(());
-        }
-
-        let limiter = Arc::new(Mutex::new(TokenBucketLimiter::new(rule.settings)));
-        self.named_rate_limiters
-            .pin()
-            .insert(rule_name_str.clone(), limiter);
-        tracing::info!("Created named rule '{}' in hashring node", rule_name_str);
+        let actor = self.actor;
+        self.apply_rules(|rules| rules.set(rule.name.clone(), rule.settings, actor))?;
+        tracing::info!("Created named rule '{}' in hashring node", rule.name);
+        self.broadcast_rules().await;
         Ok(())
     }
 
     async fn delete_rate_limit_rule(&self, rule_name: RuleName) -> Result<()> {
-        let key = rule_name.as_str().to_string();
-        if self.named_rate_limiters.pin().remove(&key).is_some() {
-            tracing::info!("Deleted named rule '{}' from hashring node", key);
-        } else {
-            tracing::warn!("Attempted to delete non-existent rule '{}'", key);
+        if rule_name.as_str() == rules::DEFAULT_RULE_NAME {
+            return Err(ColibriError::Api(
+                "Cannot delete the default rule".to_string(),
+            ));
         }
+        let actor = self.actor;
+        self.apply_rules(|rules| rules.delete(rule_name.clone(), actor))?;
+        tracing::info!("Deleted named rule '{}' from hashring node", rule_name);
+        self.broadcast_rules().await;
         Ok(())
     }
 
@@ -510,6 +607,13 @@ impl HashringController {
             Message::ListRateLimitRules => {
                 let rules = self.list_rate_limit_rules().await?;
                 Ok(Message::ListRateLimitRulesResponse(rules))
+            }
+
+            Message::RuleConfigSync(config) => {
+                self.apply_rules(|rules| {
+                    rules.merge(&config);
+                })?;
+                Ok(Message::Ack)
             }
 
             _ => Err(ColibriError::Api(format!(

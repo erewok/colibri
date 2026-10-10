@@ -36,3 +36,12 @@
 - [ ] Cluster messages: prefix a magic number before the protocol version, so an unversioned (older) message can't be misread.
 - [ ] Hashring: nodes with different topology views can briefly both own a client, and moved clients start fresh at the new owner.
 - [ ] TLA+: model the controller relay, datagram size limits, partition digests (push-pull is abstracted as any-time merges), per-process clock drift, and the hashring; a receiver dating a merged slot by the sender alone (not the later of the two) isn't caught at current bounds.
+- [ ] TLA+: compact on each node's *belief* about dead incarnations (learned through gossip, possibly wrong), not the true state; the review found a self-compaction bug the spec couldn't express (fixed in code, tested in `tests/gossip_regressions.rs`).
+- [ ] TLA+: `ExpireTombAt` is unreachable at current bounds (a slot compacts at tick 2 at the earliest, its tombstone expires at tick 4); raise `MaxTicks` in `Gossip.cfg`.
+- [ ] TLA+: `Gossip3.cfg` doesn't finish since actors, compaction and tombstones were added (MaxTokens=1, MaxOps=3 still above 10M states); find bounds that do, e.g. restarts on one node only.
+- [x] Gossip: a process never compacts its own slot, and warns when it hears of a newer process under its own name.
+- [x] Gossip: partition hashes mix each bucket's hash (splitmix64) before summing, so differences can't cancel.
+- [x] Gossip: deltas and state requests carry the sender's known incarnations; a heartbeat goes out at least every 5 ticks under load.
+- [x] Gossip: a merged slot already quiet for a window retires at once, so dead slots settle even when gossip ticks outlast a rule's window.
+- [ ] Gossip: each heartbeat received recomputes every partition hash under the state lock; keep running per-partition sums instead (measure first).
+- [ ] Gossip: the incarnation registry is never pruned, so heartbeats grow ~13 bytes per node name ever seen (over 1400 bytes past ~50), and a node started with its clock far ahead makes its later, correctly-clocked restarts look dead.

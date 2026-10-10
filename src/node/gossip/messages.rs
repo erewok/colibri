@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
-use super::state::RuleBuckets;
+use super::state::{RuleBuckets, StateSync};
 use crate::limiters::rule_config::RuleConfig;
 use crate::node::{ActorId, NodeId};
 
@@ -17,7 +17,7 @@ use crate::node::{ActorId, NodeId};
 /// positional), removing or reordering variants silently corrupts traffic on a
 /// mixed-version cluster. Bumping this constant and rejecting mismatches on the
 /// receive side turns that silent corruption into a hard, logged error.
-pub const GOSSIP_PROTOCOL_VERSION: u16 = 4;
+pub const GOSSIP_PROTOCOL_VERSION: u16 = 5;
 
 /// Error returned by [`GossipPacket::from_wire`].
 #[derive(Debug)]
@@ -53,6 +53,7 @@ pub enum GossipMessage {
     /// Delta-state synchronization - only recently updated keys
     DeltaStateSync {
         response_addr: SocketAddr,
+        incarnations: Vec<ActorId>,
         updates: Vec<RuleBuckets>, // Only changed keys
         sender_node_id: NodeId,
         propagation_factor: u8, // To limit spread
@@ -61,6 +62,7 @@ pub enum GossipMessage {
     /// Request for the sender's state in `partitions` (anti-entropy)
     StateRequest {
         partitions: Vec<u16>,
+        incarnations: Vec<ActorId>,
         response_addr: SocketAddr,
         requesting_node_id: NodeId,
     },
@@ -91,7 +93,7 @@ fn encoded_len<T: Serialize>(value: &T) -> usize {
 /// Buckets merge independently, so any split is valid; a bucket larger than
 /// `max_bytes` travels alone.
 pub fn delta_packets(
-    updates: Vec<RuleBuckets>,
+    state: StateSync,
     sender_node_id: NodeId,
     response_addr: SocketAddr,
     propagation_factor: u8,
@@ -99,9 +101,14 @@ pub fn delta_packets(
 ) -> Vec<GossipPacket> {
     // Headroom for a length prefix that grows as items are added.
     const LENGTH_SLACK: usize = 4;
+    let StateSync {
+        incarnations,
+        updates,
+    } = state;
     let packet = |updates| {
         GossipPacket::new(GossipMessage::DeltaStateSync {
             response_addr,
+            incarnations: incarnations.clone(),
             updates,
             sender_node_id,
             propagation_factor,
@@ -212,6 +219,7 @@ mod tests {
         let message = GossipMessage::StateRequest {
             requesting_node_id: NodeName::from("node-1").node_id(),
             partitions: vec![3],
+            incarnations: Vec::new(),
             response_addr: "127.0.0.1:8410".parse().unwrap(),
         };
         let packet = GossipPacket::new(message);
@@ -226,6 +234,7 @@ mod tests {
                 requesting_node_id,
                 partitions,
                 response_addr,
+                ..
             } => {
                 assert_eq!(requesting_node_id, NodeName::from("node-1").node_id());
                 assert_eq!(partitions, vec![3]);
@@ -240,6 +249,7 @@ mod tests {
         let message = GossipMessage::StateRequest {
             requesting_node_id: NodeName::from("node-1").node_id(),
             partitions: vec![3],
+            incarnations: Vec::new(),
             response_addr: "127.0.0.1:8410".parse().unwrap(),
         };
         // Construct a packet with a stale version number (simulates a node

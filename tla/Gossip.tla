@@ -2,7 +2,7 @@
 \* Spec for: gossip-based CRDT rate limiter with sliding-window ageing.
 \* Corresponds to: src/limiters/distributed_bucket.rs,
 \*                 src/node/gossip/state.rs, src/node/gossip/controller.rs
-\* Verified: 2026-10-10 with TLC 2026.08.21 (see Gossip.cfg and Gossip3.cfg)
+\* Verified: 2026-10-10 with TLC 2026.08.21 (Gossip.cfg; Gossip3.cfg does not finish)
 \*
 \* What this models
 \* ----------------

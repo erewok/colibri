@@ -175,29 +175,27 @@ impl GossipCluster {
         receiver: usize,
         response_delivered: bool,
     ) -> bool {
-        match output {
-            TickOutput::Delta(updates) => {
-                self.nodes[receiver].accept(updates);
-                true
+        if let Some(updates) = &output.delta {
+            self.nodes[receiver].accept(updates);
+        }
+        let Some(digest) = &output.heartbeat else {
+            return output.delta.is_some();
+        };
+        let reply = self.nodes[receiver].on_heartbeat(digest);
+        let differ = !reply.partitions.is_empty();
+        if response_delivered {
+            if differ {
+                // The receiver pushes its partitions and pulls the sender's.
+                let pushed = self.nodes[receiver].partition_state(&reply.partitions);
+                let pulled = self.nodes[sender].partition_state(&reply.partitions);
+                self.nodes[sender].accept(&pushed);
+                self.nodes[receiver].accept(&pulled);
             }
-            TickOutput::Heartbeat(digest) => {
-                let reply = self.nodes[receiver].on_heartbeat(digest);
-                let differ = !reply.partitions.is_empty();
-                if response_delivered {
-                    if differ {
-                        // The receiver pushes its partitions and pulls the sender's.
-                        let pushed = self.nodes[receiver].partition_state(&reply.partitions);
-                        let pulled = self.nodes[sender].partition_state(&reply.partitions);
-                        self.nodes[sender].accept(&pushed);
-                        self.nodes[receiver].accept(&pulled);
-                    }
-                    if reply.push_rules {
-                        self.send_rules(receiver, sender, true);
-                    }
-                }
-                differ || reply.push_rules
+            if reply.push_rules {
+                self.send_rules(receiver, sender, true);
             }
         }
+        output.delta.is_some() || differ || reply.push_rules
     }
 
     /// Admission times of `node`'s current incarnation for `client`.
@@ -464,7 +462,7 @@ impl GossipCluster {
             let response_delivered = tc.draw(gs::booleans());
             if delivered
                 && self.deliver(&output, sender, receiver, response_delivered)
-                && matches!(output, TickOutput::Heartbeat(_))
+                && output.heartbeat.is_some()
             {
                 tc.event("heartbeat triggered anti-entropy");
             }

@@ -320,7 +320,7 @@ impl DistributedBucket {
     }
 
     /// Forget the idle slots of processes known to be dead: a node's
-    /// incarnations older than the newest seen.
+    /// incarnations older than the newest seen. Never our own, which we know is alive.
     fn compact(&mut self, newest: &BTreeMap<NodeId, u64>, window_ms: i64) {
         let now = monotonic_ms();
         self.forgotten
@@ -329,7 +329,8 @@ impl DistributedBucket {
             .counter
             .actors()
             .filter(|a| {
-                newest.get(&a.node).is_some_and(|&n| n > a.incarnation)
+                *a != self.writer
+                    && newest.get(&a.node).is_some_and(|&n| n > a.incarnation)
                     && self.counter.outstanding(*a) == 0
             })
             .collect();
@@ -427,10 +428,16 @@ pub type SlotValues = Vec<(ActorId, u64, u64)>;
 pub struct Incarnations(Arc<Mutex<BTreeMap<NodeId, u64>>>);
 
 impl Incarnations {
-    pub fn note(&self, actor: ActorId) {
+    /// Record `actor`; true if it is newer than any process seen of its node.
+    pub fn note(&self, actor: ActorId) -> bool {
         let mut newest = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = newest.entry(actor.node).or_insert(actor.incarnation);
-        *entry = (*entry).max(actor.incarnation);
+        match newest.get(&actor.node) {
+            Some(&known) if known >= actor.incarnation => false,
+            _ => {
+                newest.insert(actor.node, actor.incarnation);
+                true
+            }
+        }
     }
 
     pub fn is_dead(&self, actor: ActorId) -> bool {
@@ -606,6 +613,7 @@ impl DistributedBucketLimiter {
 
     pub fn accept_delta_state(&mut self, delta: &[DistributedBucketExternal]) {
         let local = self.actor;
+        let threshold = self.expiration_threshold_ms();
         for actor in delta.iter().flat_map(|b| b.counter.actors()) {
             self.incarnations.note(actor);
         }
@@ -623,11 +631,15 @@ impl DistributedBucketLimiter {
                 |existing| {
                     let mut bucket = existing.clone();
                     bucket.merge_from(incoming_bucket);
+                    // A slot already quiet for a window retires now, not next tick.
+                    bucket.retire_stale(threshold);
                     bucket
                 },
                 || {
-                    incoming_bucket
-                        .bucket(local, self.rate_limit_settings.rate_limit_max_calls_allowed)
+                    let mut bucket = incoming_bucket
+                        .bucket(local, self.rate_limit_settings.rate_limit_max_calls_allowed);
+                    bucket.retire_stale(threshold);
+                    bucket
                 },
             );
         }
@@ -669,7 +681,9 @@ impl DistributedBucketLimiter {
     pub fn digest_slots(&self) -> Vec<(String, SlotValues)> {
         let newest = self.incarnations.snapshot();
         let dead_and_idle = |counter: &DistributedRequestCounter, a: ActorId| {
-            newest.get(&a.node).is_some_and(|&n| n > a.incarnation) && counter.outstanding(a) == 0
+            a != self.actor
+                && newest.get(&a.node).is_some_and(|&n| n > a.incarnation)
+                && counter.outstanding(a) == 0
         };
         self.node_counters
             .pin()

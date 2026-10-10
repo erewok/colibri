@@ -6,7 +6,7 @@ use colibri::limiters::RuleName;
 use colibri::limiters::distributed_bucket::DistributedBucketLimiter;
 use colibri::limiters::rule_config::RuleVersion;
 use colibri::node::gossip::messages::{GossipMessage, delta_packets};
-use colibri::node::gossip::state::RuleBuckets;
+use colibri::node::gossip::state::{RuleBuckets, StateSync};
 use colibri::node::{ActorId, NodeName};
 use colibri::settings::RateLimitSettings;
 use hegel::TestCase;
@@ -66,7 +66,11 @@ fn packets_fit_and_carry_every_bucket(tc: TestCase) {
     let sender = NodeName::from("sender").node_id();
     let addr = "127.0.0.1:7946".parse().unwrap();
 
-    let packets = delta_packets(updates.clone(), sender, addr, 1, max_bytes);
+    let state = StateSync {
+        incarnations: Vec::new(),
+        updates: updates.clone(),
+    };
+    let packets = delta_packets(state, sender, addr, 1, max_bytes);
 
     let mut carried: Vec<(RuleName, Option<RuleVersion>, String)> = Vec::new();
     for packet in &packets {

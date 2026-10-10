@@ -84,11 +84,13 @@ On each tick (`--gossip-interval-ms`, default 1000), a node sends its changes to
 - **Raise the fanout as the cluster grows**, so changes still reach every node in a few ticks.
 - **`--gossip-max-packet-bytes`** (default 1400) caps each gossip datagram; a tick's changes are split across as many datagrams as they need. The default fits a standard Ethernet frame without IP fragmentation, so a lost fragment never drops a whole datagram. Raise it on networks with larger frames (for example 8900 with jumbo frames) to send fewer datagrams.
 
-**Anti-entropy.** A node that has nothing new to send on a tick sends a heartbeat instead: a hash of each of 64 client partitions, plus the newest process it knows of each node. A peer whose hash for a partition differs sends back its copy of that partition and asks for the sender's, so lost datagrams are repaired one partition at a time. A node that is behind on everything, such as one that just started, receives every active client at once, about 700 datagrams for 10,000 clients. Datagrams its socket buffer drops are repaired on later heartbeats; raise the buffer (`net.core.rmem_max` and `rmem_default` on Linux) to make that rarer.
+**Anti-entropy.** A node sends a heartbeat on any tick with nothing new to send, and on every fifth tick regardless, so repair continues under constant load. A heartbeat holds a hash of each of 64 client partitions, plus the newest process it knows of each node. A peer whose hash for a partition differs sends back its copy of that partition and asks for the sender's, so lost datagrams are repaired one partition at a time. A node that is behind on everything, such as one that just started, receives every active client at once, about 700 datagrams for 10,000 clients. Datagrams its socket buffer drops are repaired on later heartbeats; raise the buffer (`net.core.rmem_max` and `rmem_default` on Linux) to make that rarer.
 
 ### Restarting a Gossip Node
 
 Each process is a separate participant in the cluster's counts, so a restart is safe whatever the clocks do. Calls the old process admitted keep counting until they age out; once a peer's copy of them has sat unchanged for a full window, it releases them. The same happens when a node is removed for good.
+
+A node logs a warning if it hears of a newer process under its own name: two nodes share a name, or its clock was behind when it started. Fix the name or the clock; the node keeps counting correctly meanwhile.
 
 Until a restarted node has heard from its peers, it doesn't know about their calls. To keep the overshoot small, keep it out of the load balancer for a few gossip ticks after it starts, for example by delaying readiness by 5 × `--gossip-interval-ms`. `/health` alone doesn't wait for this.
 

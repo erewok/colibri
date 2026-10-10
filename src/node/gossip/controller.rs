@@ -17,7 +17,7 @@ use crate::settings::{self, ClusterTopology, RateLimitSettings, RunMode};
 use crate::transport::{UdpReceiver, UdpTransport};
 
 use super::messages::delta_packets;
-use super::state::{GossipState, HeartbeatDigest, PARTITIONS, RuleBuckets, TickOutput};
+use super::state::{GossipState, HeartbeatDigest, PARTITIONS, StateSync, TickOutput};
 use super::{GossipMessage, GossipPacket};
 
 /// Maximum number of recent packet IDs kept for receive-side deduplication.
@@ -461,12 +461,12 @@ impl GossipController {
 
     pub async fn handle_gossip_tick(&self) -> Result<()> {
         // Ages every bucket first, so expiries ride this same gossip round.
-        let message = match self.with_state(|state| state.tick())? {
-            TickOutput::Delta(updates) => {
-                let packets = self.delta_packets(updates, self.node_id, 1);
-                return self.send_gossip_packets(packets).await;
-            }
-            TickOutput::Heartbeat(digest) => GossipMessage::Heartbeat {
+        let TickOutput { delta, heartbeat } = self.with_state(|state| state.tick())?;
+        let mut packets = delta
+            .map(|delta| self.delta_packets(delta, self.node_id, 1))
+            .unwrap_or_default();
+        if let Some(digest) = heartbeat {
+            packets.push(GossipPacket::new(GossipMessage::Heartbeat {
                 node_id: self.node_id,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -476,9 +476,9 @@ impl GossipController {
                 partitions: digest.partitions,
                 rules_digest: digest.rules,
                 response_addr: self.response_addr,
-            },
-        };
-        self.send_gossip_packet(GossipPacket::new(message)).await
+            }));
+        }
+        self.send_gossip_packets(packets).await
     }
 
     /// Forget idle clients under every rule.
@@ -520,6 +520,7 @@ impl GossipController {
                         requesting_node_id,
                         response_addr: requester_addr,
                         partitions,
+                        incarnations,
                     } => {
                         // Don't respond to our own requests (shouldn't happen but guard anyway)
                         if requesting_node_id == self.node_id {
@@ -531,9 +532,12 @@ impl GossipController {
                             self.node_id, requesting_node_id
                         );
 
-                        let state = self.with_state(|state| state.partition_state(&partitions))?;
+                        let state = self.with_state(|state| {
+                            state.note_incarnations(&incarnations);
+                            state.partition_state(&partitions)
+                        })?;
 
-                        if !state.is_empty() {
+                        if !state.updates.is_empty() {
                             for packet in self.delta_packets(state, self.node_id, 0) {
                                 if let Err(e) =
                                     self.send_gossip_packet_to(requester_addr, packet).await
@@ -552,6 +556,7 @@ impl GossipController {
                         }
                     }
                     GossipMessage::DeltaStateSync {
+                        incarnations,
                         updates,
                         sender_node_id,
                         response_addr: _,
@@ -568,11 +573,15 @@ impl GossipController {
                             sender_node_id,
                             updates.len()
                         );
-                        self.with_state(|state| state.accept(&updates))?;
+                        let sync = StateSync {
+                            incarnations,
+                            updates,
+                        };
+                        self.with_state(|state| state.accept(&sync))?;
                         // Propagate further if propagation_factor > 0
                         if propagation_factor > 0 {
                             let packets =
-                                self.delta_packets(updates, sender_node_id, propagation_factor - 1);
+                                self.delta_packets(sync, sender_node_id, propagation_factor - 1);
                             self.send_gossip_packets(packets).await?;
                         }
                     }
@@ -617,6 +626,7 @@ impl GossipController {
                             }
                             let request = GossipMessage::StateRequest {
                                 requesting_node_id: self.node_id,
+                                incarnations: self.with_state(|state| state.incarnations())?,
                                 partitions: reply.partitions,
                                 response_addr: self.response_addr,
                             };
@@ -682,6 +692,7 @@ impl GossipController {
                         if reply.request_state {
                             let request = GossipMessage::StateRequest {
                                 requesting_node_id: self.node_id,
+                                incarnations: self.with_state(|state| state.incarnations())?,
                                 partitions: (0..PARTITIONS).collect(),
                                 response_addr: self.response_addr,
                             };
@@ -722,12 +733,12 @@ impl GossipController {
     /// `updates` as datagrams of at most `max_packet_bytes`.
     fn delta_packets(
         &self,
-        updates: Vec<RuleBuckets>,
+        state: StateSync,
         sender_node_id: NodeId,
         propagation_factor: u8,
     ) -> Vec<GossipPacket> {
         delta_packets(
-            updates,
+            state,
             sender_node_id,
             self.response_addr,
             propagation_factor,
@@ -840,6 +851,7 @@ mod tests {
         }];
 
         let message = GossipMessage::DeltaStateSync {
+            incarnations: Vec::new(),
             updates,
             sender_node_id: sender_id,
             response_addr: "127.0.0.1:9999".parse().unwrap(),

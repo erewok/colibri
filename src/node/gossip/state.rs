@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::error::{ColibriError, Result};
 use crate::limiters::distributed_bucket::{
@@ -48,6 +49,14 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// splitmix64's finalizer. FNV-1a hashes of similar inputs differ by small
+/// multiples, so unmixed sums of them can cancel.
+fn mix(mut h: u64) -> u64 {
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
 /// What a heartbeat tells peers about the sender's state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeartbeatDigest {
@@ -69,13 +78,21 @@ pub struct HeartbeatReply {
     pub push_rules: bool,
 }
 
-/// What a node sends on a gossip tick.
+/// Buckets sent to a peer, with the newest incarnations the sender knows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateSync {
+    pub incarnations: Vec<ActorId>,
+    pub updates: Vec<RuleBuckets>,
+}
+
+/// A heartbeat goes out at least this often, even on ticks with changes.
+pub const HEARTBEAT_EVERY_TICKS: u32 = 5;
+
+/// What a node sends on a gossip tick: its unsent changes, a heartbeat, or both.
 #[derive(Clone, Debug)]
-pub enum TickOutput {
-    /// Buckets with changes not yet gossiped.
-    Delta(Vec<RuleBuckets>),
-    /// Nothing changed: advertise the node's state so peers can catch up.
-    Heartbeat(HeartbeatDigest),
+pub struct TickOutput {
+    pub delta: Option<StateSync>,
+    pub heartbeat: Option<HeartbeatDigest>,
 }
 
 #[derive(Debug)]
@@ -88,6 +105,8 @@ pub struct GossipState {
     /// The version of each named rule's limiter.
     versions: BTreeMap<RuleName, RuleVersion>,
     incarnations: Incarnations,
+    /// Ticks since the last heartbeat.
+    quiet_ticks: u32,
 }
 
 impl GossipState {
@@ -114,6 +133,7 @@ impl GossipState {
             limiters,
             versions: BTreeMap::new(),
             incarnations,
+            quiet_ticks: 0,
         }
     }
 
@@ -250,7 +270,7 @@ impl GossipState {
         for limiter in self.limiters.values() {
             limiter.tick_expirations();
         }
-        let delta: Vec<RuleBuckets> = self
+        let updates: Vec<RuleBuckets> = self
             .limiters
             .iter()
             .map(|(rule, l)| RuleBuckets {
@@ -260,41 +280,77 @@ impl GossipState {
             })
             .filter(|r| !r.buckets.is_empty())
             .collect();
-        if delta.is_empty() {
-            TickOutput::Heartbeat(self.digest())
-        } else {
-            TickOutput::Delta(delta)
+        self.quiet_ticks += 1;
+        let heartbeat =
+            (updates.is_empty() || self.quiet_ticks >= HEARTBEAT_EVERY_TICKS).then(|| {
+                self.quiet_ticks = 0;
+                self.digest()
+            });
+        TickOutput {
+            delta: (!updates.is_empty()).then(|| self.sync(updates)),
+            heartbeat,
+        }
+    }
+
+    /// The newest incarnation this node knows of each node.
+    pub fn incarnations(&self) -> Vec<ActorId> {
+        self.incarnations.newest()
+    }
+
+    fn sync(&self, updates: Vec<RuleBuckets>) -> StateSync {
+        StateSync {
+            incarnations: self.incarnations.newest(),
+            updates,
+        }
+    }
+
+    /// Learn of newer processes. A newer one of our own node means a duplicate
+    /// name or a clock that went backwards; this process keeps its slot.
+    pub fn note_incarnations(&mut self, actors: &[ActorId]) {
+        for &actor in actors {
+            if self.incarnations.note(actor)
+                && actor.node == self.actor.node
+                && actor.incarnation > self.actor.incarnation
+            {
+                warn!(
+                    "A newer process {actor} of this node exists (this is {}): duplicate node name or clock behind?",
+                    self.actor
+                );
+            }
         }
     }
 
     /// Every bucket of every rule, for a peer catching up.
-    pub fn full_state(&self) -> Vec<RuleBuckets> {
-        self.limiters
-            .iter()
-            .map(|(rule, l)| RuleBuckets {
-                rule: rule.clone(),
-                version: self.versions.get(rule).copied(),
-                buckets: l.full_state_dump(),
-            })
-            .filter(|r| !r.buckets.is_empty())
-            .collect()
+    pub fn full_state(&self) -> StateSync {
+        self.sync(
+            self.limiters
+                .iter()
+                .map(|(rule, l)| RuleBuckets {
+                    rule: rule.clone(),
+                    version: self.versions.get(rule).copied(),
+                    buckets: l.full_state_dump(),
+                })
+                .filter(|r| !r.buckets.is_empty())
+                .collect(),
+        )
     }
 
     /// The buckets of every rule in `partitions`.
-    pub fn partition_state(&self, partitions: &[u16]) -> Vec<RuleBuckets> {
+    pub fn partition_state(&self, partitions: &[u16]) -> StateSync {
         let mut state = self.full_state();
-        for update in &mut state {
+        for update in &mut state.updates {
             update
                 .buckets
                 .retain(|b| partitions.contains(&partition_of(&b.client_id)));
         }
-        state.retain(|update| !update.buckets.is_empty());
+        state.updates.retain(|update| !update.buckets.is_empty());
         state
     }
 
     /// Merge a peer's buckets, ignoring rules (or rule versions) this node doesn't have.
-    pub fn accept(&mut self, updates: &[RuleBuckets]) {
-        for update in updates {
+    pub fn accept(&mut self, state: &StateSync) {
+        self.note_incarnations(&state.incarnations);
+        for update in &state.updates {
             if self.versions.get(&update.rule).copied() != update.version {
                 continue;
             }
@@ -313,7 +369,7 @@ impl GossipState {
                 let bytes =
                     postcard::to_allocvec(&(rule, version, &client, slots)).unwrap_or_default();
                 let partition = &mut partitions[usize::from(partition_of(&client))];
-                *partition = partition.wrapping_add(fnv1a(&bytes));
+                *partition = partition.wrapping_add(mix(fnv1a(&bytes)));
             }
         }
         HeartbeatDigest {
@@ -326,9 +382,7 @@ impl GossipState {
     /// Decide what to do about a peer's heartbeat: which partitions to
     /// exchange, after learning which processes it knows are dead.
     pub fn on_heartbeat(&mut self, peer: &HeartbeatDigest) -> HeartbeatReply {
-        for &actor in &peer.incarnations {
-            self.incarnations.note(actor);
-        }
+        self.note_incarnations(&peer.incarnations);
         let ours = self.digest();
         let partitions = (0..PARTITIONS)
             .filter(|&p| ours.partitions.get(usize::from(p)) != peer.partitions.get(usize::from(p)))

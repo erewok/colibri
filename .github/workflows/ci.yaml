@@ -20,17 +20,14 @@ jobs:
       RUSTC_WRAPPER: "sccache"
       RUSTFLAGS: "-C target-feature=+aes,+sse2"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          profile: minimal
-          toolchain: nightly
-          override: true
           components: rustfmt, clippy
 
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - uses: taiki-e/install-action@v2
         with:
@@ -49,5 +46,5 @@ jobs:
       RUSTFLAGS: "-C target-feature=+aes,+sse2"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: cargo build --release --all-features

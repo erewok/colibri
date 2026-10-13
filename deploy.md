@@ -30,7 +30,7 @@ Gossip mode has further limits, described [below](#current-limitations).
 
 Both bind to `--client-listen-address` (default `127.0.0.1`). In a container or on a shared network, set it to `0.0.0.0` or the host's address. Use `--peer-listen-address` to bind the peer port somewhere else.
 
-**Configuration through flags or environment variables.** Every flag has an environment variable, such as `COLIBRI_RUN_MODE` or `COLIBRI_CLIENT_LISTEN_PORT`, which suits containers. The `--config-file` option exists, but currently any value it sets is overridden by the flag defaults, so don't rely on it.
+**Configuration through flags or environment variables.** Every flag has an environment variable, such as `COLIBRI_RUN_MODE` or `COLIBRI_CLIENT_LISTEN_PORT`, which suits containers. You can also put options in a toml file with a `[default]` table and pass it with `--config-file` (or `COLIBRI_CONFIG_FILE`). Flags override environment variables, and both override the file. An unknown key in the file is an error. Use `--log-format json` for structured logs.
 
 **A unique, stable name per node.** `--name` is required. A node's identity in the cluster is derived from its name. For gossip mode, read [restarts](#restarting-a-gossip-node) before reusing names.
 
@@ -46,7 +46,7 @@ Both bind to `--client-listen-address` (default `127.0.0.1`). In a container or 
 
 **A decision about failures.** A request that takes longer than 10 s gets `408`. An overloaded node returns `503` rather than queueing, and in hashring mode a request whose owner is down fails with a `5xx`. Your services must decide whether an error means allow (fail open) or deny (fail closed). For most rate limiting, failing open with a short client-side timeout is the safer default.
 
-**No graceful shutdown.** On `SIGTERM` the process exits immediately, and in-flight requests fail. Remove a node from your load balancer before stopping it.
+**Graceful shutdown.** On `SIGTERM` or Ctrl-C a node stops accepting connections, finishes in-flight requests, and exits. New requests sent during the drain are refused, so remove a node from your load balancer before stopping it.
 
 ## Single Mode
 
@@ -127,8 +127,6 @@ colibri-admin --target 10.0.0.1:8412 get-status
 colibri-admin --target 10.0.0.1:8412 get-topology
 ```
 
-It also lists `export-buckets` and `import-buckets`, which aren't implemented yet.
-
 ## Kubernetes Sketch
 
 There are no published images or manifests yet. These are the parts that matter:
@@ -136,5 +134,5 @@ There are no published images or manifests yet. These are the parts that matter:
 - **Gossip or hashring**: use a `StatefulSet` with a headless `Service`, so pods get stable names (`colibri-0`, `colibri-1`, ...) and DNS addresses for `-t name=colibri-0.colibri:8412`. Set `--name` from the pod name. A topology change means updating every pod's arguments and rolling the set.
 - **Ports**: expose the HTTP port through a normal `Service` for callers. Gossip needs `protocol: UDP` on the peer port; hashring needs TCP.
 - **Probes**: use `GET /health` for liveness. For gossip, add the readiness delay described above.
-- **Lifecycle**: add a short `preStop` sleep so the pod leaves the `Service` endpoints before it exits, since there's no graceful drain.
+- **Lifecycle**: add a short `preStop` sleep so the pod leaves the `Service` endpoints before it exits. The node drains in-flight requests on `SIGTERM`, but it refuses new connections during the drain.
 - **Network**: add a `NetworkPolicy` that only admits your services to the HTTP port and only Colibri pods to the peer port.

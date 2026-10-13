@@ -10,17 +10,10 @@
 //!
 //! # Get topology from a node
 //! colibri-admin get-topology --target 192.168.1.100:8421
-//!
-//! # Export data from a node (for migration)
-//! colibri-admin export-buckets --target 192.168.1.100:8421 -f exported_data.bin
-//!
-//! # Import data to a node (for migration)
-//! colibri-admin import-buckets --target 192.168.1.100:8421 -f exported_data.bin
 //! ```
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use tracing::{error, info};
 
 use colibri::error::{ColibriError, Result};
@@ -48,22 +41,6 @@ enum Commands {
     /// Get cluster topology from a node
     #[command(name = "get-topology")]
     GetTopology,
-
-    /// Export buckets from a node (for migration)
-    #[command(name = "export-buckets")]
-    ExportBuckets {
-        /// File to write exported data to
-        #[arg(short, long)]
-        file: PathBuf,
-    },
-
-    /// Import buckets to a node (for migration)
-    #[command(name = "import-buckets")]
-    ImportBuckets {
-        /// File to read imported data from
-        #[arg(short, long)]
-        file: PathBuf,
-    },
 }
 
 #[tokio::main]
@@ -138,22 +115,6 @@ async fn main() -> Result<()> {
                     ));
                 }
             }
-        }
-
-        Commands::ExportBuckets { file } => {
-            error!("ExportBuckets not yet implemented");
-            println!("Export buckets functionality will write to: {:?}", file);
-            return Err(ColibriError::Api(
-                "ExportBuckets not yet implemented".to_string(),
-            ));
-        }
-
-        Commands::ImportBuckets { file } => {
-            error!("ImportBuckets not yet implemented");
-            println!("Import buckets functionality will read from: {:?}", file);
-            return Err(ColibriError::Api(
-                "ImportBuckets not yet implemented".to_string(),
-            ));
         }
     }
 

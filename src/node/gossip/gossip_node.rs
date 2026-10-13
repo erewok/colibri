@@ -7,12 +7,11 @@ use super::GossipController;
 use crate::error::{ColibriError, Result};
 use crate::limiters::{RuleList, RuleName, SerializableRule};
 use crate::node::messages::{
-    BucketExport, CheckCallsRequest, CheckCallsResponse, ExportMetadata, Message, StatusResponse,
-    TopologyChangeRequest, TopologyResponse,
+    CheckCallsRequest, CheckCallsResponse, Message, StatusResponse, TopologyChangeRequest,
+    TopologyResponse,
 };
 use crate::node::{Node, NodeName};
 use crate::settings;
-use crate::settings::RunMode;
 
 /// Gossip-based distributed rate limiter node
 #[derive(Clone)]
@@ -214,33 +213,6 @@ impl Node for GossipNode {
 
 // Cluster-specific methods for GossipNode
 impl GossipNode {
-    pub async fn handle_export_buckets(&self) -> Result<BucketExport> {
-        // Gossip nodes don't use bucket-based data export
-        // All data is replicated across gossip network
-        let export = BucketExport {
-            client_data: Vec::new(),
-            metadata: ExportMetadata {
-                node_name: self.node_name.to_string(),
-                export_timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                node_type: RunMode::Gossip,
-                bucket_count: 0,
-            },
-        };
-
-        tracing::info!("Gossip node export skipped. Using gossip synchronization");
-        Ok(export)
-    }
-
-    pub async fn handle_import_buckets(&self, _import_data: BucketExport) -> Result<()> {
-        // Gossip nodes don't use bucket-based data import
-        // Data synchronization happens through gossip protocol
-        tracing::info!("Gossip node data import skipped. Using gossip synchronization");
-        Ok(())
-    }
-
     pub async fn handle_cluster_health(&self) -> Result<StatusResponse> {
         let message = Message::GetStatus;
         match self.controller.handle_message(message).await? {

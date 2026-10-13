@@ -58,7 +58,11 @@ pub fn deserialize<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T> {
 }
 
 /// Version of the `Message` wire format. Bump it whenever `Message` changes.
-pub const MESSAGE_PROTOCOL_VERSION: u16 = 2;
+pub const MESSAGE_PROTOCOL_VERSION: u16 = 3;
+
+/// Leads every cluster message, ahead of the protocol version, so a node
+/// refuses messages from binaries older than the version field.
+pub const MESSAGE_MAGIC: [u8; 4] = *b"CLBM";
 
 /// Maximum forwarding depth to prevent loops in case of topology inconsistency
 pub const MAX_FORWARDING_DEPTH: u8 = 3;
@@ -233,20 +237,6 @@ pub enum Message {
     /// Acknowledge node removal
     RemoveNodeResponse,
 
-    /// Export all rate limiting data (for migration)
-    ExportBuckets,
-    /// Response with exported data
-    ExportBucketsResponse {
-        data: Vec<u8>,
-    },
-
-    /// Import rate limiting data (for migration)
-    ImportBuckets {
-        data: Vec<u8>,
-    },
-    /// Acknowledge import completion
-    ImportBucketsResponse,
-
     // ===== Generic responses =====
     /// Generic acknowledgment
     Ack,
@@ -257,17 +247,20 @@ pub enum Message {
 }
 
 impl Message {
-    /// Serialize message using postcard binary format
-    /// Encode with a leading protocol version, so nodes on different versions
-    /// refuse each other's messages instead of misreading them.
+    /// Encode with a leading magic number and protocol version, so nodes on
+    /// different versions refuse each other's messages instead of misreading them.
     pub fn serialize(&self) -> Result<bytes::Bytes> {
-        let mut data = MESSAGE_PROTOCOL_VERSION.to_be_bytes().to_vec();
+        let mut data = MESSAGE_MAGIC.to_vec();
+        data.extend_from_slice(&MESSAGE_PROTOCOL_VERSION.to_be_bytes());
         data.extend_from_slice(&serialize(self)?);
         Ok(bytes::Bytes::from(data))
     }
 
     /// Decode a message, refusing one from a different protocol version.
     pub fn deserialize(data: &[u8]) -> Result<Self> {
+        let data = data.strip_prefix(&MESSAGE_MAGIC).ok_or_else(|| {
+            ColibriError::Transport("Not a colibri message (bad magic number)".to_string())
+        })?;
         let (version, body) = data
             .split_first_chunk::<2>()
             .ok_or_else(|| ColibriError::Transport("Message too short".to_string()))?;
@@ -279,26 +272,6 @@ impl Message {
         }
         deserialize(body)
     }
-}
-
-// ============================================================================
-// ADDITIONAL TYPES
-// ============================================================================
-
-/// Bucket export data structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BucketExport {
-    pub client_data: Vec<u8>,
-    pub metadata: ExportMetadata,
-}
-
-/// Metadata for bucket exports
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportMetadata {
-    pub node_name: String,
-    pub export_timestamp: u64,
-    pub node_type: RunMode,
-    pub bucket_count: usize,
 }
 
 // ============================================================================
@@ -472,11 +445,19 @@ mod message_tests {
         let message = Message::GetStatus;
         let mut bytes = message.serialize().unwrap().to_vec();
         assert!(Message::deserialize(&bytes).is_ok());
-        bytes[0] ^= 0xff;
+        bytes[MESSAGE_MAGIC.len()] ^= 0xff;
         let err = Message::deserialize(&bytes).unwrap_err();
         assert!(
             err.to_string().contains("version"),
             "unexpected error: {err}"
         );
+    }
+
+    /// An older binary sent the version first with no magic number.
+    #[test]
+    fn test_message_without_magic_is_refused() {
+        let bytes = Message::GetStatus.serialize().unwrap();
+        let err = Message::deserialize(&bytes[MESSAGE_MAGIC.len()..]).unwrap_err();
+        assert!(err.to_string().contains("magic"), "unexpected error: {err}");
     }
 }

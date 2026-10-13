@@ -13,17 +13,10 @@ const KEY_EXPIRY_INTERVAL: u64 = 500;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,colibri=info,tower_http=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    // Parse args and env vars
-    let args = cli::Cli::parse_with_file();
-    let settings = args.into_settings();
+    // Parse args, env vars and config file
+    let args = cli::Cli::parse_with_file()?;
+    init_tracing(args.log_format);
+    let settings = args.into_settings()?;
 
     // Socket server listen address setup
     let listen_address: IpAddr = settings
@@ -56,7 +49,53 @@ async fn main() -> Result<()> {
 
     // Start server
     info!("Starting Colibri on {}", socket_address);
-    axum::serve(listener, api).await?;
+    axum::serve(listener, api)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    info!("Colibri stopped");
 
     Ok(())
+}
+
+fn init_tracing(format: cli::LogFormat) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,colibri=info,tower_http=info".into());
+    let registry = tracing_subscriber::registry().with(filter);
+    match format {
+        cli::LogFormat::Text => registry.with(tracing_subscriber::fmt::layer()).init(),
+        cli::LogFormat::Json => registry
+            .with(tracing_subscriber::fmt::layer().json())
+            .init(),
+    }
+}
+
+/// Resolves on SIGTERM or Ctrl-C; the server then finishes in-flight requests.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!("Failed to listen for Ctrl-C: {}", e);
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(e) => {
+                error!("Failed to listen for SIGTERM: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("Shutdown signal received; draining in-flight requests");
 }

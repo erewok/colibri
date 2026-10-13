@@ -720,6 +720,10 @@ impl GossipController {
                         "[{}] Gossip protocol version mismatch from {}: expected {}, got {}",
                         self.node_id, peer_addr, expected, got
                     ),
+                    GossipDecodeError::BadMagic => warn!(
+                        "[{}] Refused packet from {}: {}",
+                        self.node_id, peer_addr, e
+                    ),
                     GossipDecodeError::Decode(_) => debug!(
                         "[{}] Failed to decode gossip packet from {}: {}",
                         self.node_id, peer_addr, e

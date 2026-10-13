@@ -23,10 +23,8 @@ One primary design goal for this project is as mentioned above: **Colibri remain
 This project's status is considered **experimental**. I do not run it in production yet. It has the following major issues to solve:
 
 - Gossip: a node that starts or rejoins receives every active client in one burst of datagrams (see [deploy.md](deploy.md)).
-- Crash-and-reload is not implemented
-- No upgrade paths (we have planned an admin command).
-- No authentication or TLS, no metrics, no graceful shutdown
-- The config file I want to use is ignored.
+- No metrics.
+- No authentication or TLS: run Colibri on a trusted network only.
 
 ## Design
 
@@ -150,7 +148,12 @@ See `demo/gossip.sh` and `demo/hashring.sh` for complete three-node clusters.
 - `--gossip-interval-ms`: How often a gossip node sends updates (default: 1000)
 - `--gossip-fanout`: How many peers each gossip update goes to (default: 1)
 
-Every option can also be set with an environment variable, such as `COLIBRI_RUN_MODE`. Use `cargo run -- --help` for the complete list.
+- `-f, --config-file`: A toml file whose `[default]` table sets any of these options by field name, such as `run_mode = "gossip"` (see `colibri.toml`)
+- `--log-format`: `text` or `json` (default: `text`)
+
+Every option can also be set with an environment variable, such as `COLIBRI_RUN_MODE`. Flags override environment variables, and both override the config file. Use `cargo run -- --help` for the complete list.
+
+On SIGTERM or Ctrl-C, a node stops accepting connections and finishes in-flight requests before it exits.
 
 ## Deployment
 

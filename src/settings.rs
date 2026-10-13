@@ -40,6 +40,7 @@ impl TransportConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RunMode {
     Gossip,
     Hashring,

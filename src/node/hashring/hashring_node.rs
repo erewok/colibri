@@ -7,8 +7,8 @@ use super::HashringController;
 use crate::error::{ColibriError, Result};
 use crate::limiters::{RuleList, RuleName, SerializableRule};
 use crate::node::messages::{
-    BucketExport, CheckCallsRequest, CheckCallsResponse, ExportMetadata, Message, StatusResponse,
-    TopologyChangeRequest, TopologyResponse,
+    CheckCallsRequest, CheckCallsResponse, Message, StatusResponse, TopologyChangeRequest,
+    TopologyResponse,
 };
 use crate::node::{Node, NodeName};
 use crate::settings;
@@ -201,28 +201,6 @@ impl Node for HashringNode {
 
 // Cluster-specific methods for HashringNode
 impl HashringNode {
-    pub async fn handle_export_buckets(&self) -> Result<BucketExport> {
-        let export = BucketExport {
-            client_data: Vec::new(),
-            metadata: ExportMetadata {
-                node_name: self.node_name.to_string(),
-                export_timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                node_type: settings::RunMode::Hashring,
-                bucket_count: 0,
-            },
-        };
-        tracing::info!("Hashring bucket export not yet implemented");
-        Ok(export)
-    }
-
-    pub async fn handle_import_buckets(&self, _import_data: BucketExport) -> Result<()> {
-        tracing::info!("Hashring bucket import not yet implemented");
-        Ok(())
-    }
-
     pub async fn handle_cluster_health(&self) -> Result<StatusResponse> {
         let message = Message::GetStatus;
         match self.controller.handle_message(message).await? {

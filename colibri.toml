@@ -15,4 +15,3 @@ topology=[
 ]
 gossip_interval_ms=500
 gossip_fanout=1
-hash_replication_factor=1

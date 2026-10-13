@@ -17,13 +17,19 @@ use crate::node::{ActorId, NodeId};
 /// positional), removing or reordering variants silently corrupts traffic on a
 /// mixed-version cluster. Bumping this constant and rejecting mismatches on the
 /// receive side turns that silent corruption into a hard, logged error.
-pub const GOSSIP_PROTOCOL_VERSION: u16 = 5;
+pub const GOSSIP_PROTOCOL_VERSION: u16 = 6;
+
+/// Leads every gossip datagram, ahead of the protocol version, so a receiver
+/// refuses stray traffic and packets from binaries older than the version field.
+pub const GOSSIP_MAGIC: [u8; 4] = *b"CLBG";
 
 /// Error returned by [`GossipPacket::from_wire`].
 #[derive(Debug)]
 pub enum GossipDecodeError {
     /// Postcard deserialization failed (truncated, corrupt, or wrong format).
     Decode(postcard::Error),
+    /// The packet does not start with [`GOSSIP_MAGIC`].
+    BadMagic,
     /// The packet's protocol version does not match [`GOSSIP_PROTOCOL_VERSION`].
     VersionMismatch { expected: u16, got: u16 },
 }
@@ -32,6 +38,7 @@ impl std::fmt::Display for GossipDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Decode(e) => write!(f, "gossip decode error: {}", e),
+            Self::BadMagic => write!(f, "not a colibri gossip packet (bad magic number)"),
             Self::VersionMismatch { expected, got } => write!(
                 f,
                 "gossip protocol version mismatch: expected {}, got {}",
@@ -114,7 +121,7 @@ pub fn delta_packets(
             propagation_factor,
         })
     };
-    let empty = encoded_len(&packet(Vec::new())) + LENGTH_SLACK;
+    let empty = GOSSIP_MAGIC.len() + encoded_len(&packet(Vec::new())) + LENGTH_SLACK;
 
     let mut packets = Vec::new();
     let mut current: Vec<RuleBuckets> = Vec::new();
@@ -188,7 +195,9 @@ impl GossipPacket {
 
     /// Serialize for INTERNAL cluster communication (UDP gossip).
     pub fn serialize(&self) -> Result<bytes::Bytes, postcard::Error> {
-        to_allocvec(self).map(bytes::Bytes::from)
+        let mut data = GOSSIP_MAGIC.to_vec();
+        data.extend_from_slice(&to_allocvec(self)?);
+        Ok(bytes::Bytes::from(data))
     }
 
     /// Deserialize and version-check a raw gossip packet from the wire.
@@ -198,7 +207,10 @@ impl GossipPacket {
     /// what would otherwise be silent postcard corruption on a mixed-version
     /// cluster into a hard, logged error.
     pub fn from_wire(data: &[u8]) -> Result<Self, GossipDecodeError> {
-        let packet: Self = from_bytes(data)?;
+        let body = data
+            .strip_prefix(&GOSSIP_MAGIC)
+            .ok_or(GossipDecodeError::BadMagic)?;
+        let packet: Self = from_bytes(body)?;
         if packet.protocol_version != GOSSIP_PROTOCOL_VERSION {
             return Err(GossipDecodeError::VersionMismatch {
                 expected: GOSSIP_PROTOCOL_VERSION,
@@ -273,5 +285,24 @@ mod tests {
             "expected VersionMismatch error, got {:?}",
             result.map(|_| ())
         );
+    }
+
+    /// An older binary sent postcard with no magic number; refuse it unread.
+    #[test]
+    fn test_packet_without_magic_is_rejected() {
+        let packet = GossipPacket::new_with_id(
+            GossipMessage::StateRequest {
+                requesting_node_id: NodeName::from("node-1").node_id(),
+                partitions: vec![3],
+                incarnations: Vec::new(),
+                response_addr: "127.0.0.1:8410".parse().unwrap(),
+            },
+            42,
+        );
+        let unframed = to_allocvec(&packet).unwrap();
+        assert!(matches!(
+            GossipPacket::from_wire(&unframed),
+            Err(GossipDecodeError::BadMagic)
+        ));
     }
 }

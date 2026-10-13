@@ -4,22 +4,22 @@
 - [x] Add tests
 - [x] Make it possible to setup a rate-limiter key that diverges from settings
 - [ ] Hashring: replicate each client's bucket to its ring neighbours. Replication existed (#7) but was removed in #9; only the unused `get_neighbor_bucket` remains, so each client lives on one node.
-- [ ] Alternatives for config: config files and env vars. Make a config file and use that for both *launching* a node *and* admin commands for all nodes.
+- [x] Config from a file and env vars: `--config-file` loads a `[default]` table; flags and env vars override it.
+- [ ] Use the config file for admin commands too, so `colibri-admin` can reach every node.
 - [ ] Add deployment infra: config-file and kubernetes resource definitions
-- [ ] Snapshot node state to persistent storage and reload on crash
 - [ ] Add docs
-- [ ] Fix config-file loading: `colibri.toml` values are overridden by CLI defaults (merged after the file), and `--name` is required before the file is read.
+- [x] Fix config-file loading: `colibri.toml` values are overridden by CLI defaults (merged after the file), and `--name` is required before the file is read.
 - [x] Gossip: restarting a node under the same name over-admits; calls admitted before the first sync are credited back twice when they expire.
 - [x] Gossip: split delta and anti-entropy state across UDP datagrams (`--gossip-max-packet-bytes`, default 1400).
 - [x] Gossip: partitioned anti-entropy: heartbeats hash 64 client partitions; nodes push and pull only the partitions that differ.
 - [x] Gossip: free idle client state (`GossipNode::expire_keys` is a no-op), without breaking the single-writer CRDT discipline.
 - [x] Gossip: expire requests from a node that is removed for good (peers retire a slot that has sat unchanged for a window).
 - [x] Hashring: free idle client buckets (`HashringNode::expire_keys` is a no-op).
-- [ ] Implement `colibri-admin export-buckets` / `import-buckets` (currently stubs), and make `colibri-admin` work with gossip nodes.
+- [ ] Make `colibri-admin` work with gossip nodes (it speaks TCP; gossip peer ports are UDP).
 - [ ] Expose runtime membership changes (`AddNode`/`RemoveNode` messages exist but nothing can send them).
-- [ ] Graceful shutdown on SIGTERM (drain in-flight requests).
-- [ ] Authentication and TLS for the HTTP API and peer ports.
-- [ ] Metrics endpoint, and an option for JSON logs (the `tracing-subscriber` `json` feature is enabled but unused).
+- [x] Graceful shutdown on SIGTERM (drain in-flight requests).
+- [ ] Metrics endpoint.
+- [x] JSON logs (`--log-format json`).
 - [x] Named rules reach every node (gossip and hashring) and get the same guarantees as the default rule.
 - [x] Gossip: the heartbeat digest ignores idle buckets, and a node pushes state back when a peer is behind.
 - [ ] Gossip: a bucket is dropped once its changes are sent, not delivered; a delayed relay can resurrect it on another node until anti-entropy repairs it.
@@ -33,7 +33,7 @@
 - [x] Gossip: the heartbeat digest hashes each bucket's slots, so different states don't produce equal digests (barring hash collisions).
 - [ ] Gossip: a create on a node that never saw an earlier delete can lose to that delete (last-write-wins), so the rule silently disappears.
 - [ ] Gossip: deleted-rule tombstones are never garbage-collected, and `RuleConfigSync` is a single datagram.
-- [ ] Cluster messages: prefix a magic number before the protocol version, so an unversioned (older) message can't be misread.
+- [x] Cluster messages: prefix a magic number before the protocol version, so an unversioned (older) message can't be misread. Gossip packets carry `CLBG`, hashring messages `CLBM`.
 - [ ] Hashring: nodes with different topology views can briefly both own a client, and moved clients start fresh at the new owner.
 - [ ] TLA+: model the controller relay, datagram size limits, partition digests (push-pull is abstracted as any-time merges), per-process clock drift, and the hashring; a receiver dating a merged slot by the sender alone (not the later of the two) isn't caught at current bounds.
 - [ ] TLA+: compact on each node's *belief* about dead incarnations (learned through gossip, possibly wrong), not the true state; the review found a self-compaction bug the spec couldn't express (fixed in code, tested in `tests/gossip_regressions.rs`).
